@@ -730,6 +730,15 @@ LABEL_BUDGET_PREFIX = "budget:"
 # written post-promote), so the sha is the only piece that must ride the label; the full
 # {branch, sha, worktree} triple lands in a comment for the audit trail.
 LABEL_VERIFIED_PREFIX = "verified:"
+# Shutdown-resume record — `stranded:<sha>`, replaced (never accumulated) when `stop()`
+# saves a mid-dispatch card's dirty tree to a `stranded/…` branch. The sha is that
+# branch's tip; the branch NAME holds `/` and a timestamp, so it rides a
+# `stranded resume: ref=… sha=…` comment (the `verified:` label-plus-comment pattern).
+# Boot recovery reads both and hands the saved work back to a coder instead of
+# rebuilding fresh. It only ever resumes work INTO a coder — it publishes nothing.
+# Cleared when the card opens a PR, is cancelled, or the record fails recovery's checks.
+LABEL_STRANDED_PREFIX = "stranded:"
+STRANDED_RESUME_PREFIX = "stranded resume:"
 # In-review VERDICT currency (#131) — `merged-verified:<sha>`, replaced (never
 # accumulated) each time the merge-poll reconciler re-runs the gate against the
 # MERGED state (branch tip + current origin/<base>) after base moved under an
@@ -3767,6 +3776,12 @@ class BeadsBoard:
         args = ["update", fid, "--add-label", LABEL_IN_REVIEW]
         if pr_url:
             args += ["--external-ref", pr_url]
+        # The shutdown-resume record's window has closed: the work it pointed at is on a PR
+        # (or superseded by one). Only labels actually present, so a card that never had
+        # one writes exactly what it always did.
+        for label in f.get("labels") or []:
+            if str(label).startswith(LABEL_STRANDED_PREFIX):
+                args += ["--remove-label", label]
         self._run(*args)
         return self.get_feature(fid)
 
@@ -3838,6 +3853,7 @@ class BeadsBoard:
                 LABEL_REVIEW_CLEAN_SHA_PREFIX,
                 LABEL_REVIEWED_HEAD_PREFIX,
                 LABEL_MERGED_VERIFIED_PREFIX,
+                LABEL_STRANDED_PREFIX,  # the card has its PR: the shutdown-resume record is spent
             )
             for label in labels:
                 if (
@@ -4408,6 +4424,10 @@ class BeadsBoard:
         # ONLY labels actually present, so an already-clean cancel is byte-for-byte its prior
         # single-label write.
         stale = _terminal_stale_labels(f.get("labels"))
+        # A cancelled card resumes nothing: drop its shutdown-resume record with the rest
+        # (the `stranded/…` branch itself stays). Folded into `stale`, so a failed close
+        # puts it back exactly like the other labels.
+        stale += [s for s in (str(l) for l in f.get("labels") or []) if s.startswith(LABEL_STRANDED_PREFIX)]
         tag = ["update", fid, "--add-label", LABEL_CANCELLED, "--assignee", ""]
         tag += [a for label in stale for a in ("--remove-label", label)]
         self._run(*tag)
@@ -4829,6 +4849,34 @@ class BeadsBoard:
         so it must not linger to confuse a later recovery. No-op without the label."""
         f = self._require(fid)
         stale = [l for l in f.get("labels") or [] if l.startswith(LABEL_VERIFIED_PREFIX)]
+        if not stale:
+            return f
+        args = ["update", fid]
+        for label in stale:
+            args += ["--remove-label", label]
+        self._run(*args)
+        return self.get_feature(fid)
+
+    # ── shutdown-resume record (stranded work a restart interrupted) ──────────
+    def record_stranded_work(self, fid: str, *, ref: str, sha: str) -> dict:
+        """Persist where a shutdown saved this card's mid-dispatch work — a single,
+        replaced `stranded:<sha>` label plus a `stranded resume: ref=… sha=…` comment
+        naming the branch (the `verified:` pattern). Boot recovery reads it to resume
+        the card from that commit instead of rebuilding fresh. Best-effort for callers:
+        a `br` hiccup here costs only the resume, never the saved work."""
+        f = self._require(fid)
+        args = ["update", fid]
+        args += replace_prefixed_label_args(f.get("labels"), LABEL_STRANDED_PREFIX, f"{LABEL_STRANDED_PREFIX}{sha}")
+        self._run(*args)
+        self.comment(fid, f"{STRANDED_RESUME_PREFIX} ref={ref} sha={sha}")
+        return self.get_feature(fid)
+
+    def clear_stranded_work(self, fid: str) -> dict:
+        """Drop the `stranded:` resume record — the card opened a PR, was cancelled, or
+        the record failed recovery's checks (branch gone, moved or diverged). The
+        `stranded/…` branch is left alone. No-op without the label."""
+        f = self._require(fid)
+        stale = [l for l in f.get("labels") or [] if str(l).startswith(LABEL_STRANDED_PREFIX)]
         if not stale:
             return f
         args = ["update", fid]
@@ -5574,6 +5622,14 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
+        # The shutdown-resume record: the tip of the `stranded/…` branch a shutdown saved
+        # this card's mid-dispatch work to, from the single replaced `stranded:<sha>` label
+        # — "" when none. Its branch name is read from the comments below.
+        stranded_sha = next(
+            (l[len(LABEL_STRANDED_PREFIX) :] for l in labels if l.startswith(LABEL_STRANDED_PREFIX)),
+            "",
+        )
+        stranded_ref = ""
         # WHY this card is blocked (the sweep's self-heal input): the classifier category
         # off the single `blocked-class:` label, "" when the block predates it or the
         # caller never classified. Hyphenated on the label, hyphenated here — callers
@@ -5615,6 +5671,13 @@ class BeadsBoard:
             if txt.startswith(LABEL_DELIVERABLE_PREFIX):
                 deliverable = txt[len(LABEL_DELIVERABLE_PREFIX) :].strip()
                 rejection = ""
+            elif stranded_sha and txt.startswith(STRANDED_RESUME_PREFIX):
+                # The branch the CURRENT `stranded:<sha>` label points at: only a comment
+                # naming that same sha counts, so an older save's branch is never paired
+                # with a newer save's commit.
+                fields = dict(part.split("=", 1) for part in txt[len(STRANDED_RESUME_PREFIX) :].split() if "=" in part)
+                if fields.get("sha") == stranded_sha and fields.get("ref"):
+                    stranded_ref = fields["ref"]
             elif txt.startswith(BLOCKED_REASON_PREFIX):
                 # The LATEST `blocked: <reason>` comment — what the operator is told when
                 # a block is escalated, so the notification names the actual failure
@@ -5705,6 +5768,10 @@ class BeadsBoard:
             "budgets": budgets_from_labels(labels),
             # Operator-notification markers (#341): the alert kinds already delivered to a
             "verified_sha": verified_sha,
+            # Where a shutdown saved this card's mid-dispatch work (only `br show` carries
+            # the comment, so a `br list` row projects `stranded_ref` as "").
+            "stranded_sha": stranded_sha,
+            "stranded_ref": stranded_ref,
             "deliverable": deliverable,
             # Delivered IN THIS ROUND (#399, #432 review): a delivery is on record — a
             # deliverable, or the `delivered-by:` stamp every record_delivery writes (the
