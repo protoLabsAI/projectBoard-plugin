@@ -18,7 +18,7 @@ import sys
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction
-from ..projects import orphaned_cards
+from ..projects import orphaned_cards, shared_base_conflicts
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
@@ -956,9 +956,27 @@ class PreflightMixin:
         results: dict[str, dict] = {}
         jobs: dict[tuple[str, str], list[str]] = {}
         where: dict[str, tuple[str, str]] = {}
-        for name in list(self._projects):
-            repo = self._repo_for({"project": name})
-            base = self._base_branch_for({"project": name})
+        resolved = {
+            name: {"repo": self._repo_for({"project": name}), "base_branch": self._base_branch_for({"project": name})}
+            for name in list(self._projects)
+        }
+        conflicts = shared_base_conflicts(resolved)
+        seen = self.__dict__.setdefault("_base_stale_logged", {})
+        for key in list(seen):
+            if key[1] == "config conflict" and key[0] not in conflicts:
+                seen.pop(key)
+        for repo, detail in conflicts.items():
+            key = (repo, "config conflict")
+            if seen.get(key) != detail:
+                log.warning("[project_board] %s", detail)
+            seen[key] = detail
+            self.__dict__.setdefault("_off_base_passes", {}).pop(repo, None)
+        for name, settings in resolved.items():
+            repo, base = settings["repo"], settings["base_branch"]
+            if repo and os.path.realpath(repo) in conflicts:
+                where[name] = (repo, base)
+                results[name] = {"state": "conflict", "behind": 0, "detail": conflicts[os.path.realpath(repo)]}
+                continue
             if not repo or not os.path.exists(os.path.join(repo, ".git")):
                 continue  # no checkout: the repo setup check owns that
             where[name] = (repo, base)
@@ -1070,6 +1088,19 @@ class PreflightMixin:
                 log.debug("[project_board] off-base switch for %s deferred — a gate smoke is running in it", repo)
                 return {"switched": False, "detail": detail}
             async with lock:  # uncontended: acquired without yielding, so nothing slips in between
+                try:
+                    exists = await worktree.origin_branch_exists(repo, base)
+                except Exception as exc:  # noqa: BLE001 — uncertain remote evidence never switches or pages
+                    log.debug("[project_board] base existence check for %s failed: %s", repo, exc)
+                    return {"switched": False, "detail": detail}
+                seen = self.__dict__.setdefault("_base_stale_logged", {})
+                if not exists:
+                    detail = f"base branch {base} no longer exists on origin — project is stale"
+                    if seen.get((key, base)) != detail:
+                        log.warning("[project_board] base checkout for %s is stale: %s", name, detail)
+                    seen[(key, base)] = detail
+                    return {"switched": False, "detail": detail}
+                seen.pop((key, base), None)
                 result = await worktree.switch_base_checkout(repo, base)
             if result.get("state") == "switched":
                 passes.pop(key, None)  # on base now — reset
