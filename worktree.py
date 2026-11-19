@@ -657,6 +657,10 @@ async def unpublished_work(path: str, *, branch: str = "", base: str = "") -> st
 # so no reap, rebuild or `branch -D` of the board's ever reaches it.
 STRANDED_REF_PREFIX = "stranded/"
 _REF_TRIES = 20  # names tried before a save may fail on naming — never, in practice
+# How a save commit `preserve_worktree` wrote is told from a coder's own (its subject and
+# author): resuming from one puts its content back as UNCOMMITTED changes on its parent.
+_STRANDED_SUBJECT = "stranded work from "
+_STRANDED_AUTHOR = "project-board"
 
 
 def _stamp() -> str:
@@ -743,7 +747,7 @@ async def preserve_worktree(repo: str, path: str, branch: str, *, summary: str =
     head_tree = _checked(await _git(path, "rev-parse", "--verify", f"{head}^{{tree}}"), path, "reading HEAD's tree")
     if tree != head_tree or len(parents) > 1:
         message = (
-            f"stranded work from {path} ({branch or 'no branch'})\n\n"
+            f"{_STRANDED_SUBJECT}{path} ({branch or 'no branch'})\n\n"
             f"Saved by project-board before the tree was removed (#405). It held: {summary or 'unknown'}"
         )
         commit = _checked(
@@ -1972,6 +1976,99 @@ async def discard_worktree(
             return True, record  # a husk, moved aside: its path is already free
         removed, why_not = await _remove_saved(repo, path, branch)
         return removed, dataclasses.replace(record, removed=removed, why=why_not)
+
+
+class StrandedResumeError(WorktreeError):
+    """A recorded ``stranded/…`` branch cannot be resumed from — it is gone, moved,
+    unreadable or no longer shares history with the card's base. The message is the reason
+    the caller logs before it rebuilds fresh; nothing was changed on disk."""
+
+
+async def _stranded_save_parent(repo: str, commit: str) -> str:
+    """The commit a save commit was made ON — the tree's HEAD when it was saved — or ``""``
+    when ``commit`` is not one ``preserve_worktree`` wrote (a tree whose only unique work
+    was commits is saved at its own HEAD, with no commit of the board's on top)."""
+    rc, out, _err = await _git(repo, "log", "-1", "--format=%an%n%s", commit)
+    author, _sep, subject = out.strip().partition("\n")
+    if rc != 0 or author != _STRANDED_AUTHOR or not subject.startswith(_STRANDED_SUBJECT):
+        return ""
+    rc, parent, _err = await _git(repo, "rev-parse", "--verify", "--quiet", f"{commit}^1^{{commit}}")
+    return parent.strip() if rc == 0 else ""
+
+
+async def resume_stranded_worktree(
+    repo: str, base: str, fid: str, root: str = ".worktrees", title: str = "", *, ref: str, sha: str
+) -> tuple[str, str]:
+    """Recreate the card's canonical worktree holding the work a shutdown saved on the
+    ``stranded/…`` branch ``ref`` (tip ``sha``), so a coder can continue it instead of
+    rebuilding. Returns ``(path, branch)``.
+
+    The tree comes back as it was when it was saved: the branch on the commit the dead
+    coder's tree had checked out, and the saved changes UNCOMMITTED in the working files —
+    the board's own save commit never enters the card's history. Nothing here publishes
+    anything; the drive that picks the tree up still runs every gate.
+
+    Raises ``StrandedResumeError`` — before touching the disk — when the branch is missing
+    or unreadable, no longer points at ``sha``, or shares no history with the card's base
+    branch (the base was rewritten under it: resuming would carry a foreign history into
+    the card's PR). A failure after the tree was created removes it again."""
+    if not ref or not sha:
+        raise StrandedResumeError("no stranded branch is recorded with the commit")
+    rc, tip, err = await _git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{ref}^{{commit}}")
+    if rc != 0 or not tip.strip():
+        raise StrandedResumeError(f"{ref} is missing or unreadable{(': ' + err.strip()[:120]) if err.strip() else ''}")
+    if tip.strip() != sha:
+        raise StrandedResumeError(f"{ref} moved ({tip.strip()[:12]} ≠ recorded {sha[:12]})")
+    await _git(repo, "fetch", "origin", base)  # best-effort, as `create_worktree` does
+    base_ref = ""
+    for candidate in (f"origin/{base}", base):
+        if (await _git(repo, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"))[0] == 0:
+            base_ref = candidate
+            break
+    if not base_ref:
+        raise StrandedResumeError(f"base branch {base} is unreadable")
+    rc, fork, _err = await _git(repo, "merge-base", sha, base_ref)
+    if rc != 0 or not fork.strip():
+        raise StrandedResumeError(f"{ref} has diverged: it shares no history with {base_ref}")
+    head = await _stranded_save_parent(repo, sha) or sha
+    path, branch = await create_worktree(repo, base, fid, root, title=title)
+    try:
+        # The branch onto the saved state, then — for a save commit — back onto its parent
+        # with the index: the saved changes stay in the files, uncommitted, as they were.
+        for args in (("reset", "--hard", "--quiet", sha), *((("reset", "--quiet", head),) if head != sha else ())):
+            rc, out, err = await _git(path, *args)
+            if rc != 0:
+                raise StrandedResumeError(f"restoring {ref}: git {args[0]} failed: {(err or out).strip()[:200]}")
+    except WorktreeError as exc:
+        await remove_worktree(repo, path, branch)  # nothing unique in it: the work is still on `ref`
+        if isinstance(exc, StrandedResumeError):
+            raise
+        raise StrandedResumeError(f"restoring {ref}: {exc}") from exc
+    return path, branch
+
+
+async def stranded_resume_tree(repo: str, root: str, fid: str, title: str, sha: str) -> tuple[str, str] | None:
+    """The card's canonical worktree, as ``(path, branch)``, when it is the one
+    ``resume_stranded_worktree`` recreated from the commit ``sha`` — on the card's branch,
+    at that commit or (a save commit) its parent. ``None`` for anything else: no tree, another
+    branch, another commit, or a tree git cannot read. Never raises — any doubt is a fresh
+    build, which saves whatever the tree holds first."""
+    if not sha:
+        return None
+    branch = branch_name(fid, title)
+    path = os.path.abspath(os.path.join(repo, root, worktree_dir(fid, title)))
+    if not os.path.lexists(os.path.join(path, ".git")):
+        return None
+    try:
+        rc, current, _err = await _git(path, "branch", "--show-current")
+        if rc != 0 or current.strip() != branch:
+            return None
+        rc, head, _err = await _git(path, "rev-parse", "--verify", "HEAD")
+        if rc != 0 or head.strip() not in {sha, await _stranded_save_parent(path, sha) or sha}:
+            return None
+    except WorktreeError:
+        return None
+    return path, branch
 
 
 async def _clear_for(repo: str, path: str, branch: str, base: str, why: str) -> None:

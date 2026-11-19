@@ -99,6 +99,10 @@ WORKTREE_SEAMS: dict[str, str] = {
     "_unpublished_recovery": "REAL",
     "preserved_recovery_progress": "REAL",  # Real-Git restart/publication cases in test_conflict_recovery_contract.py.
     "_create_stranded_ref": "REAL",
+    # Real git recovery in tests/test_shutdown_resume_stranded.py.
+    "_stranded_save_parent": "REAL",
+    "resume_stranded_worktree": "REAL",
+    "stranded_resume_tree": "REAL",
     # #475: the leftover-candidate-branch seams, against real git in
     # tests/test_stale_candidate_branch_475.py.
     "_checked_out_branches": "REAL",
@@ -236,6 +240,7 @@ STORE_SEAMS: dict[str, str] = {
     "clear_blocked": "REAL",  # #401: real `br` in tests/test_stale_blocked_class_401.py
     "clear_budgets": "REAL",
     "clear_verified_candidate": "UNCOVERED",
+    "clear_stranded_work": "REAL",  # Real br in tests/test_shutdown_resume_stranded.py.
     "comment": "UNCOVERED",
     "create_from_plan": "UNCOVERED",
     "delete_feature": "UNCOVERED",
@@ -267,6 +272,7 @@ STORE_SEAMS: dict[str, str] = {
     "request_decomposition": "REAL",
     "record_verification": "REAL",
     "record_verified_candidate": "REAL",
+    "record_stranded_work": "REAL",  # Real br in tests/test_shutdown_resume_stranded.py.
     "release_merge_hold": "REAL",  # #532: label drop + audit comment, real `br` in tests/test_integration.py
     "remove_dependency": "UNCOVERED",
     "requeue": "REAL",
@@ -454,8 +460,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_56_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #361 S1/S2/S3: 56 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_59_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #361 S1/S2/S3: 59 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -494,6 +500,7 @@ def test_worktree_coverage_contract_is_56_real_3_exempt_0_uncovered():
     # The 54th–56th are bd-z4jw6's off-base recovery seams — `checkout_branch`,
     # `off_base_checkout`, `switch_base_checkout` — all LOCAL git, exercised against a real
     # bare origin + clone in tests/test_preflight_off_base_checkout.py.
+    # The 57th–59th recover stranded work against real git in test_shutdown_resume_stranded.py.
     real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
     exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
     uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
@@ -503,7 +510,7 @@ def test_worktree_coverage_contract_is_56_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 56, f"expected 56 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 59, f"expected 59 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

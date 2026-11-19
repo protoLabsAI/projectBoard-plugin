@@ -204,7 +204,7 @@ class PromptMixin:
         """Include queued route feedback without consuming it before prompt construction."""
         return bool(self._ci_feedback.get(fid) or _PENDING_FEEDBACK.get(fid))
 
-    def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "") -> str:
+    def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "", resume_note: str = "") -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
         nothing; naming the files + a direct 'make the edits now' makes it act.
@@ -217,7 +217,11 @@ class PromptMixin:
         rides the same rejected-attempt block as CI/fix feedback, but it is NOT that
         feedback: ``_ci_feedback`` persists across drives and marks a carried-forward
         FIX (which disables max-mode/solve fan-out), while a timeout climb is a fresh
-        build — so the note lives only in the drive that climbed (#425 review)."""
+        build — so the note lives only in the drive that climbed (#425 review).
+
+        ``resume_note`` is the drive's note that this worktree already holds the work a
+        restart interrupted (``STRANDED_RESUME_NOTE``). Drive-local for the same reason, and
+        its own block: nothing was rejected, so it must not ride the rejection heading."""
         files = feature.get("files_to_modify") or []
         files_block = (
             "\n".join(f"- {f}" for f in files) if files else "(none listed — create the files the task requires)"
@@ -410,6 +414,7 @@ class PromptMixin:
             if ci
             else ""
         )
+        resume_block = f"\n## Continue the interrupted attempt\n{resume_note.strip()}\n" if resume_note.strip() else ""
         lessons_block = (
             f"\n## Known gotchas for this area (distilled from past retros — heed them)\n{lessons.strip()}\n"
             if lessons.strip()
@@ -446,6 +451,7 @@ class PromptMixin:
             f"you could solve yourself.\n\n"
             f"# {feature['title']}\n\n"
             f"{_recovery_block(feature)}"
+            f"{resume_block}"
             f"{ci_block}"
             f"{lessons_block}"
             f"## Task\n{feature.get('spec', '')}\n\n"
@@ -490,6 +496,19 @@ class PromptMixin:
             f"- You are done when the behavior is correct for every caller and shared state "
             f"your change touches, tests cover it, and every acceptance criterion is satisfied."
         )
+
+
+# What a coder is told when boot recovery handed it the work a restart interrupted: the
+# tree is not a clean base, and what is in it has passed NO gate yet.
+STRANDED_RESUME_NOTE = (
+    "A previous attempt at this card was interrupted by a host restart before it finished. "
+    "Its uncommitted work was saved and is ALREADY in this worktree's files. Continue from "
+    "the existing changes in this worktree; re-run the gate before finishing (the checks this "
+    "brief asks you to run on your change — the interrupted attempt's results do not count). Read what is "
+    "there first (`git status`, `git diff`) and keep what is correct — do NOT start over or "
+    "discard it. Nothing in it has been verified: it is unfinished and may be wrong, so check "
+    "it against the task below and complete everything that is missing, tests included."
+)
 
 
 def integration_prompt(context: dict) -> str:

@@ -406,6 +406,8 @@ class ReconcileMixin(WorktreeCleanup):
                 log.info("[project_board] %s already had a PR → in_review (%s)", fid, pr_url)
         elif await self._salvage_verified_candidate(store, fid):
             pass  # resumed + PR opened → in_review (logged inside)
+        elif await self._resume_stranded_work(store, fid):
+            pass  # tree recreated from the shutdown's save + requeued (logged inside)
         elif await self._still_orphaned_then(store, fid, store.requeue):
             log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
 
@@ -431,6 +433,81 @@ class ReconcileMixin(WorktreeCleanup):
                 return False
             await asyncio.to_thread(move, fid)
             return True
+
+    async def _resume_stranded_work(self, store, fid: str) -> bool:
+        """Shutdown resume: an orphan with no PR and no verified candidate, whose mid-dispatch
+        work ``stop()`` saved to a ``stranded/…`` branch and recorded on the card
+        (``stranded_ref`` / ``stranded_sha``). Recreate the card's worktree from that commit
+        and requeue the card; the drive that claims it finds the tree
+        (``worktree.stranded_resume_tree``) and continues in it, on the card's current tier,
+        with a continue-from-the-existing-changes prompt — instead of paying for the same
+        coder work twice (protoAgent#5267).
+
+        This only ever resumes work INTO a coder. Nothing is published here: the resumed
+        drive runs the goal check, the pre-PR gate, CI and the review gate like any other.
+
+        ANY doubt — the branch missing, unreadable, moved, or diverged from the card's base;
+        the worktree not recreatable; any error at all — logs the reason, drops the record,
+        and returns False so the caller rebuilds fresh exactly as before. A wrong resume
+        hands a coder someone else's history; a skipped one only costs a rebuild. The
+        stranded branch itself is never touched."""
+        try:
+            f = await asyncio.to_thread(store.get_feature, fid) or {}
+            ref = str(f.get("stranded_ref") or "").strip()
+            sha = str(f.get("stranded_sha") or "").strip()
+            if not (ref or sha) or f.get("pr_url") or str(f.get("verified_sha") or "").strip():
+                return False
+        except Exception:  # noqa: BLE001 — an unreadable card resumes nothing
+            log.warning("[project_board] %s stranded-resume check failed — rebuild fresh", fid, exc_info=True)
+            return False
+        repo = self._repo_for(f)
+        title_raw = f.get("title") or ""
+        wt = branch = ""
+        try:
+            # Outside the claim lock (git fetches and adds a tree here; the claim scan must
+            # not wait on it). The card is in progress with no drive, so nothing else is
+            # building in this path, and the requeue below re-checks that under the lock.
+            wt, branch = await worktree.resume_stranded_worktree(
+                repo, self._base_branch_for(f), fid, self.root, title=title_raw, ref=ref, sha=sha
+            )
+            if not await self._still_orphaned_then(store, fid, store.requeue):
+                # The card moved while the tree was recreated (an operator's attach or
+                # salvage). Whoever owns it now owns the tree too: it holds only a copy of
+                # what the stranded branch keeps, and every edge that ends a tree saves first.
+                return True
+        except Exception as exc:  # noqa: BLE001 — ANY doubt/error → today's rebuild-fresh path
+            reason = str(exc) if isinstance(exc, worktree.StrandedResumeError) else f"{type(exc).__name__}: {exc}"
+            log.warning(
+                "[project_board] %s cannot resume its stranded work (%s) — rebuild fresh%s",
+                fid,
+                reason,
+                f"; the work is still on {ref}" if ref else "",
+            )
+            if wt:
+                # Recreated, but the requeue failed: the fresh build must not find a tree
+                # it would read as resumed. Its content is still on the stranded branch.
+                try:
+                    await worktree.remove_worktree(repo, wt, branch)
+                except Exception:  # noqa: BLE001 — the next dispatch sets a leftover tree aside itself
+                    log.warning("[project_board] %s: could not remove %s after a failed resume", fid, wt)
+            await asyncio.to_thread(self._clear_stranded, store, fid)
+            return False
+        log.info(
+            "[project_board] %s reset to ready (no PR — resuming the work a restart interrupted: %s @ %s, in %s)",
+            fid,
+            ref,
+            sha[:12],
+            wt,
+        )
+        return True
+
+    @staticmethod
+    def _clear_stranded(store, fid: str) -> None:
+        """Best-effort drop of the shutdown-resume record — bookkeeping only, never raises."""
+        try:
+            store.clear_stranded_work(fid)
+        except Exception:  # noqa: BLE001 — a failed clear must not fail recovery
+            log.warning("[project_board] %s clear_stranded_work failed (ignored)", fid, exc_info=True)
 
     @staticmethod
     def _clear_verified(store, fid: str) -> None:

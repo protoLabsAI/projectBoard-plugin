@@ -16,12 +16,28 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import sys
 
-from .prompt import LEDGER_ONLY_OPENING, is_execution_task
+from .prompt import LEDGER_ONLY_OPENING, STRANDED_RESUME_NOTE, is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
 from .. import host_friction, work_location_sweep, work_location_capture
 from ..failures import PROVIDER_STALL_CLASS
+
+
+def _host_shutdown(exc: BaseException | None) -> bool:
+    """Whether a dispatch failure is the HOST killing the coder as it shuts down: the
+    host's ``AcpError`` then carries ``host_shutdown=True`` (protoAgent bd-eec0n). The
+    seam re-raises every below-seam failure as a ``WorktreeError`` built from its text, so
+    the original rides the exception chain — walked here, bounded, cycle-safe. Read with
+    ``getattr(..., False)``: an older host sets no such attribute and reads as False."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen and len(seen) < 16:
+        if getattr(exc, "host_shutdown", False) is True:
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
+    return False
+
 
 # How long the repo's auto-fix command (`format_cmd`) may run before its tree is killed.
 # Best-effort — a slow formatter only loses its fixups; CI still gates lint.
@@ -613,13 +629,15 @@ class DriveMixin:
                 ):
                     log.info("[project_board] recovery worktree kept on shutdown: %s", wt)
                     continue
-                trail = await self._discard_tree(None, fid, repo, wt, branch)
+                # …and the card records WHERE (`resume=True`), so the next boot hands the
+                # saved work back to a coder instead of paying for the same build twice.
+                trail = await self._discard_tree(None, fid, repo, wt, branch, resume=True)
                 log.info("[project_board] in-flight worktree on shutdown: %s — %s", wt, trail)
             except Exception:  # noqa: BLE001 — teardown must not raise out of shutdown
                 log.warning("[project_board] worktree reap on shutdown failed: %s", wt, exc_info=True)
 
     async def _discard_tree(
-        self, store, fid: str, repo: str, wt, branch, *, base: str = "", comment: bool = True
+        self, store, fid: str, repo: str, wt, branch, *, base: str = "", comment: bool = True, resume: bool = False
     ) -> str:
         """End this drive's own tree at a terminal edge — a block, a cancel, shutdown —
         SAVING any work in it that exists nowhere else first (``worktree.discard_worktree``,
@@ -629,7 +647,12 @@ class DriveMixin:
         Returns a one-line trail for the caller's own note. With ``comment`` (the default),
         a save — or a tree kept because it could not be saved — is also written to the card
         (``store`` may be None: resolved lazily, best-effort). A clean tree is removed exactly
-        as before, with nothing written."""
+        as before, with nothing written.
+
+        ``resume`` (shutdown only) also records the ``stranded/…`` branch and its commit on
+        the card (``store.record_stranded_work``), which is what lets boot recovery resume
+        the card from that work. Only for a save onto a branch whose tree then left its
+        path: a husk moved aside, or a tree still on disk, has nothing to resume from."""
         if not wt:
             return ""
         removed, record = await worktree.discard_worktree(repo, wt, branch or "", base=base, why="clearing")
@@ -646,6 +669,19 @@ class DriveMixin:
             trail = f"its work saved on {where}" + ("" if record.removed else f", but the tree remains: {record.why}")
         if comment:
             await self._comment(store, fid, text)
+        if resume and isinstance(record, worktree.PreservedTree) and record.ref and record.commit and record.removed:
+            try:
+                await asyncio.to_thread(
+                    (store or self._store()).record_stranded_work, fid, ref=record.ref, sha=record.commit
+                )
+                trail += " (recorded on the card for resume)"
+            except Exception:  # noqa: BLE001 — the work is safe on its branch; only the resume is lost
+                log.warning(
+                    "[project_board] %s: could not record %s for resume — the next boot rebuilds fresh",
+                    fid,
+                    record.ref,
+                    exc_info=True,
+                )
         return trail
 
     async def _keep_tree_for_salvage(
@@ -2204,6 +2240,25 @@ class DriveMixin:
         # switched max-mode off for that card for good, and every later drive still
         # opened with "a PREVIOUS attempt TIMED OUT". A timeout climb is a fresh build.
         timeout_note = ""
+        # Boot recovery recreated this card's tree from the work a shutdown interrupted
+        # (`_resume_stranded_work`): continue IN it, on the tier the card already has, and
+        # say so in the prompt. Drive-local like `timeout_note` — it describes this tree, and
+        # is dropped the moment the drive builds a fresh one. Every gate below still runs.
+        resume_note = ""
+        stranded_resume = False
+        if feature.get("stranded_sha") and not feature.get("pr_url"):
+            resumed = None
+            try:
+                resumed = await worktree.stranded_resume_tree(
+                    repo, self.root, fid, raw_title, str(feature.get("stranded_sha") or "")
+                )
+            except Exception:  # noqa: BLE001 — any doubt is a fresh build, which saves the tree first
+                log.warning("[project_board] %s: could not read its resumed worktree — building fresh", fid)
+            if resumed:
+                wt, branch = resumed
+                keep_wt = stranded_resume = True
+                resume_note = STRANDED_RESUME_NOTE
+                log.info("[project_board] %s continuing the work a restart interrupted, in %s", fid, wt)
         try:
             while True:
                 # Every attempt after the first is a RETRY of a card the drive may no longer
@@ -2242,7 +2297,9 @@ class DriveMixin:
                     if not self._has_review_feedback(fid):
                         missing_review_findings = await self._budget_get(store, fid, "review-fix", feature) > 0
                 lessons = await self._fetch_kg_lessons(feature)
-                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                prompt = self._build_prompt(
+                    feature, lessons=lessons, timeout_note=timeout_note, resume_note=resume_note
+                )
                 prompt += work_location_capture.reporting_instructions()
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
@@ -2383,6 +2440,13 @@ class DriveMixin:
                     if not reusing:
                         preserved_repair = False
                         round_start = ""  # a fresh tree: only a resumed checkout records one
+                        if resume_note:
+                            # The resumed tree is being replaced: a fresh build must not be
+                            # told its work is on disk. (The stranded branch still holds it.)
+                            resume_note = ""
+                            stranded_resume = False
+                            prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                            prompt += work_location_capture.reporting_instructions()
                         # A FRESH build first clears the ground, and the two halves are one
                         # rule (#405). This drive's own earlier attempt is its to throw away:
                         # the handler below already judged it, and a retry has always rebuilt
@@ -2427,6 +2491,11 @@ class DriveMixin:
                             # — misread as a pre-model infra failure — so say what happened.
                             raise worktree.WorktreeMissing(wt, "before its keep-worktree re-dispatch")
                         self._inflight[fid] = (repo, wt, branch)
+                        if stranded_resume:
+                            # Boot recovery recreated this tree bare: give it its deps once,
+                            # as a fresh tree gets them, before the coder continues in it.
+                            stranded_resume = False
+                            await self._prepare_tree(wt, feature)
                         if feature.get("pr_url") and (pending or await worktree.recovery_context(wt, branch)):
                             from .prompt import integration_feedback
 
@@ -2592,6 +2661,7 @@ class DriveMixin:
                         fallback=_pr_body("", feature),
                     )
                     timeout_note = ""  # the dispatch that carried it has run — consumed
+                    resume_note = ""  # likewise: later rounds in this tree carry their own feedback
                     # The provider served this dispatch, so a down mark on it (#420) — set
                     # by another card, or one that was stale when every sibling was marked
                     # and this one got the rung's last attempt — no longer holds.
@@ -3013,8 +3083,44 @@ class DriveMixin:
                     idle_s = self._timeout_idle_gap(fid, exc) if isinstance(exc, worktree.CoderTimeout) else None
                     if idle_s is not None:
                         exc = worktree.CoderTimeout(f"{exc}; last event {idle_s:.0f}s before timeout")
-                    if self._shutting_down:
-                        log.info("[project_board] %s dispatch aborted by shutdown — no escalation", fid)
+                    # The HOST killed the coder on its way down (`host_shutdown=True` on the
+                    # error, protoAgent bd-eec0n), or the loop itself is stopping. Neither is
+                    # a verdict on the coder or the provider: it used to be classified
+                    # `transient`, spend a retry and sleep the backoff through the shutdown
+                    # (protoAgent#5267). End the drive here and leave the card in progress
+                    # for boot recovery. An error with no such attribute (an older host)
+                    # takes the ordinary path below, as before.
+                    host_down = _host_shutdown(exc)
+                    stopping = self._shutting_down or self._stop.is_set()
+                    if stopping or host_down:
+                        log.info(
+                            "[project_board] %s dispatch aborted by %s — no retry, no escalation; "
+                            "the card stays in progress for boot recovery",
+                            fid,
+                            "host shutdown" if host_down else "shutdown",
+                        )
+                        if not feature.get("pr_url"):
+                            # Save the tree and record where NOW, exactly as `stop()` does
+                            # for a drive it cancels: this drive ends here and drops its
+                            # `_inflight` entry, so `stop()` will not see the tree — and may
+                            # never run at all, if the host kills the process first. A card
+                            # with a PR keeps its tree on disk as before: its fix round
+                            # resumes from the PR branch (or its kept integration checkout),
+                            # never from a stranded one. (Cancelled mid-save by `stop()`, the
+                            # entry is still there for it.)
+                            try:
+                                trail = await self._discard_tree(store, fid, repo, wt, branch, base=base, resume=True)
+                                if trail:
+                                    log.info(
+                                        "[project_board] %s in-flight worktree on shutdown: %s — %s", fid, wt, trail
+                                    )
+                            except Exception:  # noqa: BLE001 — the tree stays on disk; the next dispatch saves it
+                                log.warning(
+                                    "[project_board] %s: could not save its worktree on shutdown: %s",
+                                    fid,
+                                    wt,
+                                    exc_info=True,
+                                )
                         self._inflight.pop(fid, None)
                         return
                     if await asyncio.to_thread(self._cancelled, store, fid):
