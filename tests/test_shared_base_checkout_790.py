@@ -18,6 +18,28 @@ def _projects(repo, bases):
     }
 
 
+async def test_origin_branch_exists_reads_exact_live_head(tmp_path):
+    origin = _Origin(tmp_path)
+    assert await worktree.origin_branch_exists(origin.clone, "main") is True
+    origin.park("epic/a", push=True)
+    assert await worktree.origin_branch_exists(origin.clone, "epic/a") is True
+    # Neither a suffix match nor a tag is evidence of the requested branch.
+    assert await worktree.origin_branch_exists(origin.clone, "a") is False
+    _git("-C", origin.seed, "tag", "tag-only")
+    _git("-C", origin.seed, "push", "origin", "refs/tags/tag-only")
+    assert await worktree.origin_branch_exists(origin.clone, "tag-only") is False
+    _git("-C", origin.seed, "push", "origin", "--delete", "epic/a")
+    assert _git("-C", origin.clone, "rev-parse", "origin/epic/a")
+    assert await worktree.origin_branch_exists(origin.clone, "epic/a") is False
+
+
+async def test_origin_branch_exists_unavailable_origin_is_uncertain(tmp_path):
+    origin = _Origin(tmp_path)
+    _git("-C", origin.clone, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+    with pytest.raises(worktree.WorktreeError, match="git ls-remote failed"):
+        await worktree.origin_branch_exists(origin.clone, "main")
+
+
 @pytest.mark.parametrize("condition", ["clean", "dirty", "unowned", "refresh_failure"])
 async def test_conflicting_checkout_keeps_refreshing_current_base(tmp_path, monkeypatch, condition):
     origin = _Origin(tmp_path)
