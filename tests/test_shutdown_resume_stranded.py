@@ -17,12 +17,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from project_board import store as store_mod
 from project_board import worktree
+from project_board.store import BeadsBoard
 from project_board.loop import BoardLoop
 from project_board.loop.prompt import STRANDED_RESUME_NOTE
 
@@ -642,3 +645,38 @@ def test_clearing_is_a_no_op_without_a_record(make_board):
     board, runs = _recording_board(make_board, _bead([f"stranded:{SHA}"]))
     board.clear_stranded_work(FID)
     assert ("update", FID, "--remove-label", f"stranded:{SHA}") in runs
+
+
+@pytest.mark.skipif(shutil.which(store_mod.BR) is None, reason="real br CLI required (installed by CI)")
+@pytest.mark.br_shape
+@pytest.mark.parametrize("finish", ["clear", "open_review", "cancel"])
+def test_stranded_record_survives_restart_and_clears_through_real_br(tmp_path, finish):
+    """Exercise beads' label validator and durable projection, including stale comments."""
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    fid = board.create_feature("Interrupted coder", spec="s")["id"]
+    board._run("update", fid, "--status", "in_progress")
+    board.record_stranded_work(fid, ref=REF, sha=SHA)
+
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    card = board.get_feature(fid)
+    assert (card["stranded_ref"], card["stranded_sha"]) == (REF, SHA)
+    assert f"stranded:{SHA}" in card["labels"]
+    assert len(f"stranded:{SHA}") <= 50
+
+    new_ref, new_sha = REF + "-next", "f" * 40
+    board.record_stranded_work(fid, ref=new_ref, sha=new_sha)
+    card = board.get_feature(fid)
+    assert (card["stranded_ref"], card["stranded_sha"]) == (new_ref, new_sha)
+    assert [label for label in card["labels"] if label.startswith("stranded:")] == [f"stranded:{new_sha}"]
+
+    if finish == "clear":
+        board.clear_stranded_work(fid)
+        board.clear_stranded_work(fid)  # idempotent without a record
+    elif finish == "open_review":
+        board.open_review(fid, pr_url=PR)
+    else:
+        board.cancel_feature(fid, "scope cut")
+
+    card = BeadsBoard(repo=str(tmp_path), actor="test").get_feature(fid)
+    assert (card["stranded_ref"], card["stranded_sha"]) == ("", "")
+    assert not [label for label in card["labels"] if label.startswith("stranded:")]
