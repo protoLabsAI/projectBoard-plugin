@@ -224,6 +224,24 @@ def repo_config_key(name: str, projects: dict) -> str:
     return "project_board.repo"
 
 
+def shared_base_conflicts(projects: dict[str, dict]) -> dict[str, str]:
+    """Describe checkouts whose projects disagree on the base, including path aliases."""
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for name, settings in projects.items():
+        repo = settings.get("repo")
+        if repo:
+            base = settings.get("base_branch") or "main"
+            grouped.setdefault(os.path.realpath(repo), []).append((name, base))
+    conflicts = {}
+    for repo, entries in grouped.items():
+        if len({base for _, base in entries}) > 1:
+            names = ", ".join(f"{name} ({base})" for name, base in sorted(entries))
+            conflicts[repo] = (
+                f"{repo} is shared by projects {names} with different base branches — config conflict; not switching"
+            )
+    return conflicts
+
+
 def resolve_projects(cfg: dict) -> dict[str, dict]:
     """Parse the board's `projects:` config map → ``{name: settings}`` (#90).
 
@@ -248,6 +266,8 @@ def resolve_projects(cfg: dict) -> dict[str, dict]:
             for key in _INHERITED_SETTING_KEYS:
                 if key not in entry and key in cfg:
                     entry[key] = cfg[key]
+        for detail in shared_base_conflicts(out).values():
+            log.warning("[project_board] %s", detail)
         return out
     name = str(cfg.get("default_project") or "").strip() or IMPLICIT_PROJECT_NAME
     return {name: _synthesize_implicit_project(name, cfg)}

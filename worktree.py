@@ -1093,6 +1093,15 @@ async def off_base_checkout(repo: str, base: str) -> dict:
     return {"branch": branch, "off_base": True, "dirty": dirty, "unpushed": unpushed, "error": ""}
 
 
+async def origin_branch_exists(repo: str, branch: str) -> bool:
+    """Check live origin, never a stale tracking ref; failed reads remain uncertain."""
+    ref = f"refs/heads/{branch}"
+    rc, out, err = await _git(repo, "ls-remote", "--heads", "origin", ref, timeout=60)
+    if rc:
+        raise WorktreeError(f"git ls-remote failed: {(err or out).strip()[:200]}")
+    return any(line.split()[1:] == [ref] for line in out.splitlines())
+
+
 async def switch_base_checkout(repo: str, base: str) -> dict:
     """Switch ``repo``'s MAIN checkout back onto its ``base`` branch with ``git switch
     <base>`` (bd-z4jw6). The off-base recovery sweep calls this ONLY after it has confirmed

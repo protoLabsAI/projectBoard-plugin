@@ -167,6 +167,7 @@ WORKTREE_SEAMS: dict[str, str] = {
     "checkout_branch": "REAL",
     "off_base_checkout": "REAL",
     "switch_base_checkout": "REAL",
+    "origin_branch_exists": "REAL",  # #790: real bare origin in tests/test_shared_base_checkout_790.py.
     "remove_worktree": "REAL",
     "repo_slug": "REAL",
     "preserve_worktree": "REAL",
@@ -501,6 +502,7 @@ def test_worktree_coverage_contract_is_59_real_3_exempt_0_uncovered():
     # `off_base_checkout`, `switch_base_checkout` — all LOCAL git, exercised against a real
     # bare origin + clone in tests/test_preflight_off_base_checkout.py.
     # The 57th–59th recover stranded work against real git in test_shutdown_resume_stranded.py.
+    # The 60th checks live origin branches in test_shared_base_checkout_790.py.
     real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
     exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
     uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
@@ -510,7 +512,7 @@ def test_worktree_coverage_contract_is_59_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 59, f"expected 59 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 60, f"expected 60 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"
