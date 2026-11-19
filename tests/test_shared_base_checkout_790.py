@@ -1,8 +1,10 @@
 """Shared checkout conflicts and stale origin bases must never trigger repair."""
 
 from unittest.mock import AsyncMock
+from pathlib import Path
 
 import pytest
+from conftest import REAL_SEAMS
 
 from project_board import health, worktree
 from project_board.projects import resolve_projects
@@ -14,6 +16,47 @@ def _projects(repo, bases):
         name: {"repo": str(repo), "base_branch": base, "base_refresh": True}
         for name, base in zip(("app", "epic-a", "epic-b"), bases)
     }
+
+
+@pytest.mark.parametrize("condition", ["clean", "dirty", "unowned", "refresh_failure"])
+async def test_conflicting_checkout_keeps_refreshing_current_base(tmp_path, monkeypatch, condition):
+    origin = _Origin(tmp_path)
+    before = origin.head()
+    projects = _projects(origin.clone, ["main", "epic/a", "epic/b"])
+    if condition == "unowned":
+        for settings in projects.values():
+            settings["base_refresh"] = False
+    if condition == "dirty":
+        Path(origin.clone, "README.md").write_text("local edits\n")
+    lp = _loop(projects)
+    pages = _capture_pages(lp)
+    switch = AsyncMock()
+    monkeypatch.setattr(worktree, "switch_base_checkout", switch)
+    refresh = AsyncMock(wraps=REAL_SEAMS["worktree.refresh_base_checkout"])
+    if condition == "refresh_failure":
+        refresh.side_effect = OSError("remote unavailable")
+    monkeypatch.setattr(worktree, "refresh_base_checkout", refresh)
+
+    for index in range(3):
+        latest = origin.release(f"release {index}\n")
+        await lp._refresh_base_checkouts()
+        assert origin.head() == (latest if condition == "clean" else before)
+        assert _branch(origin.clone) == "main"
+        rows = health.base_checkouts_snapshot()
+        assert set(rows) == set(projects)
+        for row in rows.values():
+            assert row["state"] == "conflict"
+            for label in ("app (main)", "epic-a (epic/a)", "epic-b (epic/b)"):
+                assert label in row["detail"]
+
+    assert refresh.await_count == (0 if condition == "unowned" else 3)
+    for call in refresh.await_args_list:
+        assert call.args == (origin.clone, "main")
+    switch.assert_not_awaited()
+    assert pages == []
+    assert lp._off_base_passes == {}
+    if condition == "dirty":
+        assert Path(origin.clone, "README.md").read_text() == "local edits\n"
 
 
 async def test_conflicting_projects_never_switch(tmp_path, monkeypatch, caplog):

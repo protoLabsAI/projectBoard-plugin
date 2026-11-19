@@ -976,6 +976,12 @@ class PreflightMixin:
             if repo and os.path.realpath(repo) in conflicts:
                 where[name] = (repo, base)
                 results[name] = {"state": "conflict", "behind": 0, "detail": conflicts[os.path.realpath(repo)]}
+                # A disagreement forbids recovery switches, but must not stop the
+                # normal locked refresh of an owned checkout already on this base.
+                if os.path.exists(os.path.join(repo, ".git")) and self._base_refresh_owned(name, repo)[0]:
+                    off = await worktree.off_base_checkout(repo, base)
+                    if not off.get("error") and not off.get("off_base"):
+                        jobs.setdefault((os.path.realpath(repo), base), []).append(name)
                 continue
             if not repo or not os.path.exists(os.path.join(repo, ".git")):
                 continue  # no checkout: the repo setup check owns that
@@ -1032,7 +1038,10 @@ class PreflightMixin:
             if outcome["state"] == "unknown":
                 log.info("[project_board] base checkout for %s not refreshed: %s", ", ".join(names), outcome["detail"])
             for name in names:
-                results[name] = dict(outcome)
+                # Keep the configuration conflict visible even when its current
+                # branch was safely refreshed (or that refresh failed).
+                if key[0] not in conflicts:
+                    results[name] = dict(outcome)
         for name, row in results.items():
             repo, base = where[name]
             row.update(repo=repo, base=base, checked_at=stamp)
