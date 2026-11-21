@@ -22,6 +22,8 @@ from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
 from .. import host_friction, work_location_sweep, work_location_capture
 from ..failures import PROVIDER_STALL_CLASS
+from . import host_disk
+from .host_disk import HostDiskMixin
 
 
 def _host_shutdown(exc: BaseException | None) -> bool:
@@ -127,9 +129,12 @@ _READY_SKIP_MAX_DEFAULT = 5
 #  - WAITING_ON_PUBLISH: the card waits on an external fact (a publish, a release, a
 #    merged PR — `waits_for`, gates.py) and says so on its next_action. Waiting days for
 #    a release is the design, not a stuck dispatch.
+#  - "host-disk": the volume holding the card's checkout is out of room (#801). The loop
+#    pages the operator once for the volume and claims again when space is back; a
+#    terminal block per card is exactly what that hold replaces.
 # Waiting for a verdict is not a code failure or claim livelock.
 _NON_LIVELOCK_SKIP_REASONS = frozenset(
-    {"hot-file", "blocked", "preflight-hold", "preflight-pending", "reserved", WAITING_ON_PUBLISH}
+    {"hot-file", "blocked", "preflight-hold", "preflight-pending", "reserved", WAITING_ON_PUBLISH, HOST_DISK_CLASS}
 )
 
 
@@ -239,6 +244,8 @@ def _held_summary(feats) -> dict:
             ]
             if cls == PREFLIGHT_HOLD_CLASS:
                 step = PREFLIGHT_HOLD_STEP
+            elif cls == HOST_DISK_CLASS:
+                step = host_disk.HOLD_STEP  # the loop releases these itself (#801)
             elif healing and len(healing) == len(ids):
                 step = f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
             elif healing:
@@ -328,7 +335,7 @@ async def request_dispatch() -> dict:
     return await loop.dispatch_now()
 
 
-class DriveMixin:
+class DriveMixin(HostDiskMixin):
     def _labels_as_record(self) -> bool:
         """Label this card's PR as the board's to review (#318): only while the board's own
         review gate is on, since the gate's verdict is what the label hands the panel."""
@@ -784,6 +791,11 @@ class DriveMixin:
         if is_block and now and now.get("board_state") not in (None, "", "blocked"):
             block_pages.retire(now)
             return
+        if is_block and (now or {}).get("blocked_class") == HOST_DISK_CLASS:
+            # #801: a full disk is one condition of the host, paged ONCE for its volume
+            # (`host-disk:<volume>`, loop/host_disk.py) — never once per waiting card.
+            log.debug("[project_board] %s is held for disk space — covered by the host-disk page", fid)
+            return
         if is_block:
             text = block_pages.page_text(fid, now or {})
         key = f"blocked:{fid}"
@@ -954,6 +966,9 @@ class DriveMixin:
         # tick's claim scan, as it does in dispatch_now. A successfully evaluated scan
         # may leave runs in flight; the per-project claim barrier defers unknowns.
         if status != "stalled":
+            # Before the claim scan (#801): a volume with room again releases its held cards
+            # in time for this tick's scan to claim them. Its failure never stops a claim.
+            await self._tick_phase("host-disk hold", self._host_disk_tick)
             status, _ = await self._tick_phase("gate preflight", self._maybe_preflight)
             if status == "ok":
                 # Under the claim lock so an on-demand board_dispatch (#390) evaluating the
@@ -1164,6 +1179,8 @@ class DriveMixin:
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
         parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
         ready = await asyncio.to_thread(store.ready_queue, relaxed=self.relaxed_gate)
+        disk_probed: dict = {}  # checkout → this scan's free-space reading (#801)
+        self._host_disk_scan_start()
         for candidate in ready:  # priority order, dep-unblocked
             if len(self._drives) >= self.max_concurrent:
                 break  # remaining candidates are lower priority than what we already selected
@@ -1191,6 +1208,14 @@ class DriveMixin:
             # Disabled preflight and no command retain their dispatch semantics.
             if self.preflight and self._preflight_state.get(pname) is not True and self._preflight_cmd_for(candidate):
                 skipped.append({"fid": cid, "reason": "preflight-pending", "project": pname})
+                continue
+            # Host-disk hold (#801): the volume holding this card's checkout is nearly full
+            # (or cards already failed on it for disk space). Claim nothing there — every
+            # claim would fail at `worktree add` — and keep scanning: a card whose project
+            # lives on another volume still goes.
+            disk_skip = await self._host_disk_claim_skip(candidate, disk_probed)
+            if disk_skip:
+                skipped.append(disk_skip)
                 continue
             # Publish gates (`waits_for`, gates.py): an external fact — a version on npm, a
             # GitHub release, a merged PR — the card needs before a coder can start. Checked
@@ -3146,6 +3171,28 @@ class DriveMixin:
                     # Into the host's friction ledger, whatever happens to the card next: a
                     # drive's failure happens outside any agent turn, so nothing else records it.
                     self._friction_drive_failure(fid, exc, feature, base=base, branch=branch, refusal=coder_refusal)
+                    if await self._host_disk_failure(exc, repo):
+                        # #801: the HOST is out of room, not the card. No retry and no tier
+                        # climb (both fail the same way on the same disk), and no terminal
+                        # block: the card goes back to ready under a `host-disk` hold the
+                        # loop releases itself once space is freed. Like every drive-side
+                        # block, never over a card someone moved meanwhile (#398).
+                        if await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            f"{HOST_DISK_CLASS}: {exc}",
+                            category=HOST_DISK_CLASS,
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                        ):
+                            await self._host_disk_hold(store, feature, repo)
+                            if not isinstance(exc, worktree.EnvironmentPreparationError):
+                                # As on any block: save what the tree holds, then remove it (#405).
+                                await self._discard_tree(store, fid, repo, wt, branch, base=base)
+                            self._inflight.pop(fid, None)
+                        return
                     if isinstance(exc, worktree.EnvironmentPreparationError):
                         if await self._block_or_stand_aside(
                             store,

@@ -465,6 +465,18 @@ def _no_base_checkout_refresh(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _roomy_host_disk(monkeypatch):
+    """The claim scan reads the free space on the volume holding each card's checkout and
+    claims nothing under `min_free_disk_gb` (#801). Left real, every claim test in the suite
+    would depend on how full the machine running it is. Report plenty of room by default;
+    tests/test_host_disk_hold.py sets its own probe on the loop instance."""
+    from project_board.loop import host_disk
+
+    monkeypatch.setattr(host_disk.HostDiskMixin, "_disk_free", lambda self, path: 1024 * host_disk.GB)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_external_review_read(monkeypatch):
     """The PR reconcile asks GitHub for the external QA panel's verdict first (#473). In the
     unit tier every PR url is made up, so a real read would shell `gh` against a repo that
