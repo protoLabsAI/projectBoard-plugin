@@ -1152,10 +1152,20 @@ LIVE_KNOBS = (
     "coder",
     "br_autofetch",
     "merged_verify_max",
+    "archive_after_days",
+    "archive_keep_done",
 )
-LIVE_KNOB_FLOORS = {"max_concurrent": 1, "max_pending_reviews": 0, "max_concurrent_sessions": 0, "merged_verify_max": 0}
+LIVE_KNOB_FLOORS = {
+    "max_concurrent": 1,
+    "max_pending_reviews": 0,
+    "max_concurrent_sessions": 0,
+    "merged_verify_max": 0,
+    "archive_after_days": 1,
+    "archive_keep_done": 0,
+}
 # Knobs that are booleans (coerced by _knob_bool) or strings (stripped); everything
-# else in LIVE_KNOBS is an int with a floor in LIVE_KNOB_FLOORS.
+# else in LIVE_KNOBS uses integer coercion with a floor in LIVE_KNOB_FLOORS.
+# archive_after_days retains float storage for compatibility with construction.
 # `br_autofetch` (v0.43.0) is live so an operator who left it off can flip it on and
 # have the paused loop fetch `br` on its next setup check — no restart.
 LIVE_BOOL_KNOBS = ("auto_merge", "br_autofetch")
