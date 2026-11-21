@@ -1258,8 +1258,7 @@ class ReconcileMixin(WorktreeCleanup):
                 if cls == HOST_DISK_CLASS and await self._host_disk_adopt(store, f):
                     # #801: the host-disk hold owns this card — one page for the volume, and
                     # a release when space is back. Tracked here so a hold from before a
-                    # restart (or a block set outside a drive on a disk that reads full) is
-                    # released too. A card that only carries the class — given from the
+                    # restart is released too. A card that only carries the class — given from the
                     # words of its reason — is not held: it takes the ordinary path below.
                     continue
                 # The reason rides a COMMENT. `br list` carries none, but since #416 the

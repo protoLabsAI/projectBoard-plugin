@@ -383,8 +383,8 @@ class HostDiskMixin:
         """Track a card found blocked ``host-disk`` that this process is not holding yet,
         so the next tick that finds its volume with room releases it. True when the card is
         (now) held. Only for a card the loop put under the hold (its reason starts with
-        ``HOLD_REASON_PREFIX`` — one a previous run held), or one whose volume reads under
-        the threshold right now (a block set outside a drive on a disk that IS full). The
+        ``HOLD_REASON_PREFIX`` — one a previous run held). Low space now does not prove
+        that an earlier failure was caused by the disk. The
         class alone comes from the reason's text and proves nothing: such a card is left
         to the blocked sweep's ordinary handling (False)."""
         fid = feature.get("id")
@@ -398,10 +398,10 @@ class HostDiskMixin:
             if not reason:  # a listing row without its comment thread: read the card once
                 fresh = await asyncio.to_thread(store.get_feature, fid) or {}
                 reason = str(fresh.get("blocked_reason") or "").strip()
+            if not is_hold_reason({**feature, "blocked_reason": reason}):
+                return False
             repo = self._repo_for(feature)
             volume, low, _free = await self._host_disk_probe_safe(repo)
-            if not is_hold_reason({**feature, "blocked_reason": reason}) and not low:
-                return False
             if not volume:  # the probe could not read it; the hold is still the loop's own
                 volume = await asyncio.to_thread(self._disk_volume, repo)
         except Exception:  # noqa: BLE001 — adoption is best-effort; the next sweep retries

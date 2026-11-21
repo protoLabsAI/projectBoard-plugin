@@ -644,26 +644,43 @@ async def test_a_disk_full_error_on_a_disk_with_room_keeps_its_ordinary_block_an
     assert board.get_feature("bd-1")["bead_status"] == "in_progress" and len(inbox) == 1
 
 
-async def test_a_block_that_only_quotes_a_disk_error_is_not_adopted_as_a_hold(monkeypatch, inbox):
-    """A block set outside a drive is classified `host-disk` from its reason's words. With
-    room on the volume it is an ordinary block; with the volume reading full it is held."""
-    board = Board({"bd-1": "/a/one", "bd-2": "/a/two"})
+@pytest.mark.parametrize("missing_reason", [False, True])
+async def test_a_block_that_only_quotes_a_disk_error_is_not_adopted_as_a_hold(monkeypatch, inbox, missing_reason):
+    """Text-only blocks keep their pages even beside a genuine hold on a full volume."""
+    board = Board({"bd-1": "/a/one", "bd-2": "/a/two", "bd-3": "/a/three"})
     for fid in board.beads:
         board.claim(fid, assignee="proto")
-        board.flag_blocked(fid, "gate output: No space left on device", automatic=True)
+        reason = HELD_REASON if fid == "bd-3" else "gate output: No space left on device"
+        board.flag_blocked(fid, reason, automatic=True)
         assert board.get_feature(fid)["blocked_class"] == HOST_DISK_CLASS
-    disk = _Disk({"/a/one": VOL_A, "/a/two": VOL_B})
+    board.requeue("bd-3")
+    if missing_reason:
+        list_features = board.list_features
+        monkeypatch.setattr(
+            board, "list_features",
+            lambda *args, **kwargs: [{**f, "blocked_reason": ""} for f in list_features(*args, **kwargs)],
+        )
+    disk = _Disk({"/a/one": VOL_A, "/a/two": VOL_B, "/a/three": VOL_B})
     disk.free[VOL_B] = GB
     loop = _loop(monkeypatch, board, disk)
 
     await loop._recover_blocked(board)
     await loop._host_disk_tick()
 
-    assert set(loop._host_disk_state()) == {VOL_B} and loop._host_disk_state()[VOL_B]["held"].keys() == {"bd-2"}
-    keys = sorted(r["dedup_key"].split(":")[0] for r in _pending(inbox))
-    assert keys == ["blocked", "host-disk"]  # bd-1's own page; one page for the full volume
-    assert not loop._host_disk_holds(board.get_feature("bd-1")) and loop._host_disk_holds(board.get_feature("bd-2"))
+    assert set(loop._host_disk_state()) == {VOL_B}
+    assert loop._host_disk_state()[VOL_B]["held"].keys() == {"bd-3"}
+    pending = _pending(inbox)
+    card_pages = [r for r in pending if r["dedup_key"].startswith("blocked:")]
+    assert len(card_pages) == 2
+    for fid in ("bd-1", "bd-2"):
+        assert any(fid in r["dedup_key"] for r in card_pages)
+        assert not loop._host_disk_holds(board.get_feature(fid))
+    assert [r["dedup_key"] for r in pending if r not in card_pages] == [f"host-disk:{VOL_B}"]
+    assert loop._host_disk_holds(board.get_feature("bd-3"))
 
     disk.free[VOL_B] = 50 * GB
     await loop._host_disk_tick()
-    assert board.states()["bd-1"] == "blocked" and not board.get_feature("bd-2")["blocked"]
+    await loop._recover_blocked(board)
+    assert board.states() == {"bd-1": "blocked", "bd-2": "blocked", "bd-3": "ready"}
+    assert _pending(inbox) == card_pages
+    assert loop._host_disk_state() == {}
