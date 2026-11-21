@@ -31,6 +31,7 @@ from fastapi import BackgroundTasks, Request  # module-level so stringized route
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import setup_check
+from .board_cards import summary_row
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
 from .store import (
@@ -1000,6 +1001,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         state: str | None = None,
         include_archived: bool = False,
         project: str | None = None,
+        view: str | None = None,
     ):
         # _guard, like every other store-touching route: an unusable board (no repo
         # bound, no .beads, br missing) must reach the view as JSON 400 with the
@@ -1022,7 +1024,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
 
         def _render():
             snap = read_cache.snapshot(include_archived)
-            body = {"features": annotate_next_action(_rows(snap, state, want), cfg or {})}
+            rows = annotate_next_action(_rows(snap, state, want), cfg or {})
+            body = {"features": [summary_row(f) for f in rows] if view == "summary" else rows}
             raw = json.dumps(body, sort_keys=True, default=_json_default, separators=(",", ":")).encode()
             return raw, _etag_of(raw), snap
 

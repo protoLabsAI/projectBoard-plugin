@@ -29,7 +29,7 @@ def test_the_drawer_renders_the_ledger_from_the_single_card_read_above_the_contr
     """The ledger comes from the single-card GET the drawer already makes (the same read
     the deliverable comes from), and it renders ABOVE Approve/Reject — where the verifier
     is looking when they decide."""
-    merge = "{...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements}"
+    merge = "{...d.feature, ...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements}"
     assert merge in _fn("syncTaskDrawer")
     detail = _fn("taskDetail")
     assert "h += taskRequirements(f);" in detail

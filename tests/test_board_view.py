@@ -797,13 +797,13 @@ def test_r1_drawer_fetches_the_single_feature_route_for_the_deliverable():
 
 
 def test_r1_drawer_splices_the_fetched_deliverable_onto_the_list_summary():
-    """r1: syncTaskDrawer keeps the list projection (state/spec/controls) as the base and
-    overlays ONLY the single-fetch deliverable once it has landed for THIS task — so a
+    """r1: syncTaskDrawer keeps full text from the single-card read and overlays live
+    list metadata once it has landed for THIS task — so a
     recorded deliverable renders in the drawer, which it never did off the list poll."""
     assert "const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;" in BOARD_PAGE
     # #399 splices the requirement ledger from the same single-card read, beside it
     assert (
-        "const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable, "
+        "const merged = d && d.feature ? {...d.feature, ...f, deliverable: d.feature.deliverable, "
         "requirements: d.feature.requirements} : f;" in BOARD_PAGE
     )
     assert '$("drawer-body").innerHTML = err + note + taskDetail(merged);' in BOARD_PAGE
@@ -831,9 +831,12 @@ def test_r3_no_deliverable_and_coding_cards_are_unaffected():
     starts null and is dropped on every open so a task never inherits the prior one's."""
     assert "let TASK_DETAIL = null;" in BOARD_PAGE
     # the merge falls back to the bare list `f` when nothing has been fetched
-    assert "? {...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;" in BOARD_PAGE
-    # the poll still pulls the plain list route — deliverable is NOT added there
-    assert 'kit.apiFetch("/api/plugins/project_board/features",' in BOARD_PAGE
+    assert (
+        "? {...d.feature, ...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;"
+        in BOARD_PAGE
+    )
+    # the poll pulls summary rows — deliverable is NOT added there
+    assert 'kit.apiFetch("/api/plugins/project_board/features?view=summary",' in BOARD_PAGE
     # openTask drops the prior task's fetched detail
     assert "TASK_DETAIL = null;" in BOARD_PAGE
 

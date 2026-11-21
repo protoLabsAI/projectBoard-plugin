@@ -510,7 +510,7 @@ async function load(){
   const seq = ++LOAD_SEQ;
   LAST_FULL = Date.now();
   try {
-    const res = await kit.apiFetch("/api/plugins/project_board/features",
+    const res = await kit.apiFetch("/api/plugins/project_board/features?view=summary",
       FEATURES_ETAG ? {headers: {"if-none-match": FEATURES_ETAG}} : undefined);
     if (seq !== LOAD_SEQ) return;
     // The server answered from its previous snapshot because `br` was busy (its refresh
@@ -792,7 +792,7 @@ function blockedLine(f){
   return '<div class="why">'+heal+(why ? '<span class="why-t" title="'+esc(why)+'">'+esc(why)+'</span>' : '')+'</div>';
 }
 function cardHTML(f, state){
-  const spec = specLine(f.spec);
+  const spec = f.spec_preview ?? specLine(f.spec);
   const meta = (flags(f)+' '+taskFoot(f)).trim();
   return (isFollowed(f.id) ? '<span class="follow-tag">Following</span>' : '')
     + '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
@@ -1503,6 +1503,7 @@ let MON_FID = null, MON_TIMER = null, TASK_FID = null, MON_LAST_FID = null;
 // monitor's on-open /progress posture). Shape: {fid, feature} on success, {fid, error} on
 // a failed fetch (surfaced in the drawer); null when no task is open / not yet fetched.
 let TASK_DETAIL = null;
+const TASK_DETAIL_REV = {};
 // Monotonic ticket for fetchTaskDetail — see its comment: fences two in-flight
 // fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
 const TASK_DETAIL_SEQ = {};
@@ -1852,6 +1853,7 @@ function openTask(fid){
 // action on task A bump the sequence and silently invalidate task B's in-flight fetch
 // after the drawer switched, leaving B with no deliverable and no replacement fetch.
 async function fetchTaskDetail(fid){
+  TASK_DETAIL_REV[fid] = (featureById(fid) || {}).updated_at;
   const seq = TASK_DETAIL_SEQ[fid] = (TASK_DETAIL_SEQ[fid] || 0) + 1;
   try {
     const f = await api(FEAT + encodeURIComponent(fid));
@@ -1873,15 +1875,11 @@ function syncTaskDrawer(){
   // The header names the task: its id, then its title (inline code rendered, escaped).
   const dt = $("drawer-title"), dh = 'Task — '+esc(f.id)+(f.title ? '<span class="dt-name">'+inlineCode(f.title)+'</span>' : '');
   if (dt.innerHTML !== dh) dt.innerHTML = dh;                     // unchanged → untouched (no reflow per poll)
-  // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
-  // action re-render still tracks in_progress → in_review → done; the comment-derived
-  // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it
-  // has landed for THIS task (#312), and so is the requirement ledger (#399) — the
-  // verifier reads the same card read the deliverable came from. A failed single-fetch
-  // surfaces as an error callout ABOVE the detail rather than leaving the deliverable
-  // silently blank; an approval past open requirements (VERIFY_NOTE) rides the same slot.
+  // Full text comes from the single-card read; live metadata still follows the poll.
+  // Record the requested revision before fetching so repeated renders cannot fan out.
   const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;
-  const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;
+  if (d && f.updated_at && TASK_DETAIL_REV[TASK_FID] !== f.updated_at) fetchTaskDetail(TASK_FID);
+  const merged = d && d.feature ? {...d.feature, ...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;
   const err = d && d.error
     ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load task detail: " + d.error)+'</div>'
     : "";

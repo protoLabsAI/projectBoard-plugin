@@ -272,6 +272,45 @@ def card_row(f: dict) -> dict:
     return {k: f[k] for k in _CARD_KEYS if k in f}
 
 
+# The board listing shares the chat-card metadata, but never the attempts body.
+# Keep lane placement, sorting, badges, building attribution and drawer invalidation.
+_SUMMARY_KEYS = tuple(k for k in _CARD_KEYS if k != "attempts") + (
+    "priority",
+    "labels",
+    "depends_on",
+    "open_depends_on",
+    "bead_status",
+    "closed_at",
+    "created_at",
+    "updated_at",
+    "assignee",
+    "self_verified",
+    "delivered",
+    "delivered_by",
+    "verified_by",
+)
+
+
+# ECMAScript whitespace (including BOM), for parity with specLine trim/\s.
+_JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+
+
+def spec_preview(spec: str | None) -> str:
+    """Match board.js specLine, including its 160 UTF-16-code-unit limit."""
+    line = next(
+        (line for raw in (spec or "").split("\n") if (line := raw.lstrip(_JS_SPACE + "#>*-+").strip(_JS_SPACE))), ""
+    )
+    encoded = line.encode("utf-16-le", errors="surrogatepass")
+    if len(encoded) > 320:
+        return encoded[:314].decode("utf-16-le", errors="surrogatepass") + "…"
+    return line
+
+
+def summary_row(f: dict) -> dict:
+    """Additive /features?view=summary projection; full listings and /cards stay intact."""
+    return {**{k: f[k] for k in _SUMMARY_KEYS if k in f}, "spec_preview": spec_preview(f.get("spec"))}
+
+
 STATE_LABEL = {
     "backlog": "backlog",
     "ready": "on deck",
