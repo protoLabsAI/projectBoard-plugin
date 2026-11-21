@@ -2055,6 +2055,20 @@ class BeadsBoard:
         new revision with the old rows."""
         try:
             return self._shell_br(*args, want_json=want_json, with_has_more=with_has_more, actor=actor)
+        except FileNotFoundError as exc:
+            repo = self.repo or "."
+            if not os.path.isdir(repo):
+                names = [name for name, entry in self.projects.items() if entry.get("repo") == repo]
+                if not names:
+                    # The board's own (flat / default) repo: there is no project to remove.
+                    raise BoardError(
+                        f"board repo folder {repo!r} is missing — restore the folder or fix project_board.repo"
+                    ) from exc
+                project = ", ".join(repr(name) for name in names)
+                raise BoardError(
+                    f"project {project}: repo folder {repo!r} is missing — remove the project or restore the folder"
+                ) from exc
+            raise BoardError(f"could not run beads CLI {BR!r}: {exc}") from exc
         finally:
             if args and args[0] in _PROJECTION_WRITES:
                 work_snapshot.note_board_write()

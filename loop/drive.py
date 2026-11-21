@@ -134,7 +134,16 @@ _READY_SKIP_MAX_DEFAULT = 5
 #    terminal block per card is exactly what that hold replaces.
 # Waiting for a verdict is not a code failure or claim livelock.
 _NON_LIVELOCK_SKIP_REASONS = frozenset(
-    {"hot-file", "blocked", "preflight-hold", "preflight-pending", "reserved", WAITING_ON_PUBLISH, HOST_DISK_CLASS}
+    {
+        "missing-repo",
+        "hot-file",
+        "blocked",
+        "preflight-hold",
+        "preflight-pending",
+        "reserved",
+        WAITING_ON_PUBLISH,
+        HOST_DISK_CLASS,
+    }
 )
 
 
@@ -870,6 +879,20 @@ class DriveMixin(HostDiskMixin):
             loop_snapshot=setup_check.snapshot_of(self.cfg),
         )
 
+    def _report_missing_repos(self, repo_status: dict) -> None:
+        """Refresh availability and warn once per project/path disappearance."""
+        missing = repo_status.get("missing_projects", {})
+        previous = getattr(self, "_missing_repos", {})
+        for name, path in missing.items():
+            if previous.get(name) != path:
+                log.warning(
+                    "[project_board] skipping project %r: repo folder %r is missing — "
+                    "remove the project or restore the folder",
+                    name,
+                    path,
+                )
+        self._missing_repos = dict(missing)
+
     async def _setup_gate(self) -> bool:
         """Hold the puller until the setup preflight has no loop blockers (no `br`,
         an unresolvable coder, an unbound repo — each of which turned EVERY tick into
@@ -887,6 +910,7 @@ class DriveMixin(HostDiskMixin):
                 # spent; it arms the fetch when `br_autofetch` was flipped on live.
                 await asyncio.to_thread(self._ensure_br)
                 status = await asyncio.to_thread(self._setup_status)
+                self._report_missing_repos(status.get("repo", {}))
                 self._gap_reporter.report(status)
                 blockers = setup_check.loop_blockers(status)
             except Exception:  # noqa: BLE001 — a broken probe must fail OPEN, never wedge the loop
@@ -1202,6 +1226,9 @@ class DriveMixin(HostDiskMixin):
             # gate on clean base — skip it (it was flag_blocked above), but keep scanning
             # so a sibling in a HEALTHY project still gets claimed this tick.
             pname = self._project_name(candidate)
+            if pname in getattr(self, "_missing_repos", {}):
+                skipped.append({"fid": cid, "reason": "missing-repo", "project": pname})
+                continue
             if isinstance(self._preflight_state.get(pname), str):
                 skipped.append({"fid": cid, "reason": "preflight-hold", "project": pname})
                 continue
@@ -1567,6 +1594,10 @@ class DriveMixin(HostDiskMixin):
         ``dispatched``)."""
         if not self.enabled:
             return self._dispatch_disabled_record()
+        repo_status = await asyncio.to_thread(setup_check._repo_check, self.cfg, os.path.isdir)
+        self._report_missing_repos(repo_status)
+        if repo_status.get("missing_projects") and not repo_status["ok"]:
+            return self._dispatch_error_record("repository setup", BoardError(repo_status["hint"]))
         # Fail-closed preflight FIRST, exactly as the periodic tick does before its claim
         # scan (`_run`): a newly-required or freshly-failing per-project gate must hold this
         # on-demand dispatch too, or an interactive kick could claim work the next tick

@@ -764,22 +764,38 @@ def _repo_check(cfg: dict, isdir) -> dict:
         if isdir(os.path.join(default_repo, ".beads")):
             return {"ok": True, "path": default_repo, "hint": ""}
         return {"ok": False, "path": default_repo, "hint": REPO_UNBOUND_HINT}
-    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
     # NB: a multi-entry projects: map with an explicitly blank db_path is NOT a repo
     # failure — since D3 (#260) the blank resolves to the instance store, so the board
     # runs correctly on one shared db. The stale override is the `db` ADVISORY in
     # setup_status, not a pause.
-    for name, entry in projects.items():
-        path = str((entry or {}).get("repo") or "").strip()
-        if not path or not isdir(path):
-            where = f" (project {name!r})" if explicit else ""
-            return {
-                "ok": False,
-                "path": path or default_repo,
-                "hint": f"repo {path or default_repo!r} does not exist{where} — fix project_board.repo "
-                "(or the projects: entry) in Settings ▸ Project Board",
-            }
-    return {"ok": True, "path": default_repo, "hint": ""}
+    missing = {
+        name: str((entry or {}).get("repo") or "").strip()
+        for name, entry in projects.items()
+        if not isdir(str((entry or {}).get("repo") or "").strip())
+    }
+    if not missing:
+        return {"ok": True, "path": default_repo, "hint": ""}
+    default = resolve_default_project(cfg)
+    blocked = default in missing or len(missing) == len(projects)
+    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    hints = []
+    for name, path in missing.items():
+        where = f" (project {name!r})" if explicit else ""
+        if blocked and (name == default or not explicit):
+            # The repo the board itself is bound to: "remove the project" is not the fix.
+            action = (
+                "fix project_board.repo (or the projects: entry) in Settings ▸ Project Board, or restore the folder"
+            )
+        else:
+            action = "remove the project or restore the folder"
+        hints.append(f"repo {path or default_repo!r} does not exist{where} — {action}")
+    # Keep the finding visible even when healthy siblings can continue.
+    return {
+        "ok": not blocked,
+        "path": missing.get(default, next(iter(missing.values()))) if blocked else default_repo,
+        "hint": "; ".join(hints),
+        "missing_projects": missing,
+    }
 
 
 def setup_status(
@@ -1292,6 +1308,11 @@ class GapReporter:
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
+                # #803: a missing SECONDARY project no longer fails the repo check (healthy
+                # projects keep building), but the operator must still see it — keep the
+                # warning up until the folder is restored or the project removed.
+                if msg is None and key == "repo" and check.get("missing_projects"):
+                    msg = str(check.get("hint") or "") or None
             if not first and key in self._reported and self._reported[key] == msg:
                 continue
             self._reported[key] = msg

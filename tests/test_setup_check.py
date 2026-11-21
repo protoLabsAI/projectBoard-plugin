@@ -333,7 +333,7 @@ def test_bound_repo_must_exist_on_disk(tmp_path):
 def test_projects_map_names_the_missing_project_repo(tmp_path):
     cfg = {"coder": "proto", "projects": {"web": {"repo": str(tmp_path)}, "api": {"repo": "/gone"}}}
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
-    assert s["repo"]["ok"] is False and "(project 'api')" in s["repo"]["hint"]
+    assert s["repo"]["ok"] is True and "(project 'api')" in s["repo"]["hint"]
 
 
 def test_malformed_projects_map_is_the_repo_finding_not_a_raise():
@@ -386,11 +386,16 @@ def test_a_shared_db_path_still_passes_quietly(tmp_path):
     assert s["repo"]["ok"] is True
 
 
-def test_a_missing_project_dir_still_fails_the_repo_check_on_a_blank_db_path(tmp_path):
+def test_a_missing_default_project_dir_still_fails_on_a_blank_db_path(tmp_path):
     """The removed advisory shared this config shape, so this guards that dropping it
     did not take the real finding with it: a missing dir is the repo CHECK's failure and
     still pauses the loop."""
-    cfg = {"coder": "proto", "db_path": "", "projects": {"web": {"repo": str(tmp_path)}, "api": {"repo": "/gone"}}}
+    cfg = {
+        "coder": "proto",
+        "db_path": "",
+        "default_project": "api",
+        "projects": {"web": {"repo": str(tmp_path)}, "api": {"repo": "/gone"}},
+    }
     s = setup_status(cfg, which=_which_all, delegates=_delegates("proto"), run=_fake_run())
     assert s["repo"]["ok"] is False and "/gone" in s["repo"]["hint"]
     assert "repo" in s["loop_blockers"]

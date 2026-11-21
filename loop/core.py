@@ -370,6 +370,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # reason; `_preflight_held[name]` is the set of fids THIS loop blocked for that
         # project's failed preflight; `_last_preflight[name]` throttles its re-checks.
         self._preflight_state: dict[str, bool | str | None] = {}
+        # #803: project name → repo path for registered projects whose folder is gone,
+        # refreshed by every setup gate / manual dispatch (`_report_missing_repos`).
+        self._missing_repos: dict[str, str] = {}
         self._preflight_no_command: set[str] = set()  # runnable, but no gate verdict (#612)
         # Projects whose last preflight ran against a non-base checkout (#255): the
         # verdict was downgraded to indeterminate, and /status says so rather than
