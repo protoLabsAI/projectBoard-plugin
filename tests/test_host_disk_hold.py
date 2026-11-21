@@ -657,7 +657,8 @@ async def test_a_block_that_only_quotes_a_disk_error_is_not_adopted_as_a_hold(mo
     if missing_reason:
         list_features = board.list_features
         monkeypatch.setattr(
-            board, "list_features",
+            board,
+            "list_features",
             lambda *args, **kwargs: [{**f, "blocked_reason": ""} for f in list_features(*args, **kwargs)],
         )
     disk = _Disk({"/a/one": VOL_A, "/a/two": VOL_B, "/a/three": VOL_B})
