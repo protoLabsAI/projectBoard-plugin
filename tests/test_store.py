@@ -1445,19 +1445,16 @@ def _blocked_then_cancelled():
     return _gf
 
 
-def test_cancel_feature_clears_the_blocked_label_before_close(make_board, monkeypatch):
-    """#325: cancelling a card blocked through the normal board path drops the `blocked`
-    label alongside the `cancelled` tag (one atomic `br update`) — a terminal card can't
-    remain a live blocker, the same invariant record_merge / mark_done enforce. The
-    projection reads terminal `cancelled` with blocked cleared, and the audit reason is
-    preserved."""
+def test_cancel_feature_clears_the_blocked_label_after_close(make_board, monkeypatch):
+    """Live labels remain until the close succeeds."""
     br = Br()  # `show` → [] : no open blocker EDGES gate this feature
     b = make_board(br)
     monkeypatch.setattr(b, "get_feature", _blocked_then_cancelled())
     f = b.cancel_feature("bd-9", "scope cut")
-    # the cancel tag write ALSO drops the blocked label — one atomic write, not two
     update = next(c for c in br.calls if c[0] == "update")
-    assert update == ("update", "bd-9", "--add-label", "cancelled", "--assignee", "", "--remove-label", "blocked")
+    assert update == ("update", "bd-9", "--add-label", "cancelled", "--assignee", "")
+    strip = ("update", "bd-9", "--remove-label", "blocked")
+    assert br.calls.index(strip) > next(i for i, c in enumerate(br.calls) if c[0] == "close")
     # …then it closes with the auditable cancel reason (the `cancelled` tag stands)
     close = next(c for c in br.calls if c[0] == "close")
     assert close == ("close", "bd-9", "-r", "cancelled: scope cut")
@@ -1479,22 +1476,19 @@ def test_cancel_feature_unblocked_does_not_touch_the_blocked_label(make_board, m
     assert all("blocked" not in c for c in br.calls if c[0] == "update")
 
 
-def test_cancel_feature_rollback_restores_the_blocked_label(make_board, monkeypatch):
-    """#325 + #106: if `br close` fails after the blocked card was tagged `cancelled` and
-    unblocked, the rollback re-adds `blocked` (and removes `cancelled`) so the card lands
-    back in its exact pre-cancel state — blocked, never a half-cancelled, now-unblocked
-    zombie."""
+def test_cancel_feature_rollback_preserves_the_blocked_label(make_board, monkeypatch):
+    """Live labels remain until the close succeeds."""
     br = Br(returns={"close": _raise_on_close})
     b = make_board(br)
     # flag_blocked clears the assignee, so a blocked card is unassigned pre-cancel.
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "assignee": "", "labels": ["blocked"]})
     with pytest.raises(BoardError, match="failed"):
         b.cancel_feature("bd-9", "scope cut — folded into bd-42")
-    # forward: tag `cancelled` + drop `blocked` in one update…
-    assert ("update", "bd-9", "--add-label", "cancelled", "--assignee", "", "--remove-label", "blocked") in br.calls
-    # …then close blew up, so the compensating write undoes the tag AND re-adds `blocked`
+    assert ("update", "bd-9", "--add-label", "cancelled", "--assignee", "") in br.calls
+    # A failed close undoes only the tag; blocked was never removed.
     # (no assignee token — a blocked card was already unassigned, nothing to restore).
-    assert ("update", "bd-9", "--remove-label", "cancelled", "--add-label", "blocked") in br.calls
+    assert ("update", "bd-9", "--remove-label", "cancelled") in br.calls
+    assert all("blocked" not in c for c in br.calls if c[0] == "update")
 
 
 def test_cancelled_card_projects_unblocked_even_if_the_label_lingered(make_board):
@@ -2057,9 +2051,8 @@ def test_mark_done_without_a_reason_closes_bare_and_skips_the_comment(make_board
     assert not any(c[0] == "comments" for c in br.calls)
 
 
-def test_mark_done_from_blocked_clears_the_blocked_label_first(make_board, monkeypatch):
-    """A blocked card can be hand-done too: like record_merge, mark_done clears the
-    `blocked` label before closing (or `br close` refuses / the card stays stuck)."""
+def test_mark_done_from_blocked_clears_the_blocked_label_after_close(make_board, monkeypatch):
+    """Live labels remain until the close succeeds."""
     br = Br()
     b = make_board(br)
     monkeypatch.setattr(b, "get_feature", _source_then_done("blocked"))

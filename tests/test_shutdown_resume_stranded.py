@@ -634,8 +634,9 @@ def test_opening_a_pr_on_a_card_without_a_record_writes_what_it_always_did(make_
 def test_cancelling_clears_the_record(make_board):
     board, runs = _recording_board(make_board, _bead([f"stranded:{SHA}"]))
     board.cancel_feature(FID, "scope cut")
-    tag = next(r for r in runs if r[:2] == ("update", FID) and "cancelled" in r)
-    assert ("--remove-label", f"stranded:{SHA}") in list(zip(tag, tag[1:]))
+    strip = next(r for r in runs if r[:2] == ("update", FID) and f"stranded:{SHA}" in r)
+    assert ("--remove-label", f"stranded:{SHA}") in list(zip(strip, strip[1:]))
+    assert runs.index(strip) > next(i for i, r in enumerate(runs) if r[0] == "close")
 
 
 def test_clearing_is_a_no_op_without_a_record(make_board):

@@ -222,7 +222,8 @@ MAX_UNCOVERED_HOST = 1
 # a version matrix (0.1.23 / 0.2.16 / 0.3.2) with PB_REQUIRE_BR=1 so an absent binary
 # FAILS rather than skips. #353 and #356 were both caught by adding to it.
 STORE_SEAMS: dict[str, str] = {
-    "_close_restoring_stale": "REAL",  # #536: the shared `br close` (+ atomic undo) for record_merge/mark_done; real `br` in tests/test_stale_alerts_536.py
+    "_close_then_strip_stale": "REAL",  # Close with timeout re-read before terminal cleanup.
+    "_strip_terminal_stale": "REAL",  # Best-effort terminal label cleanup.
     "_create": "UNCOVERED",
     "_create_feature": "REAL",  # create_feature's body, run under the hot-file chain lock; real `br` (test_card_authoring_455.py)
     "_find_by_external_ref": "UNCOVERED",
@@ -252,7 +253,6 @@ STORE_SEAMS: dict[str, str] = {
     "list_features": "REAL",
     "live_cards": "REAL",  # #401 review: the snapshot's light read, real `br` (test_work_snapshot_review_401.py)
     "mark_designing": "UNCOVERED",
-    "mark_done": "UNCOVERED",
     "mark_ready": "REAL",
     "open_review": "REAL",
     "raw_features_with_comments": "REAL",
@@ -262,7 +262,6 @@ STORE_SEAMS: dict[str, str] = {
     "record_delivery": "REAL",
     "record_work_location": "REAL",  # #572: real beads restart roundtrip in tests/test_work_locations.py
     "record_gens_spent": "REAL",
-    "record_merge": "REAL",
     "record_merged_verified": "REAL",
     "record_pr_url": "REAL",  # #398: through real `br` in tests/test_requeue_under_drive_398.py
     "record_review_bounce": "REAL",  # #473: the head stamp + comment, real `br` in tests/test_external_review_473.py
@@ -290,7 +289,7 @@ STORE_SEAMS: dict[str, str] = {
 # seam is now REAL or an honestly-recorded EXEMPT, so the worktree UNCOVERED floor is 0 and a
 # newly-added UNCOVERED worktree seam fails this file outright.
 MAX_UNCOVERED_WORKTREE = 0
-MAX_UNCOVERED_STORE = 16
+MAX_UNCOVERED_STORE = 15
 
 # The EXEMPT ratchet. An EXEMPT drops a seam from MAX_UNCOVERED_WORKTREE, so EXEMPT must itself be
 # bounded or the label would let real debt vanish (the review finding on the UNCOVERED → EXEMPT
