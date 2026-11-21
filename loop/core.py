@@ -215,6 +215,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # out of the default board view, NEVER deleted (query back via
         # include_archived). Rides the sweep cadence; no scheduler of its own.
         self.archive_after_days = float(self.cfg.get("archive_after_days", 7))
+        # Count cap after the age pass (#793); 0 keeps age-only archival.
+        self.archive_keep_done = _knob_int(self.cfg, "archive_keep_done", store_mod.ARCHIVE_KEEP_DONE_DEFAULT, floor=0)
         # #585: host-reported silence gets a separate, durable same-tier retry budget.
         self.provider_stall_idle_s = max(0.0, float(self.cfg.get("provider_stall_idle_s", 600)))
         self.provider_stall_max = max(0, int(self.cfg.get("provider_stall_max", 2)))

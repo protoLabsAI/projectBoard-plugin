@@ -3536,7 +3536,7 @@ async def test_sweep_reclaims_a_dead_acp_task_end_to_end(monkeypatch):
         def requeue(self, fid):
             self.requeued.append(fid)
 
-        def archive_stale(self, archive_after_days=7):
+        def archive_stale(self, archive_after_days=7, *, keep_done=0):
             return []
 
     store = _Store()
@@ -5970,6 +5970,7 @@ class _SweepStore:
         self._features = features or {}  # fid -> board_state
         self.requeued = []
         self.archive_windows = []  # archive_after_days of each archive pass (#115)
+        self.archive_caps = []  # keep_done of each archive pass (#793)
 
     def list_features(self, state=None):
         return [{"id": f} for f in self._in_progress] if state == "in_progress" else []
@@ -5984,8 +5985,9 @@ class _SweepStore:
         st = self._features.get(fid)
         return {"id": fid, "board_state": st} if st else None
 
-    def archive_stale(self, archive_after_days=7):
+    def archive_stale(self, archive_after_days=7, *, keep_done=0):
         self.archive_windows.append(archive_after_days)
+        self.archive_caps.append(keep_done)
         return []
 
 
@@ -6112,14 +6114,29 @@ def test_archive_window_config_default_and_override():
     assert BoardLoop({"archive_after_days": 30}).archive_after_days == 30
 
 
-async def test_sweep_runs_the_archive_pass_with_the_configured_window(monkeypatch):
+@pytest.mark.parametrize(
+    "cfg, expected",
+    [
+        ({}, store_mod.ARCHIVE_KEEP_DONE_DEFAULT),
+        ({"archive_keep_done": 30}, 30),
+        ({"archive_keep_done": 0}, 0),
+        ({"archive_keep_done": -5}, 0),
+    ],
+)
+def test_archive_keep_done_config_default_override_and_floor(cfg, expected):
+    assert BoardLoop(cfg).archive_keep_done == expected
+
+
+@pytest.mark.parametrize("keep_done", [store_mod.ARCHIVE_KEEP_DONE_DEFAULT, 30, 0])
+async def test_sweep_runs_the_archive_pass_with_the_configured_window(monkeypatch, keep_done):
     """The archive pass (#115) rides the existing health sweep — no scheduler of its
-    own — and hands the store the configured window."""
+    own — and hands the store the configured window and count cap."""
     store = _SweepStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
-    await BoardLoop({"archive_after_days": 3})._sweep()
+    await BoardLoop({"archive_after_days": 3, "archive_keep_done": keep_done})._sweep()
     assert store.archive_windows == [3.0]
+    assert store.archive_caps == [keep_done]
 
 
 async def test_sweep_survives_an_archive_pass_failure(monkeypatch):
@@ -6127,7 +6144,7 @@ async def test_sweep_survives_an_archive_pass_failure(monkeypatch):
     (the self-heal halves already ran) or escape into the loop."""
     store = _SweepStore(in_progress=["bd-1"])
 
-    def _boom(archive_after_days=7):
+    def _boom(archive_after_days=7, *, keep_done=0):
         raise RuntimeError("br unavailable")
 
     store.archive_stale = _boom
@@ -10250,7 +10267,7 @@ class _ThreadProbeStore:
         self._run("record_merge")
         return True
 
-    def archive_stale(self, days):
+    def archive_stale(self, days, *, keep_done=0):
         self._run("archive")
         return []
 

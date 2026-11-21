@@ -62,7 +62,7 @@ class _Store:
     def list_features(self, state=None, **_kw):
         return []
 
-    def archive_stale(self, archive_after_days=7):
+    def archive_stale(self, archive_after_days=7, *, keep_done=0):
         return []
 
     def live_cards(self):

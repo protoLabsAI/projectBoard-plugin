@@ -1,0 +1,1 @@
+- **Keep recent completions readable (#793).** The health sweep now applies `archive_keep_done` after age-based archival, retaining the newest 100 done/cancelled cards by default. Configure a nonnegative integer in YAML and restart; `0` disables the count cap. Archived cards remain available and are never deleted.

@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **41 of 96 keys are in this state, including `coders` and `projects`** —
+never renders it. **42 of 97 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -556,6 +556,7 @@ blank.
 | Key | Default | Applies |
 |---|---|---|
 | `archive_after_days` | `7` | reload **· YAML only** |
+| `archive_keep_done` | `100` | **restart · YAML only** |
 | `base_refresh` | `True` | **restart** |
 | `provider_stall_idle_s` | `600` | **restart · YAML only** |
 | `provider_stall_max` | `2` | **restart · YAML only** |
@@ -564,6 +565,13 @@ blank.
 | `kg_lessons` | `True` | reload **· YAML only** |
 | `kg_lessons_k` | `3` | reload **· YAML only** |
 | `kg_lessons_domain` | `"loop-lessons"` | reload **· YAML only** |
+
+`archive_keep_done` caps the newest done/cancelled cards retained after the health
+sweep’s age-based archive pass. It is an integer, floored at 0; `0` disables the
+count cap while age-based archival still runs. Cards without a parseable `closed_at`
+are left visible and do not count toward the cap. Archival adds a label, never
+deletes a card; archived cards remain available with `include_archived`. Set this
+key in YAML and restart to apply it.
 
 A fresh-build coder timeout whose idle gap — the silence since its last tool/thought/plan/
 answer event, measured from the live progress monitor — is at least `provider_stall_idle_s`

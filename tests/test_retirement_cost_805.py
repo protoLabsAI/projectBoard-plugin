@@ -66,7 +66,7 @@ def sweep_loop(monkeypatch, store):
     monkeypatch.setattr(loop, "_start_base_refresh", lambda: None)
     for name in ("_publish_orphaned_cards", "_recover_blocked", "_publish_work_snapshot"):
         monkeypatch.setattr(loop, name, AsyncMock())
-    monkeypatch.setattr(store, "archive_stale", lambda days: [])
+    monkeypatch.setattr(store, "archive_stale", lambda days, *, keep_done=0: [])
     return loop
 
 

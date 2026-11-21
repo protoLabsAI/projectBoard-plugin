@@ -361,7 +361,7 @@ async def test_health_sweep_retries_retirement_after_tree_already_gone(tmp_path,
     monkeypatch.setattr(
         store, "list_features", lambda *, state: [store.feature] if state == "done" else [], raising=False
     )
-    monkeypatch.setattr(store, "archive_stale", lambda days: 0, raising=False)
+    monkeypatch.setattr(store, "archive_stale", lambda days, *, keep_done=0: 0, raising=False)
     monkeypatch.setattr(loop, "_start_base_refresh", lambda: None)
     monkeypatch.setattr(loop, "_publish_orphaned_cards", AsyncMock())
     monkeypatch.setattr(loop, "_recover_blocked", AsyncMock())
