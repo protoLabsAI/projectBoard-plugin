@@ -449,3 +449,21 @@ mutation route. Stored in secrets.yaml.
 Read token for npm publish gates (waits_for npm:...) on PRIVATE packages. Blank reads
 the public registry anonymously, which is all a public package needs. Stored in
 secrets.yaml; PROJECT_BOARD_NPM_TOKEN or NPM_TOKEN also work.
+
+### Days to keep finished cards (`archive_after_days`)
+
+| Label | Help |
+|---|---|
+| Days to keep finished cards | Lower this when Done is too long to read; older finished cards are archived without deletion on the next health sweep. |
+
+Default: 7; whole days from 1 to 3650. Applies live on the next health sweep.
+
+### Maximum finished cards to keep (`archive_keep_done`)
+
+| Label | Help |
+|---|---|
+| Maximum finished cards to keep | Lower this when Done is too long to read; keep this many newest finished cards after age-based archiving, or use 0 to turn off the count limit. |
+
+Default: 100; whole numbers from 0 to 100000. Applies live on the next health sweep,
+after age-based archiving; 0 disables only the count cap. Archived cards remain
+available with `include_archived`.

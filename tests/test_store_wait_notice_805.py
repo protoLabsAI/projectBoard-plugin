@@ -13,13 +13,17 @@ threshold is lowered so the suite waits tenths of a second, not seconds.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
 import logging
 import re
 import subprocess
+import sys
 import threading
 import time
 
 import pytest
+from langchain_core.runnables import RunnableConfig
 
 import project_board as pb
 from project_board import store as store_mod
@@ -259,11 +263,152 @@ def test_an_error_reply_says_the_wait_came_before_the_error(monkeypatch):
     assert pb._with_store_wait(payload, 9.0) is payload
 
 
-def test_every_board_tool_keeps_its_arguments(real_run_board):
-    """Wrapping must not change a tool's schema: the wrappers carry the original signature."""
+# ── a reply that ends in a component-v1 payload keeps the payload last ─────────────
+
+# The host's component-v1 sentinel (protoAgent graph/components.py), mirrored so the tail
+# can be decoded without a host. The host reads EVERYTHING after it as the JSON payload.
+_SENTINEL = "\x1e[component-v1]"
+NOTICE = re.compile(r"Waited (\d+\.\d) s for the board store \(busy with other board work\); the answer is current\.")
+
+
+def _encode(component, props):
+    return _SENTINEL + json.dumps({"component": component, "props": props}, ensure_ascii=False)
+
+
+def _split(reply: str):
+    """What the host does with a reply: the text, and the payload parsed from all that follows."""
+    text, _, tail = reply.partition("\n" + _SENTINEL)
+    return text, (json.loads(tail) if tail else None)
+
+
+@pytest.fixture
+def emit(monkeypatch):
+    """A host that took both component kinds, with ``graph.sdk.encode_component`` available."""
+    from project_board import board_card_form, board_cards
+
+    monkeypatch.setattr(sys.modules["graph.sdk"], "encode_component", _encode, raising=False)
+    monkeypatch.setattr(board_cards, "EMIT", True)
+    monkeypatch.setattr(board_card_form, "EMIT", True)
+
+
+def test_show_cards_that_waited_keeps_its_component_payload_last(real_run_board, emit):
+    """The round-1 defect: the line landed AFTER the payload, so the host could not parse
+    the card exactly when the notice fired. Real lock, real ``_run``, real tool."""
+    show = _tool("board_show_cards")
+    plain = show.invoke({"state": "blocked"})
+    plain_text, plain_payload = _split(plain)
+    assert plain_payload == {"component": "board-cards", "props": {"state": "blocked"}}
+
+    with _HeldLock(HOLD):
+        reply = show.invoke({"state": "blocked"})
+
+    text, payload = _split(reply)  # json.loads raises if anything follows the payload
+    assert payload == plain_payload
+    # The payload is the trailing bytes of the reply, unchanged.
+    tail = plain[len(plain_text) :]
+    assert tail.startswith("\n" + _SENTINEL) and reply.endswith(tail)
+    # The line is the last thing in the TEXT, once, with the wait time.
+    assert text.startswith(plain_text + "\n\n")
+    match = NOTICE.fullmatch(text[len(plain_text) + 2 :])
+    assert match, text
+    assert float(match.group(1)) >= HOLD - 0.15
+    assert reply.count("Waited") == 1
+
+
+def test_card_form_that_waited_keeps_its_component_payload_last(monkeypatch, emit):
+    monkeypatch.setattr(store_mod, "_BR_WAIT_NOTICE_S", THRESHOLD)
+    reg = importlib.import_module(f"{pb.__name__}.project_registry")
+    rows = [{"name": n, "repo": f"/r/{n}", "base_branch": "main"} for n in ("web", "api")]
+    waits = []
+
+    def _snapshot():
+        if waits:
+            store_mod._note_br_lock_wait(("list",), waits[0])  # this call queued for the store
+        return {"projects": rows, "default_project": "web"}
+
+    monkeypatch.setattr(reg, "project_registry_snapshot", _snapshot)
+    form = _tool("board_card_form")
+    plain = form.invoke({"title_hint": "Add CSV export"})
+    plain_text, plain_payload = _split(plain)
+    assert plain_payload and plain_payload["component"] == "board-card-form"
+
+    waits.append(6.2)
+    text, payload = _split(form.invoke({"title_hint": "Add CSV export"}))
+    assert payload == plain_payload
+    assert text == (
+        f"{plain_text}\n\nWaited 6.2 s for the board store (busy with other board work); the answer is current."
+    )
+
+
+def test_wait_line_goes_before_a_component_tail_and_nowhere_else(monkeypatch):
+    monkeypatch.setattr(store_mod, "_BR_WAIT_NOTICE_S", THRESHOLD)
+    line = "Waited 6.2 s for the board store (busy with other board work); the answer is current."
+    tail = "\n" + _encode("board-cards", {"ids": ["bd-1"]})
+    assert pb._with_store_wait("2 open" + tail, 6.2) == f"2 open\n\n{line}{tail}"
+    # A reply that is only a payload still ends with the payload.
+    assert pb._with_store_wait(tail, 6.2) == line + tail
+    assert pb._with_store_wait(tail[1:], 6.2) == line + tail[1:]
+    # No wait: byte for byte the same object, payload or not.
+    reply = "2 open" + tail
+    assert pb._with_store_wait(reply, 0.0) is reply
+    # The sentinel constant is the host's.
+    assert pb._COMPONENT_SENTINEL == _SENTINEL
+
+
+def test_wrapping_leaves_the_tool_schema_and_call_arguments_alone(monkeypatch):
+    """Compare the schema the model sees BEFORE and AFTER wrapping, and check the wrapped
+    tool still receives its arguments (defaults included)."""
+    monkeypatch.setattr(store_mod, "_BR_WAIT_NOTICE_S", THRESHOLD)
+    from langchain_core.tools import tool
+
+    seen = []
+
+    @tool
+    def board_probe(feature_id: str, limit: int = 5, note: str = "") -> str:
+        """Probe."""
+        seen.append((feature_id, limit, note))
+        return "ok"
+
+    @tool
+    async def board_aprobe(feature_id: str, limit: int = 5, config: RunnableConfig = None) -> str:
+        """Async probe. ``config`` is found by signature at call time, through the wrapper."""
+        assert config is not None and config["configurable"]["thread_id"] == "t-1"
+        seen.append((feature_id, limit))
+        return "ok"
+
+    for t in (board_probe, board_aprobe):
+        before = (dict(t.args), t.tool_call_schema.model_json_schema(), t.name, t.description)
+        original = t.coroutine or t.func
+        pb._report_store_wait(t)
+        assert (t.coroutine or t.func) is not original, "the tool must actually be wrapped"
+        assert (dict(t.args), t.tool_call_schema.model_json_schema(), t.name, t.description) == before
+    assert board_probe.invoke({"feature_id": "bd-1", "note": "n"}) == "ok"
+    cfg = {"configurable": {"thread_id": "t-1"}}
+    assert asyncio.run(board_aprobe.ainvoke({"feature_id": "bd-2", "limit": 9}, config=cfg)) == "ok"
+    assert seen == [("bd-1", 5, "n"), ("bd-2", 9)]
+
+
+def test_every_board_tool_is_wrapped_and_its_schema_matches_its_function(real_run_board):
+    """Every board tool reports the wait, and the schema the model sees still lists exactly
+    the arguments of the ORIGINAL function. ``inspect.signature`` follows ``__wrapped__``
+    by default, so the wrapper is compared with ``follow_wrapped=False`` where it matters."""
     import inspect
 
-    for t in pb._board_tools({}):
-        for fn in (t.func, t.coroutine):
-            if fn is not None:
-                assert inspect.signature(fn) == inspect.signature(fn.__wrapped__), t.name
+    tools = pb._board_tools({})
+    assert tools
+    for t in tools:
+        fns = [fn for fn in (t.func, t.coroutine) if fn is not None]
+        assert fns, t.name
+        for fn in fns:
+            original = getattr(fn, "__wrapped__", None)
+            assert original is not None, f"{t.name} is not wrapped"
+            # The wrapper itself is generic; the original carries the real parameters.
+            assert list(inspect.signature(fn, follow_wrapped=False).parameters) == ["args", "kwargs"], t.name
+            # The full input schema (injected arguments such as `state` included) is the
+            # original function's parameter list; the model-facing one is a subset of it.
+            params = set(inspect.signature(original).parameters)
+            fields = set(t.get_input_schema().model_fields)
+            # `config` is not a schema field: langchain passes it by reading the signature at call time.
+            assert fields <= params and params - fields <= {"config"}, t.name
+            assert set(t.args) <= params, t.name
+            assert asyncio.iscoroutinefunction(fn) == asyncio.iscoroutinefunction(original), t.name

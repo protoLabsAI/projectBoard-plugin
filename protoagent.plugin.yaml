@@ -27,6 +27,8 @@ min_protoagent_version: "0.244.1"  # origin-session threading (ADR 0131): InboxS
 config_section: project_board
 secrets: [webhook_secret, npm_token]
 config:
+  archive_after_days: 7     # Age window for archiving finished cards; live on reload.
+  archive_keep_done: 100    # Newest finished cards retained; 0 disables the count cap.
   coder: ""                 # acp delegate name the loop dispatches builds to. NO DEFAULT
                             # (v0.42.0): unset = the setup preflight fails `coder`, the host
                             # shows an operator warning, and the loop pauses (no tracebacks)
@@ -339,11 +341,15 @@ settings_tabs:
 # `review_dispatch`, `review_fix_max`, `ci_poll`, `ci_rerun_max`, `ci_fix_max`, `auto_rebase`,
 # `rebase_fix_max`, `auto_merge`, `merge_method`, `merged_verify_max`, `merge_poll`, `dep_gate`.
 # They are still written through PUT /settings and tracked in pending_restart via settings_api's
-# hand-added allowlist. The Maintenance schema tab below (S5, #615) now holds the five generic
-# fields that survive — br_autofetch, base_refresh and local_gate_cmd plus the two secrets
+# hand-added allowlist. The Maintenance schema tab below (S5, #615) holds the archive
+# controls, starting-model pickers and upkeep fields — br_autofetch, base_refresh and local_gate_cmd plus the two secrets
 # (webhook_secret, npm_token) folded in from the old Security tab. None is needed to get a board
 # started; each description says WHEN an operator would reach for it.
 settings:
+  - { key: archive_after_days, label: "Days to keep finished cards", type: number, minimum: 1, maximum: 3650, group: "Project Board", tab: maintenance,
+      description: "Lower this when Done is too long to read; older finished cards are archived without deletion on the next health sweep." }
+  - { key: archive_keep_done, label: "Maximum finished cards to keep", type: number, minimum: 0, maximum: 100000, group: "Project Board", tab: maintenance,
+      description: "Lower this when Done is too long to read; keep this many newest finished cards after age-based archiving, or use 0 to turn off the count limit." }
   - { key: br_autofetch, label: "Download the board tool automatically", type: bool, group: "Project Board", tab: maintenance,
       description: "Download and verify the board's card database tool (br) from github.com when it is missing, or turn it off to install br yourself." }
   - { key: base_refresh, label: "Update project checkouts automatically", type: bool, group: "Project Board", tab: maintenance, restart: true,

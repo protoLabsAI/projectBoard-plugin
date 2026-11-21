@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **42 of 97 keys are in this state, including `coders` and `projects`** —
+never renders it. **40 of 97 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -555,8 +555,8 @@ blank.
 
 | Key | Default | Applies |
 |---|---|---|
-| `archive_after_days` | `7` | reload **· YAML only** |
-| `archive_keep_done` | `100` | **restart · YAML only** |
+| `archive_after_days` | `7` | live |
+| `archive_keep_done` | `100` | live |
 | `base_refresh` | `True` | **restart** |
 | `provider_stall_idle_s` | `600` | **restart · YAML only** |
 | `provider_stall_max` | `2` | **restart · YAML only** |
@@ -571,7 +571,9 @@ sweep’s age-based archive pass. It is an integer, floored at 0; `0` disables t
 count cap while age-based archival still runs. Cards without a parseable `closed_at`
 are left visible and do not count toward the cap. Archival adds a label, never
 deletes a card; archived cards remain available with `include_archived`. Set this
-key in YAML and restart to apply it.
+key in Settings → Maintenance; both archive controls apply live on the next health
+sweep. Lower them when Done is too long to read. `archive_after_days` uses whole
+days in Settings and on live reload, with a minimum of 1.
 
 A fresh-build coder timeout whose idle gap — the silence since its last tool/thought/plan/
 answer event, measured from the live progress monitor — is at least `provider_stall_idle_s`

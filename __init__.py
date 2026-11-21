@@ -614,15 +614,33 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
     return None
 
 
+# The host's component-v1 sentinel (protoAgent graph/components.py). A reply that carries a
+# component ends with ``"\n" + sentinel + <json>`` and the host reads everything after the
+# sentinel as the payload, so nothing may follow it.
+_COMPONENT_SENTINEL = "\x1e[component-v1]"
+
+
 def _with_store_wait(result, seconds: float):
     """``result`` plus the store-wait line when the call queued for the board store past
-    the threshold (#805); ``result`` itself, untouched, otherwise."""
+    the threshold (#805); ``result`` itself, untouched, otherwise.
+
+    The line goes at the end of the reply TEXT. A reply that ends in a component-v1
+    payload (board_show_cards, board_card_form) keeps that payload last, byte for byte:
+    the line is put before it, because the host parses everything after the sentinel."""
     if not isinstance(result, str):
         return result
     from .store import br_wait_notice
 
     notice = br_wait_notice(seconds, failed=result.startswith("Error:"))
-    return f"{result}\n\n{notice}" if notice else result
+    if not notice:
+        return result
+    at = result.find(_COMPONENT_SENTINEL)
+    if at < 0:
+        return f"{result}\n\n{notice}"
+    if at > 0 and result[at - 1] == "\n":
+        at -= 1  # the tail is "\n" + payload: keep its newline with it
+    text, tail = result[:at], result[at:]
+    return f"{text}\n\n{notice}{tail}" if text else f"{notice}{tail}"
 
 
 def _report_store_wait(t) -> None:

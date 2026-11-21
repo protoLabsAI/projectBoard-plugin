@@ -47,8 +47,8 @@ def test_allowlist_metadata_and_masking(host):
     for entry in manifest["settings"]:
         for field in ("label", "type", "minimum", "maximum", "options"):
             assert settings.SETTINGS[entry["key"]][field] == entry.get(field)
-    # 9 manifest settings (5 + the 4 difficulty-tier pickers) + loop_enabled + the 25 page-owned.
-    assert len(settings.SETTINGS) == 35
+    # 11 manifest settings (7 + the 4 difficulty-tier pickers) + loop_enabled + the 25 page-owned.
+    assert len(settings.SETTINGS) == 37
     live["webhook_secret"] = "never-echo-this"
     settings.capture_boot_settings(live)
     live["npm_token"] = "nor-this"
@@ -142,6 +142,23 @@ async def test_every_live_knob_never_pending(host):
     assert result["ok"]
     assert result["restart_required"] == result["pending_restart"] == []
     assert settings.settings_snapshot()["pending_restart"] == []
+
+
+@pytest.mark.parametrize("key,default,minimum", [("archive_after_days", 7, 1), ("archive_keep_done", 100, 0)])
+async def test_archive_settings_are_live_and_validate_bounds(host, key, default, minimum):
+    live, writes, _ = host
+    entry = settings.settings_snapshot()["settings"][key]
+    assert entry["value"] == default
+    assert entry["type"] == "number" and entry["minimum"] == minimum
+    assert entry["restart"] is False
+    result = await settings.apply_setting_updates({key: minimum}, "alice")
+    assert result["ok"] and live[key] == minimum
+    assert result["restart_required"] == result["pending_restart"] == []
+    assert len(writes) == 1
+    for bad in (minimum - 1, "bad", 1.5):
+        result = await settings.apply_setting_updates({key: bad}, "alice")
+        assert not result["ok"] and result["saved"] == []
+    assert len(writes) == 1
 
 
 async def test_host_refusal_does_not_echo_secrets(host):
