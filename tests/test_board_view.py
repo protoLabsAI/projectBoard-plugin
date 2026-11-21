@@ -485,9 +485,11 @@ def test_drawer_spec_and_ac_render_through_the_markdown_hook():
     assert "function prose(s){" in BOARD_PAGE
     assert "'<div class=\"tdsec md-saying\" data-md=\"'+esc(s)+'\">'+esc(s)+'</div>'" in BOARD_PAGE
     assert "'<div class=\"tdsec tdsec--empty\">—</div>'" in BOARD_PAGE
-    # both drawers route spec + acceptance criteria through the shared helper.
-    assert BOARD_PAGE.count("prose(f.spec)") == 2
-    assert BOARD_PAGE.count("prose(f.acceptance_criteria)") == 2
+    # both drawers route spec + acceptance criteria through the shared helper — via
+    # fullText, which is prose() whenever a single-card read is in hand (#805).
+    assert "if (!f.detail_state || f[key]) return prose(f[key]);" in BOARD_PAGE
+    assert BOARD_PAGE.count('fullText(f, "spec")') == 2
+    assert BOARD_PAGE.count('fullText(f, "acceptance_criteria")') == 2
 
 
 def test_drawer_repaint_re_runs_the_markdown_pass_on_fresh_nodes():
@@ -691,8 +693,8 @@ def test_r2_task_drawer_is_card_type_aware_and_shows_spec_ac_and_deliverable():
     assert "function openTask(fid)" in BOARD_PAGE
     assert '$("drawer-title").textContent = "Task — " + fid;' in BOARD_PAGE
     assert "function taskDetail(f)" in BOARD_PAGE
-    assert "'<div class=\"tdlbl\">spec</div>' + prose(f.spec)" in BOARD_PAGE
-    assert "'<div class=\"tdlbl\">acceptance criteria</div>' + prose(f.acceptance_criteria)" in BOARD_PAGE
+    assert '\'<div class="tdlbl">spec</div>\' + fullText(f, "spec")' in BOARD_PAGE
+    assert '\'<div class="tdlbl">acceptance criteria</div>\' + fullText(f, "acceptance_criteria")' in BOARD_PAGE
     assert (
         "if (f.deliverable) h += '<div class=\"tdlbl\">deliverable</div><div class=\"deliv\">'+esc(f.deliverable)+'</div>';"
         in BOARD_PAGE
@@ -797,14 +799,15 @@ def test_r1_drawer_fetches_the_single_feature_route_for_the_deliverable():
 
 
 def test_r1_drawer_splices_the_fetched_deliverable_onto_the_list_summary():
-    """r1: syncTaskDrawer keeps full text from the single-card read and overlays live
-    list metadata once it has landed for THIS task — so a
-    recorded deliverable renders in the drawer, which it never did off the list poll."""
+    """r1: syncTaskDrawer keeps full text from the single-card read (this open's, else
+    the last good one) and overlays live list metadata — so a recorded deliverable renders
+    in the drawer, which it never did off the list poll."""
     assert "const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;" in BOARD_PAGE
     # #399 splices the requirement ledger from the same single-card read, beside it
+    assert "const full = fullDetail(TASK_FID, d);" in BOARD_PAGE
     assert (
-        "const merged = d && d.feature ? {...d.feature, ...f, deliverable: d.feature.deliverable, "
-        "requirements: d.feature.requirements} : f;" in BOARD_PAGE
+        "const merged = full ? {...full, ...f, deliverable: full.deliverable, "
+        "requirements: full.requirements} : pendingRow(f, d);" in BOARD_PAGE
     )
     assert '$("drawer-body").innerHTML = err + note + taskDetail(merged);' in BOARD_PAGE
 
@@ -813,8 +816,9 @@ def test_r2_single_fetch_is_on_open_and_after_actions_not_every_poll():
     """r2: the single-card fetch fires on open (openTask) and after each mutation
     (deliver/approve/reject), NOT on the 10s poll — load()/render() never call it, so a
     poll tick re-renders the drawer from the cached TASK_DETAIL with no per-task br show."""
-    # openTask (1) + the three action handlers (3) + the definition (1) = 5 name sites
-    assert BOARD_PAGE.count("fetchTaskDetail(fid)") == 5
+    # openTask (1) + the three action handlers (3) + the definition (1) + the fenced
+    # retry of a FAILED read (1, #805: off a timer, not the poll) = 6 name sites
+    assert BOARD_PAGE.count("fetchTaskDetail(fid)") == 6
     # each action re-fetches right after its list reload — three sites, one per action
     assert BOARD_PAGE.count("await load(); await fetchTaskDetail(fid);") == 3
     # neither render() nor load() fetches per-task detail (no poll-tick / list-route br show)
@@ -830,9 +834,10 @@ def test_r3_no_deliverable_and_coding_cards_are_unaffected():
     still reads only /features (no deliverable added to the list route), and TASK_DETAIL
     starts null and is dropped on every open so a task never inherits the prior one's."""
     assert "let TASK_DETAIL = null;" in BOARD_PAGE
-    # the merge falls back to the bare list `f` when nothing has been fetched
+    # with no single-card read at all the merge falls back to the list `f`, marked so the
+    # text sections say they are loading rather than render as empty (#805)
     assert (
-        "? {...d.feature, ...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;"
+        "? {...full, ...f, deliverable: full.deliverable, requirements: full.requirements} : pendingRow(f, d);"
         in BOARD_PAGE
     )
     # the poll pulls summary rows — deliverable is NOT added there

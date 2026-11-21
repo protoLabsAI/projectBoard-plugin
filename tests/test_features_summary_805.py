@@ -155,15 +155,112 @@ def test_preview_matches_browser_and_task_drawer_uses_full_detail():
     assert [spec_preview(s) for s in specs] == json.loads(result.stdout)
     assert 'features?view=summary"' in BOARD_PAGE
     assert "f.spec_preview ?? specLine(f.spec)" in BOARD_PAGE
-    # Execute the real merge expression: text must come from detail, state from the poll.
-    expr = re.search(r"const merged = (.*);", BOARD_PAGE).group(1)
-    script = (
-        "const f = {state:'done', spec_preview:'preview'}; const d = {feature:{state:'in_review', spec:'full', acceptance_criteria:'criteria'}}; console.log(JSON.stringify("
-        + expr
-        + "));"
-    )
-    merged = json.loads(subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout)
-    assert merged["state"] == "done"
-    assert merged["spec"] == "full"
-    assert merged["acceptance_criteria"] == "criteria"
     assert "TASK_DETAIL_REV[TASK_FID] !== f.updated_at" in BOARD_PAGE
+
+
+def _js(name):
+    """One top-level function of the assembled page, by name."""
+    one_line = re.search(r"^function " + name + r"\([^\n]*\}$", BOARD_PAGE, re.M)
+    return (one_line or re.search(r"(?:async )?function " + name + r"\(.*?\n\}", BOARD_PAGE, re.S)).group()
+
+
+def _drawer(script):
+    """Run `script` against the real drawer helpers and merge expressions under node."""
+    task = re.search(r"const merged = (full \? \{\.\.\.full, \.\.\.f,.*);", BOARD_PAGE).group(1)
+    card = re.search(r"const merged = (full \? \{\.\.\.f, \.\.\.full,.*);", BOARD_PAGE).group(1)
+    pre = (
+        "const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
+        "const DETAIL_CACHE = new Map(), DETAIL_CACHE_MAX = 40;\n"
+        + "\n".join(_js(n) for n in ("prose", "fullText", "rememberDetail", "fullDetail", "pendingRow"))
+        + "\nconst taskRow = (fid, f, d) => { const full = fullDetail(fid, d); return "
+        + task
+        + "; };\nconst cardRow = (fid, f, d) => { const full = fullDetail(fid, d); return "
+        + card
+        + "; };\n"
+    )
+    out = subprocess.run(["node", "-e", pre + script], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node required to run the drawer helpers")
+def test_drawers_never_render_a_summary_row_as_an_empty_spec():
+    """Review round 1: the poll row has no spec or acceptance criteria, so a drawer whose
+    single-card read has not landed, or failed, must not show them as empty ("—")."""
+    got = _drawer(
+        """
+        const f = {id:'bd-1', state:'done', next_action:'live', spec_preview:'First line', updated_at:'2'};
+        const full = {id:'bd-1', state:'in_review', next_action:'old', spec:'FULL SPEC', acceptance_criteria:'FULL AC',
+                      deliverable:'shipped', requirements:[{id:'r1'}]};
+        const text = r => fullText(r, 'spec') + fullText(r, 'acceptance_criteria');
+        const out = {};
+        // 1. nothing read yet → a loading note under the preview line, for both drawers
+        out.taskLoading = text(taskRow('bd-1', f, null));
+        out.cardLoading = text(cardRow('bd-1', f, null));
+        // 2. the read failed and there is no earlier one → says so, and that it retries
+        out.taskFailed = text(taskRow('bd-1', f, {fid:'bd-1', error:'boom'}));
+        out.cardFailed = text(cardRow('bd-1', f, {fid:'bd-1', error:'boom'}));
+        // 3. the read landed → full text; live state still from the poll row
+        const d = {fid:'bd-1', feature: full};
+        rememberDetail('bd-1', full);
+        out.task = taskRow('bd-1', f, d); out.card = cardRow('bd-1', f, d);
+        out.taskText = text(out.task);
+        // 4. a LATER read fails, or the drawer is reopened and its read is in flight →
+        //    the last good text stays
+        out.taskAfterFail = taskRow('bd-1', f, {fid:'bd-1', error:'boom'});
+        out.cardAfterFail = cardRow('bd-1', f, {fid:'bd-1', error:'boom'});
+        out.cardReopened = cardRow('bd-1', f, null);
+        // 5. another card never inherits it
+        out.other = taskRow('bd-2', {id:'bd-2'}, null);
+        // 6. a card whose full read has NO text still renders the plain empty marker
+        out.empty = fullText({id:'bd-3', spec:''}, 'spec');
+        // 7. the cache is capped
+        for (let i = 0; i < 100; i++) rememberDetail('x' + i, {});
+        out.size = DETAIL_CACHE.size; out.evicted = !DETAIL_CACHE.has('bd-1');
+        console.log(JSON.stringify(out));
+        """
+    )
+    for key in ("taskLoading", "cardLoading"):
+        assert "First line" in got[key] and got[key].count("Loading the full text…") == 2
+        assert "—" not in got[key]
+    for key in ("taskFailed", "cardFailed"):
+        assert "First line" in got[key] and got[key].count("Couldn't load the full text. Retrying…") == 2
+        assert "—" not in got[key]
+    for key in ("task", "card", "taskAfterFail", "cardAfterFail", "cardReopened"):
+        row = got[key]
+        assert (row["spec"], row["acceptance_criteria"]) == ("FULL SPEC", "FULL AC"), key
+        assert (row["state"], row["next_action"]) == ("done", "live"), key
+        assert "detail_state" not in row
+    assert got["task"]["deliverable"] == "shipped" and got["task"]["requirements"] == [{"id": "r1"}]
+    assert got["taskAfterFail"]["deliverable"] == "shipped"
+    assert "FULL SPEC" in got["taskText"] and "Loading" not in got["taskText"]
+    assert got["other"]["detail_state"] == "loading" and "spec" not in got["other"]
+    assert got["empty"] == '<div class="tdsec tdsec--empty">—</div>'
+    assert got["size"] == 40 and got["evicted"]
+
+
+def test_a_failed_single_card_read_is_retried_and_remembered():
+    """A failed read is not permanent: each drawer schedules ONE fenced retry per failure,
+    and every good read is kept as the fallback for the next in-flight or failed one."""
+    for name, fid_var in (("fetchTaskDetail", "TASK_FID"), ("fetchCardDetail", "CARD_FID")):
+        body = _js(name)
+        seq = name.replace("fetch", "").replace("Detail", "").upper() + "_DETAIL_SEQ"
+        assert (
+            "setTimeout(() => { if (%s === fid && seq === %s[fid]) %s(fid); }, DETAIL_RETRY_MS);" % (fid_var, seq, name)
+            in body
+        )
+        assert body.index("} catch (e) {") < body.index("setTimeout(")
+        assert body.index("rememberDetail(fid, f);") < body.index("} catch (e) {")
+    assert "const full = fullDetail(CARD_FID, d);" in BOARD_PAGE
+    assert "const full = fullDetail(TASK_FID, d);" in BOARD_PAGE
+
+
+def test_summary_rows_carry_the_card_tab_fact_fields(listing):
+    """Review round 1 (minor): base, issue and runs paint from the poll row, before the
+    single-card read lands — the attempts list itself stays out, only its length rides."""
+    store, client = listing
+    store.rows[0].update(base_branch="main", source_issue="o/r#1", gens_spent=3, waits_for=["x"])
+    work_snapshot.note_board_write()
+    row = client.get(BASE + "/features?view=summary").json()["features"][0]
+    assert (row["base_branch"], row["source_issue"], row["gens_spent"], row["waits_for"]) == ("main", "o/r#1", 3, ["x"])
+    assert row["attempts_count"] == 1 and "attempts" not in row
+    assert "Number(f.attempts ?? f.attempts_count)" in BOARD_PAGE

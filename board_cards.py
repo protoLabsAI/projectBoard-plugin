@@ -288,6 +288,12 @@ _SUMMARY_KEYS = tuple(k for k in _CARD_KEYS if k != "attempts") + (
     "delivered",
     "delivered_by",
     "verified_by",
+    # The Card tab's fact rows (base, runs, issue, waits for) paint from the poll row
+    # before the single-card read lands, so these small fields ride along.
+    "base_branch",
+    "source_issue",
+    "gens_spent",
+    "waits_for",
 )
 
 
@@ -308,7 +314,12 @@ def spec_preview(spec: str | None) -> str:
 
 def summary_row(f: dict) -> dict:
     """Additive /features?view=summary projection; full listings and /cards stay intact."""
-    return {**{k: f[k] for k in _SUMMARY_KEYS if k in f}, "spec_preview": spec_preview(f.get("spec"))}
+    row = {k: f[k] for k in _SUMMARY_KEYS if k in f}
+    row["spec_preview"] = spec_preview(f.get("spec"))
+    # The attempts list stays out of the listing; the Card tab's "runs" row needs its length.
+    attempts = f.get("attempts")
+    row["attempts_count"] = len(attempts) if isinstance(attempts, (list, tuple)) else int(attempts or 0)
+    return row
 
 
 STATE_LABEL = {
