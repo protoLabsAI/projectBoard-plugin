@@ -288,7 +288,9 @@ How a card becomes a build.
 project's checkout (where its worktrees are made) before it starts a card there. Below it,
 no card on that disk is claimed (skip reason `host-disk`); cards whose project is on
 another disk still start. A card that fails for disk space anyway goes back to ready
-under a `host-disk` hold. You get one Needs-you page for the disk, listing the waiting
+under a `host-disk` hold, provided the disk itself confirms it (its free space is under
+the threshold, or it refuses a small test write for lack of room). An error that only
+mentions a full disk blocks the card as before. You get one Needs-you page for the disk, listing the waiting
 cards. When space is back, the board releases the cards and retires the page itself; there
 is nothing to unblock. `0` switches the check off.
 

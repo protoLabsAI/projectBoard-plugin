@@ -244,7 +244,7 @@ def _held_summary(feats) -> dict:
             ]
             if cls == PREFLIGHT_HOLD_CLASS:
                 step = PREFLIGHT_HOLD_STEP
-            elif cls == HOST_DISK_CLASS:
+            elif cls == HOST_DISK_CLASS and all(host_disk.is_hold_reason(rows[fid]) for fid in ids):
                 step = host_disk.HOLD_STEP  # the loop releases these itself (#801)
             elif healing and len(healing) == len(ids):
                 step = f"none — the health sweep retries a {cls} block by itself (up to {_UNBLOCK_RETRY_MAX} times)"
@@ -791,9 +791,11 @@ class DriveMixin(HostDiskMixin):
         if is_block and now and now.get("board_state") not in (None, "", "blocked"):
             block_pages.retire(now)
             return
-        if is_block and (now or {}).get("blocked_class") == HOST_DISK_CLASS:
+        if is_block and self._host_disk_holds(now):
             # #801: a full disk is one condition of the host, paged ONCE for its volume
             # (`host-disk:<volume>`, loop/host_disk.py) — never once per waiting card.
+            # Only for a card under the loop's hold: one merely classified `host-disk`
+            # from its reason's text keeps its own page.
             log.debug("[project_board] %s is held for disk space — covered by the host-disk page", fid)
             return
         if is_block:
@@ -3172,7 +3174,9 @@ class DriveMixin(HostDiskMixin):
                     # drive's failure happens outside any agent turn, so nothing else records it.
                     self._friction_drive_failure(fid, exc, feature, base=base, branch=branch, refusal=coder_refusal)
                     if await self._host_disk_failure(exc, repo):
-                        # #801: the HOST is out of room, not the card. No retry and no tier
+                        # #801: the HOST is out of room, not the card — and the host says
+                        # so itself (its free space, or a refused write), not just the
+                        # error's text. No retry and no tier
                         # climb (both fail the same way on the same disk), and no terminal
                         # block: the card goes back to ready under a `host-disk` hold the
                         # loop releases itself once space is freed. Like every drive-side
@@ -3180,7 +3184,7 @@ class DriveMixin(HostDiskMixin):
                         if await self._block_or_stand_aside(
                             store,
                             fid,
-                            f"{HOST_DISK_CLASS}: {exc}",
+                            f"{host_disk.HOLD_REASON_PREFIX}{exc}",
                             category=HOST_DISK_CLASS,
                             repo=repo,
                             wt=wt,

@@ -13,12 +13,17 @@ The drive cases use real git (a bare origin plus a clone, as in
 test_shutdown_resume_stranded.py) and the store's real claim / block / unblock / requeue
 transitions over a minimal `br` command seam (as in test_block_pages_735.py). The disk is
 not really filled: a `git` wrapper on PATH fails `worktree add` with git's own ENOSPC text
-and passes every other command through.
+and passes every other command through, and the host's own answers (the free space, and
+whether a small write is refused for lack of room) are set per volume on the loop.
+
+The error text alone holds nothing: the last cases fail the same way on a volume the host
+says has room, and get the ordinary block and the card's own page.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import shutil
 import subprocess
@@ -38,6 +43,7 @@ from project_board.store import BeadsBoard
 posix_only = pytest.mark.skipif(os.name == "nt", reason="the git wrapper is a POSIX shell script")
 
 VOL_A, VOL_B = "/Volumes/a", "/Volumes/b"
+HELD_REASON = f"{host_disk.HOLD_REASON_PREFIX}worktree add failed: No space left on device"
 TITLES = {"bd-1": "Trim the retry log", "bd-2": "Paginate the audit feed", "bd-3": "Cache the roster read"}
 
 
@@ -208,11 +214,13 @@ class _Disk:
     def __init__(self, volumes: dict[str, str]):
         self.volumes = volumes  # checkout path → volume
         self.free = {volume: 100 * GB for volume in volumes.values()}
+        self.refuses_writes: set[str] = set()  # volumes where a small write gets ENOSPC
         self.asked: list[str] = []
 
     def install(self, loop: BoardLoop) -> None:
         loop._disk_volume = lambda path: self.volumes[path]
         loop._disk_free = self._free
+        loop._disk_full = lambda path: self.volumes[path] in self.refuses_writes
 
     def _free(self, path):
         self.asked.append(path)
@@ -396,7 +404,10 @@ async def test_three_disk_full_drives_hold_their_cards_page_once_and_come_back(
     monkeypatch, inbox, clone, full_disk_git
 ):
     board = Board({fid: clone for fid in TITLES})
-    disk = _Disk({clone: VOL_A})  # the probe sees room: only git's own error says otherwise
+    # The free-space reading still shows room (inodes, a quota): the host confirms the
+    # condition by refusing a small write, as git's own failed.
+    disk = _Disk({clone: VOL_A})
+    disk.refuses_writes.add(VOL_A)
     loop = _loop(monkeypatch, board, disk)
     dispatched = []
 
@@ -413,6 +424,7 @@ async def test_three_disk_full_drives_hold_their_cards_page_once_and_come_back(
         card = board.get_feature(fid)
         assert card["blocked_class"] == HOST_DISK_CLASS, card
         assert card["bead_status"] == "open" and "ready" in card["labels"]
+        assert card["blocked_reason"].startswith(host_disk.HOLD_REASON_PREFIX)
         assert "No space left on device" in card["blocked_reason"]
     assert not loop._inflight_files and not loop._inflight
 
@@ -431,6 +443,7 @@ async def test_three_disk_full_drives_hold_their_cards_page_once_and_come_back(
     loop._notify_operator("bd-1", "host-disk: full", incident="host-disk|full|0", store=board)
     assert (await _scan(loop))["selected"] == []
     assert len(inbox) == 1 and dispatched == []
+    disk.refuses_writes.clear()
 
     # The probe now measures the volume under the threshold: still held, still one page.
     disk.free[VOL_A] = 2 * GB
@@ -459,7 +472,7 @@ async def test_the_release_returns_held_cards_to_ready(monkeypatch, inbox):
     loop = _loop(monkeypatch, board, disk)
     for fid in board.beads:
         board.claim(fid, assignee="proto")
-        board.flag_blocked(fid, "host-disk: worktree add failed: No space left on device", automatic=True)
+        board.flag_blocked(fid, HELD_REASON, automatic=True)
         await loop._host_disk_hold(board, board.get_feature(fid), board.repos[fid])
     assert set(board.states().values()) == {"blocked"}
 
@@ -488,7 +501,7 @@ async def test_a_hold_the_probe_cannot_confirm_is_retried_and_its_page_waits_for
 
     async def _hold():
         board.claim("bd-1", assignee="proto")
-        board.flag_blocked("bd-1", "host-disk: Disk quota exceeded", automatic=True)
+        board.flag_blocked("bd-1", f"{host_disk.HOLD_REASON_PREFIX}Disk quota exceeded", automatic=True)
         await loop._host_disk_hold(board, board.get_feature("bd-1"), "/a/one")
 
     await _hold()
@@ -515,11 +528,15 @@ async def test_a_hold_the_probe_cannot_confirm_is_retried_and_its_page_waits_for
 async def test_a_card_held_before_a_restart_is_adopted_by_the_sweep_and_released(monkeypatch, inbox):
     board = Board({"bd-1": "/a/one"})
     board.claim("bd-1", assignee="proto")
-    board.flag_blocked("bd-1", "host-disk: worktree add failed: No space left on device", automatic=True)
+    board.flag_blocked("bd-1", HELD_REASON, automatic=True)
     board.requeue("bd-1")
     disk = _Disk({"/a/one": VOL_A})
+    loop = _loop(monkeypatch, board, disk)  # a fresh process: nothing tracked, and room by now
+    await loop._recover_blocked(board)  # known as the loop's hold by its reason alone
+    assert loop._host_disk_state()[VOL_A]["held"] == {"bd-1": TITLES["bd-1"]} and inbox == []
+
     disk.free[VOL_A] = GB
-    loop = _loop(monkeypatch, board, disk)  # a fresh process: nothing tracked
+    loop = _loop(monkeypatch, board, disk)
 
     await loop._recover_blocked(board)
     assert inbox == []  # the sweep sends no per-card page for it
@@ -532,17 +549,121 @@ async def test_a_card_held_before_a_restart_is_adopted_by_the_sweep_and_released
     assert board.states() == {"bd-1": "ready"} and _pending(inbox) == []
 
 
-async def test_a_tree_that_cannot_be_prepared_on_a_low_volume_is_a_host_disk_failure(monkeypatch):
+async def test_a_failure_is_the_hosts_only_when_the_host_confirms_it(monkeypatch):
     disk = _Disk({"/a/one": VOL_A})
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: None)
     loop = BoardLoop({})
     disk.install(loop)
     prep = worktree.EnvironmentPreparationError("setup_cmd failed: exit 1")
+    enospc = worktree.WorktreeError("worktree add failed: ENOSPC")
 
-    assert not await loop._host_disk_failure(prep, "/a/one")  # room to spare: its own class stands
-    disk.free[VOL_A] = GB
+    # Room to spare and writes go through: the words alone hold nothing.
+    assert not await loop._host_disk_failure(prep, "/a/one")
+    assert not await loop._host_disk_failure(enospc, "/a/one")
+    quoting = worktree.WorktreeError("gate failed: test_enospc expected 'No space left on device' in stderr")
+    assert not await loop._host_disk_failure(quoting, "/a/one")
+
+    disk.free[VOL_A] = GB  # the free space reads under the threshold
     assert await loop._host_disk_failure(prep, "/a/one")
-    assert await loop._host_disk_failure(worktree.WorktreeError("worktree add failed: ENOSPC"), "/a/one")
+    assert await loop._host_disk_failure(enospc, "/a/one")
+    # A failure that does not point at the disk stays its own, however full the volume.
+    assert not await loop._host_disk_failure(worktree.WorktreeError("gate failed: 2 tests red"), "/a/one")
     # A coder's own words are never read as the host's condition.
     quoted = worktree.NoChangesError("no commits. Coder said: No space left on device")
     assert not await loop._host_disk_failure(quoted, "/a/one")
+
+    disk.free[VOL_A] = 100 * GB
+    disk.refuses_writes.add(VOL_A)  # room by the reading, but the OS refuses the write
+    assert await loop._host_disk_failure(prep, "/a/one") and await loop._host_disk_failure(enospc, "/a/one")
+
+    def _broken(path):
+        raise RuntimeError("cannot test a write")
+
+    loop._disk_full = _broken  # a check that cannot be made confirms nothing
+    assert not await loop._host_disk_failure(enospc, "/a/one")
+
+
+def test_out_of_room_is_the_os_refusing_a_write_for_lack_of_space(tmp_path):
+    checkout = tmp_path / "clone"
+    (checkout / ".git").mkdir(parents=True)
+    wrote: list[str] = []
+
+    def refuse(code):
+        def _write(directory):
+            wrote.append(directory)
+            raise OSError(code, os.strerror(code))
+
+        return _write
+
+    assert host_disk.out_of_room(str(checkout), write=refuse(errno.ENOSPC))
+    assert wrote == [str(checkout / ".git")]  # in the admin directory, never the working tree
+    if hasattr(errno, "EDQUOT"):
+        assert host_disk.out_of_room(str(checkout), write=refuse(errno.EDQUOT))
+    # Refused for another reason, or not refused at all: no evidence of a full disk.
+    assert not host_disk.out_of_room(str(checkout), write=refuse(errno.EACCES))
+    assert not host_disk.out_of_room(str(checkout), write=wrote.append)
+    # A path not made yet is answered by its nearest existing parent.
+    assert host_disk.out_of_room(str(tmp_path / "later" / "wt"), write=refuse(errno.ENOSPC))
+    assert wrote[-1] == str(tmp_path)
+    # The real write, on a disk with room, leaves nothing behind.
+    assert not host_disk.out_of_room(str(checkout))
+    assert list((checkout / ".git").iterdir()) == []
+
+
+@posix_only
+async def test_a_disk_full_error_on_a_disk_with_room_keeps_its_ordinary_block_and_page(
+    monkeypatch, inbox, clone, full_disk_git
+):
+    """The review case: the failure's text says "No space left on device", the host says
+    there is room (by the reading and by a write). No hold, no retry loop, no host-disk
+    page: the card stays blocked for a human and gets its own page, as before the hold."""
+    board = Board({"bd-1": clone})
+    disk = _Disk({clone: VOL_A})
+    loop = _loop(monkeypatch, board, disk)
+
+    decision = await _scan(loop)
+    assert decision["selected"] == ["bd-1"]
+
+    card = board.get_feature("bd-1")
+    assert card["board_state"] == "blocked" and card["bead_status"] == "in_progress"  # not back to ready
+    assert not card["blocked_reason"].startswith(host_disk.HOLD_REASON_PREFIX)
+    assert loop._host_disk_state() == {} and not loop._host_disk_holds(card)
+
+    # The sweep does not adopt it into a hold, and the operator is paged for the card.
+    now = [1000.0]
+    loop._monotonic_clock = lambda: now[0]
+    await loop._recover_blocked(board)
+    await loop._tick()
+    assert loop._host_disk_state() == {}
+    assert [r["dedup_key"].split(":")[0] for r in inbox] == ["blocked"] and "bd-1" in inbox[0]["dedup_key"]
+
+    # Nothing retries it, however long it waits, and it is not paged again.
+    now[0] += 10 * host_disk.RETRY_S
+    await loop._tick()
+    await loop._recover_blocked(board)
+    assert board.get_feature("bd-1")["bead_status"] == "in_progress" and len(inbox) == 1
+
+
+async def test_a_block_that_only_quotes_a_disk_error_is_not_adopted_as_a_hold(monkeypatch, inbox):
+    """A block set outside a drive is classified `host-disk` from its reason's words. With
+    room on the volume it is an ordinary block; with the volume reading full it is held."""
+    board = Board({"bd-1": "/a/one", "bd-2": "/a/two"})
+    for fid in board.beads:
+        board.claim(fid, assignee="proto")
+        board.flag_blocked(fid, "gate output: No space left on device", automatic=True)
+        assert board.get_feature(fid)["blocked_class"] == HOST_DISK_CLASS
+    disk = _Disk({"/a/one": VOL_A, "/a/two": VOL_B})
+    disk.free[VOL_B] = GB
+    loop = _loop(monkeypatch, board, disk)
+
+    await loop._recover_blocked(board)
+    await loop._host_disk_tick()
+
+    assert set(loop._host_disk_state()) == {VOL_B} and loop._host_disk_state()[VOL_B]["held"].keys() == {"bd-2"}
+    keys = sorted(r["dedup_key"].split(":")[0] for r in _pending(inbox))
+    assert keys == ["blocked", "host-disk"]  # bd-1's own page; one page for the full volume
+    assert not loop._host_disk_holds(board.get_feature("bd-1")) and loop._host_disk_holds(board.get_feature("bd-2"))
+
+    disk.free[VOL_B] = 50 * GB
+    await loop._host_disk_tick()
+    assert board.states()["bd-1"] == "blocked" and not board.get_feature("bd-2")["blocked"]

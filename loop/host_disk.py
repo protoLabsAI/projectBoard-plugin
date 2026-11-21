@@ -10,24 +10,33 @@ Now the loop treats it the way it treats a project whose gate preflight is red:
 - before a claim, the free space on the volume holding the card's project checkout (where
   its worktrees are made) is read. Under ``min_free_disk_gb`` nothing on that volume is
   claimed, and the skip says ``host-disk``; cards on other volumes go ahead;
-- a drive that fails with the ``host-disk`` class (or while preparing its tree on a volume
-  under the threshold) puts its card back to ready with a ``host-disk`` hold, never a
-  terminal block;
+- a drive that fails with the ``host-disk`` class (or while preparing its tree) on a volume
+  the host itself confirms is out of room puts its card back to ready with a ``host-disk``
+  hold, never a terminal block;
 - the operator gets ONE inbox page per volume (dedup key ``host-disk:<volume>``), in plain
   words, listing the waiting cards;
 - each tick, once the space is back, the held cards are released and the page is retired.
 
-A failure the probe cannot see (a quota, exhausted inodes, no temp directory, or the check
-switched off) still holds its volume. With no reading to wait for, the hold is retried
-after ``RETRY_S``; the page stays up until a retry goes that long without failing again.
+Error text alone never holds a card. A coder's reply, a failing test's output or a branch
+name can quote "No space left on device" with the disk half empty, so the host has to
+confirm it: the free space reads under the threshold, or a small write to the volume is
+refused for lack of space (``out_of_room`` — what a quota, an exhausted inode table or a
+disk filled with the check switched off look like). A failure the host does not confirm
+keeps the handling it always had: an ordinary block and the card's own page.
+
+A hold confirmed only by the refused write has no free-space reading to wait for. It is
+retried after ``RETRY_S``; the page stays up until a retry goes that long without failing
+again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import shutil
+import tempfile
 import time
 
 from .. import block_pages
@@ -43,6 +52,14 @@ MIN_FREE_DISK_GB_DEFAULT = 5.0
 #: how long its page then stays up waiting to see that the retry did not fail the same way.
 RETRY_S = 300.0
 PAGE_KEY_PREFIX = "host-disk:"
+#: How the reason of a card under the loop's hold starts. The class alone does not mark a
+#: hold: any block whose reason quotes a disk-full error is classified `host-disk` from its
+#: text. Restart recovery re-adopts a block with this prefix as a hold (the way a preflight
+#: hold is known by `PREFLIGHT_BLOCK_PREFIX`).
+HOLD_REASON_PREFIX = "held for disk space: "
+#: The errors by which the OS refuses a write for lack of room: blocks, inodes or quota.
+_NO_ROOM_ERRNOS = frozenset({errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)})
+_WRITE_PROBE_BYTES = 64 * 1024
 #: What moves a card held for disk space — for the board's own "what is held" answers.
 HOLD_STEP = "free up disk space on this computer; the cards start again on their own"
 _PAGE_CARDS_MAX = 10
@@ -64,6 +81,48 @@ def free_bytes(path: str, usage=None) -> int | None:
             path = parent
         except Exception:  # noqa: BLE001 — an unreadable volume is unknown, never "full"
             return None
+
+
+def _write_probe(directory: str) -> None:
+    """Create, write, sync and remove one small file in ``directory``."""
+    with tempfile.NamedTemporaryFile(dir=directory, prefix=".board-disk-probe-") as stream:
+        stream.write(b"\0" * _WRITE_PROBE_BYTES)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def out_of_room(path: str, write=None) -> bool:
+    """Whether the volume holding ``path`` refuses a small write for lack of space: the OS
+    answers ENOSPC or EDQUOT. That is the host's own word, and it also covers what a
+    free-space reading cannot show (a quota, an exhausted inode table). The file goes in
+    the checkout's ``.git`` directory when there is one (where ``git worktree add`` writes
+    first, and never in the working tree), else in the nearest existing directory. Any
+    other outcome is False: a write that worked, or one refused for another reason (a
+    read-only or missing directory), is not evidence of a full disk. ``write`` replaces the
+    real write in tests."""
+    path = os.path.abspath(path or ".")
+    while not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+    git_dir = os.path.join(path, ".git")
+    try:
+        (write or _write_probe)(git_dir if os.path.isdir(git_dir) else path)
+    except OSError as exc:
+        return exc.errno in _NO_ROOM_ERRNOS
+    except Exception:  # noqa: BLE001 — unknown is never "full"
+        return False
+    return False
+
+
+def is_hold_reason(feature: dict | None) -> bool:
+    """Whether a card's block is the loop's own host-disk hold, by its class and the reason
+    the hold wrote — not a block merely classified ``host-disk`` from its text."""
+    feature = feature or {}
+    return feature.get("blocked_class") == HOST_DISK_CLASS and (
+        str(feature.get("blocked_reason") or "").lstrip().startswith(HOLD_REASON_PREFIX)
+    )
 
 
 def min_free_bytes(cfg: dict | None) -> int:
@@ -139,7 +198,7 @@ def _pending_pages(inbox, volume: str) -> list:
 
 def send_page(volume: str, free: int | None, waiting: dict[str, str]) -> bool:
     """Put the volume's page in the operator's inbox unless one is already waiting there.
-    True when the operator has it (sent now or before); False when no inbox took it."""
+    True when the operator has it (sent now or before). Raises when no inbox can take it."""
     inbox = block_pages.inbox_store()
     if inbox is None:
         raise RuntimeError("no resolvable inbox store for this instance")
@@ -177,7 +236,6 @@ def _new_volume(path: str) -> dict:
         "seen_low": False,  # the probe itself has measured this volume under the threshold
         "failed_at": 0.0,  # monotonic time of the newest host-disk failure on it
         "probation_until": 0.0,  # an unconfirmed hold was retried: keep the page until then
-        "free": None,
         "paged": False,
         "page_warned": False,
     }
@@ -186,7 +244,7 @@ def _new_volume(path: str) -> dict:
 class HostDiskMixin:
     """The loop's host-disk hold. State is per volume (``_new_volume``) and lives in the
     process; a restart re-adopts held cards from their ``host-disk`` class (the blocked
-    sweep calls ``_host_disk_adopt``)."""
+    sweep calls ``_host_disk_adopt``) and their reason (``HOLD_REASON_PREFIX``)."""
 
     # ── seams (tests replace these on the instance) ───────────────────────────────
     def _disk_free(self, path: str) -> int | None:
@@ -194,6 +252,9 @@ class HostDiskMixin:
 
     def _disk_volume(self, path: str) -> str:
         return volume_of(path)
+
+    def _disk_full(self, path: str) -> bool:
+        return out_of_room(path)
 
     def _host_disk_now(self) -> float:
         return getattr(self, "_monotonic_clock", time.monotonic)()
@@ -245,7 +306,6 @@ class HostDiskMixin:
             st = vols[volume] = _new_volume(repo)
         if low:
             st["seen_low"] = True
-            st["free"] = free
         st["waiting"][candidate["id"]] = str(candidate.get("title") or "")
         skip = {"fid": candidate["id"], "reason": HOST_DISK_CLASS, "volume": volume}
         if free is not None:
@@ -253,21 +313,47 @@ class HostDiskMixin:
         return skip
 
     # ── a drive that failed for disk space ────────────────────────────────────────
+    async def _host_disk_confirmed(self, repo: str) -> bool:
+        """Whether the HOST says the volume holding ``repo`` is out of room: its free space
+        reads under the threshold, or a small write to it is refused for lack of space.
+        Both off the event loop; a check that cannot be made confirms nothing."""
+        if (await self._host_disk_probe_safe(repo))[1]:
+            return True
+        try:
+            return bool(await asyncio.to_thread(self._disk_full, repo))
+        except Exception:  # noqa: BLE001
+            log.debug("[project_board] host-disk: could not test a write on %s", repo, exc_info=True)
+            return False
+
     async def _host_disk_failure(self, exc: BaseException, repo: str) -> bool:
-        """Whether a drive's failure is the host running out of room: its error is the
-        ``host-disk`` class, or it could not prepare its tree while the volume is under the
-        threshold. Never for a failure whose text is the coder's own words (no commits, a
-        refusal) or for stranded work, which keeps its own class and its tree."""
+        """Whether a drive's failure is the host running out of room. Two things must hold:
+        the failure points at the disk (its error is the ``host-disk`` class, or it could
+        not prepare its tree), AND the host confirms it (``_host_disk_confirmed``). The
+        error text alone is never enough: a gate's output, a coder timeout's tail or a
+        branch name can quote "No space left on device" on a disk with room, and such a
+        failure keeps its ordinary handling. Never for a failure whose text is the coder's
+        own words (no commits, a refusal) or for stranded work, which keeps its own class
+        and its tree."""
         from .. import worktree
         from .. import coder_seam
 
         if isinstance(exc, (worktree.NoChangesError, worktree.StrandedWorkError, coder_seam.SolveRefused)):
             return False
-        if classify(str(exc)).category == HOST_DISK_CLASS:
-            return True
-        if isinstance(exc, worktree.EnvironmentPreparationError):
-            return (await self._host_disk_probe_safe(repo))[1]
-        return False
+        suspect = isinstance(exc, worktree.EnvironmentPreparationError) or (
+            classify(str(exc)).category == HOST_DISK_CLASS
+        )
+        return suspect and await self._host_disk_confirmed(repo)
+
+    def _host_disk_holds(self, feature: dict | None) -> bool:
+        """Whether ``feature`` is under the loop's host-disk hold, so the volume's one page
+        covers it: it carries the class AND either its reason is the hold's own or this
+        loop tracks it. A card merely classified ``host-disk`` from its reason's text is
+        not held, and keeps its own page."""
+        feature = feature or {}
+        if feature.get("blocked_class") != HOST_DISK_CLASS:
+            return False
+        fid = feature.get("id")
+        return is_hold_reason(feature) or any(fid in st["held"] for st in self._host_disk_state().values())
 
     async def _host_disk_hold(self, store, feature: dict, repo: str) -> None:
         """Record a card the drive just blocked ``host-disk`` as held for its volume, and
@@ -286,7 +372,6 @@ class HostDiskMixin:
         st["probation_until"] = 0.0
         if low:
             st["seen_low"] = True
-            st["free"] = free
         log.warning(
             "[project_board] %s held (%s): the volume %s is out of room — it starts again once space is freed",
             fid,
@@ -294,24 +379,40 @@ class HostDiskMixin:
             volume or repo,
         )
 
-    def _host_disk_adopt(self, feature: dict) -> None:
-        """Track a card found blocked ``host-disk`` that this process is not holding yet —
-        one a previous run held, or one blocked on a disk-full error outside a drive. It is
-        released on the next tick that finds its volume with room."""
+    async def _host_disk_adopt(self, store, feature: dict) -> bool:
+        """Track a card found blocked ``host-disk`` that this process is not holding yet,
+        so the next tick that finds its volume with room releases it. True when the card is
+        (now) held. Only for a card the loop put under the hold (its reason starts with
+        ``HOLD_REASON_PREFIX`` — one a previous run held), or one whose volume reads under
+        the threshold right now (a block set outside a drive on a disk that IS full). The
+        class alone comes from the reason's text and proves nothing: such a card is left
+        to the blocked sweep's ordinary handling (False)."""
         fid = feature.get("id")
         if not fid:
-            return
+            return False
         vols = self._host_disk_state()
         if any(fid in st["held"] for st in vols.values()):
-            return
+            return True
         try:
+            reason = str(feature.get("blocked_reason") or "").strip()
+            if not reason:  # a listing row without its comment thread: read the card once
+                fresh = await asyncio.to_thread(store.get_feature, fid) or {}
+                reason = str(fresh.get("blocked_reason") or "").strip()
             repo = self._repo_for(feature)
-            volume = self._disk_volume(repo)
+            volume, low, _free = await self._host_disk_probe_safe(repo)
+            if not is_hold_reason({**feature, "blocked_reason": reason}) and not low:
+                return False
+            if not volume:  # the probe could not read it; the hold is still the loop's own
+                volume = await asyncio.to_thread(self._disk_volume, repo)
         except Exception:  # noqa: BLE001 — adoption is best-effort; the next sweep retries
             log.debug("[project_board] host-disk: could not place %s on a volume", fid, exc_info=True)
-            return
-        vols.setdefault(volume, _new_volume(repo))["held"][fid] = str(feature.get("title") or "")
+            return False
+        st = vols.setdefault(volume, _new_volume(repo))
+        st["held"][fid] = str(feature.get("title") or "")
+        if low:
+            st["seen_low"] = True
         log.info("[project_board] host-disk: tracking held card %s on %s", fid, volume)
+        return True
 
     # ── every tick: page while it lasts, release when it clears ───────────────────
     async def _host_disk_tick(self) -> None:
@@ -319,7 +420,6 @@ class HostDiskMixin:
         for volume, st in list(vols.items()):
             _volume, low, free = await self._host_disk_probe_safe(st["path"])
             now = self._host_disk_now()
-            st["free"] = free
             if low:
                 st["seen_low"] = True
             # A hold the probe never confirmed has no reading to wait for: give it RETRY_S.

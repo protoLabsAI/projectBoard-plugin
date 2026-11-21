@@ -473,6 +473,8 @@ def _roomy_host_disk(monkeypatch):
     from project_board.loop import host_disk
 
     monkeypatch.setattr(host_disk.HostDiskMixin, "_disk_free", lambda self, path: 1024 * host_disk.GB)
+    # Nor does a failure that quotes a disk-full error test a real write on the machine.
+    monkeypatch.setattr(host_disk.HostDiskMixin, "_disk_full", lambda self, path: False)
     yield
 
 

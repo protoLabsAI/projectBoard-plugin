@@ -1112,7 +1112,7 @@ class ReconcileMixin(WorktreeCleanup):
                     else f"held until {PREFLIGHT_HOLD_STEP} ({cls})"
                     if cls == PREFLIGHT_HOLD_CLASS
                     else f"held until there is more disk space ({cls})"
-                    if cls == HOST_DISK_CLASS
+                    if self._host_disk_holds(f)
                     else f"held by agent ({cls})"
                     if cls == store_mod.AGENT_HOLD_CLASS
                     else f"needs a human ({cls or 'unclassified'})"
@@ -1255,11 +1255,12 @@ class ReconcileMixin(WorktreeCleanup):
                 cls = str(f.get("blocked_class") or "").strip()
                 if cls == store_mod.AGENT_HOLD_CLASS:
                     continue  # Explicit release only; no terminal operator inbox alert.
-                if cls == HOST_DISK_CLASS:
+                if cls == HOST_DISK_CLASS and await self._host_disk_adopt(store, f):
                     # #801: the host-disk hold owns this card — one page for the volume, and
                     # a release when space is back. Tracked here so a hold from before a
-                    # restart (or a block set outside a drive) is released too.
-                    self._host_disk_adopt(f)
+                    # restart (or a block set outside a drive on a disk that reads full) is
+                    # released too. A card that only carries the class — given from the
+                    # words of its reason — is not held: it takes the ordinary path below.
                     continue
                 # The reason rides a COMMENT. `br list` carries none, but since #416 the
                 # listing copies the thread across for blocked rows, so it is normally
