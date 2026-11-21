@@ -308,14 +308,25 @@ function taskRequirements(f){
 // source escape + URL-scheme strip in that pass apply unchanged. The empty "—" branch
 // stays plain. One shared helper so the card drawer and the task drawer render alike.
 function prose(s){ return s ? '<div class="tdsec md-saying" data-md="'+esc(s)+'">'+esc(s)+'</div>' : '<div class="tdsec tdsec--empty">—</div>'; }
+// A drawer's spec / acceptance-criteria section. The /features poll is a summary (#805):
+// it carries `spec_preview`, never the text, which only a single-card read has. While a
+// drawer has no such read in hand (`detail_state`, set by pendingRow) the section says it
+// is loading — or that the read failed and is being retried — under the preview line,
+// instead of the "—" that means a card has no text.
+function fullText(f, key){
+  if (!f.detail_state || f[key]) return prose(f[key]);
+  const lead = key === "spec" && f.spec_preview ? '<div class="tdsec">'+esc(f.spec_preview)+'</div>' : "";
+  return lead + '<div class="tdsec tdsec--empty tdsec--pending">'
+    + (f.detail_state === "failed" ? "Couldn't load the full text. Retrying…" : "Loading the full text…")+'</div>';
+}
 // The task-detail drawer body (bd-rdmh): a task's detail + controls live in the SHARED
 // #drawer instead of inline on the Kanban card / list row. Renders the spec, the
 // acceptance criteria, any recorded deliverable, the requirement ledger, then the
 // state-appropriate controls (taskExtra). Server-authored text starts esc()'d; spec/AC
 // are upgraded through the guarded markdown pass.
 function taskDetail(f){
-  let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + prose(f.spec)
-    + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
+  let h = nextActionDetail(f) + '<div class="tdlbl">spec</div>' + fullText(f, "spec")
+    + '<div class="tdlbl">acceptance criteria</div>' + fullText(f, "acceptance_criteria");
   if (f.deliverable) h += '<div class="tdlbl">deliverable</div><div class="deliv">'+esc(f.deliverable)+'</div>';
   h += taskRequirements(f);
   h += selfVerifiedProvenance(f);
@@ -510,7 +521,7 @@ async function load(){
   const seq = ++LOAD_SEQ;
   LAST_FULL = Date.now();
   try {
-    const res = await kit.apiFetch("/api/plugins/project_board/features",
+    const res = await kit.apiFetch("/api/plugins/project_board/features?view=summary",
       FEATURES_ETAG ? {headers: {"if-none-match": FEATURES_ETAG}} : undefined);
     if (seq !== LOAD_SEQ) return;
     // The server answered from its previous snapshot because `br` was busy (its refresh
@@ -792,7 +803,7 @@ function blockedLine(f){
   return '<div class="why">'+heal+(why ? '<span class="why-t" title="'+esc(why)+'">'+esc(why)+'</span>' : '')+'</div>';
 }
 function cardHTML(f, state){
-  const spec = specLine(f.spec);
+  const spec = f.spec_preview ?? specLine(f.spec);
   const meta = (flags(f)+' '+taskFoot(f)).trim();
   return (isFollowed(f.id) ? '<span class="follow-tag">Following</span>' : '')
     + '<div class="c-top"><span class="id">'+esc(f.id)+'</span>'
@@ -1503,6 +1514,27 @@ let MON_FID = null, MON_TIMER = null, TASK_FID = null, MON_LAST_FID = null;
 // monitor's on-open /progress posture). Shape: {fid, feature} on success, {fid, error} on
 // a failed fetch (surfaced in the drawer); null when no task is open / not yet fetched.
 let TASK_DETAIL = null;
+const TASK_DETAIL_REV = {};
+// The last good single-card read per card, shared by the task drawer and the Card tab
+// (#805). The poll row has no spec, criteria or deliverable, so a drawer with no read in
+// hand — just opened, or its re-read failed — would have no text to show. Kept across
+// polls, reopens and a failed re-read; live state still comes from the poll row, and every
+// open re-reads. Capped, least recently read out first.
+const DETAIL_CACHE = new Map();
+const DETAIL_CACHE_MAX = 40;
+// A failed single-card read is retried on this beat while its drawer stays open.
+const DETAIL_RETRY_MS = 10000;
+function rememberDetail(fid, f){
+  DETAIL_CACHE.delete(fid);
+  DETAIL_CACHE.set(fid, f);
+  if (DETAIL_CACHE.size > DETAIL_CACHE_MAX) DETAIL_CACHE.delete(DETAIL_CACHE.keys().next().value);
+}
+// The single-card read a drawer renders from: this open's (`d`, a TASK_DETAIL /
+// CARD_DETAIL entry) when it landed, else the last good one for the card, else null.
+function fullDetail(fid, d){ return (d && d.feature) || DETAIL_CACHE.get(fid) || null; }
+// The poll row for a drawer with NO single-card read at all, marked so fullText says the
+// text is loading (or failed and retrying) rather than rendering it as empty.
+function pendingRow(f, d){ return {...f, detail_state: d && d.error ? "failed" : "loading"}; }
 // Monotonic ticket for fetchTaskDetail — see its comment: fences two in-flight
 // fetches of the SAME task so a slow earlier one cannot overwrite a newer one.
 const TASK_DETAIL_SEQ = {};
@@ -1852,14 +1884,19 @@ function openTask(fid){
 // action on task A bump the sequence and silently invalidate task B's in-flight fetch
 // after the drawer switched, leaving B with no deliverable and no replacement fetch.
 async function fetchTaskDetail(fid){
+  TASK_DETAIL_REV[fid] = (featureById(fid) || {}).updated_at;
   const seq = TASK_DETAIL_SEQ[fid] = (TASK_DETAIL_SEQ[fid] || 0) + 1;
   try {
     const f = await api(FEAT + encodeURIComponent(fid));
     if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ[fid]) return;
     TASK_DETAIL = {fid: fid, feature: f};
+    rememberDetail(fid, f);
   } catch (e) {
     if (TASK_FID !== fid || seq !== TASK_DETAIL_SEQ[fid]) return;
     TASK_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};
+    // Not permanent: one retry per failure, dropped if the drawer moved on or a newer
+    // fetch was issued meanwhile (same fences as above), so retries never stack.
+    setTimeout(() => { if (TASK_FID === fid && seq === TASK_DETAIL_SEQ[fid]) fetchTaskDetail(fid); }, DETAIL_RETRY_MS);
   }
   syncTaskDrawer();
 }
@@ -1873,15 +1910,21 @@ function syncTaskDrawer(){
   // The header names the task: its id, then its title (inline code rendered, escaped).
   const dt = $("drawer-title"), dh = 'Task — '+esc(f.id)+(f.title ? '<span class="dt-name">'+inlineCode(f.title)+'</span>' : '');
   if (dt.innerHTML !== dh) dt.innerHTML = dh;                     // unchanged → untouched (no reflow per poll)
-  // The list-driven summary (state, spec, controls) comes from FEATURES so a 10s-poll /
-  // action re-render still tracks in_progress → in_review → done; the comment-derived
-  // deliverable the list omits is spliced in from the single-fetch (TASK_DETAIL) once it
-  // has landed for THIS task (#312), and so is the requirement ledger (#399) — the
-  // verifier reads the same card read the deliverable came from. A failed single-fetch
-  // surfaces as an error callout ABOVE the detail rather than leaving the deliverable
+  // The live summary (state, controls) comes from FEATURES so a 10s-poll / action
+  // re-render still tracks in_progress → in_review → done. The poll row is a summary
+  // (#805): the spec and acceptance criteria, the comment-derived deliverable (#312) and
+  // the requirement ledger (#399) — the verifier reads the same card read the deliverable
+  // came from — are spliced in from the single-card read: this open's (TASK_DETAIL) once
+  // it has landed for THIS task, else the last good one (DETAIL_CACHE), so a re-read that
+  // is in flight or failed never blanks text the drawer already had. With no read at all
+  // the text sections say they are loading / retrying (pendingRow → fullText). A failed
+  // single-fetch surfaces as an error callout ABOVE the detail rather than leaving it
   // silently blank; an approval past open requirements (VERIFY_NOTE) rides the same slot.
+  // The requested revision is recorded before fetching so repeated renders cannot fan out.
   const d = (TASK_DETAIL && TASK_DETAIL.fid === TASK_FID) ? TASK_DETAIL : null;
-  const merged = d && d.feature ? {...f, deliverable: d.feature.deliverable, requirements: d.feature.requirements} : f;
+  if (d && f.updated_at && TASK_DETAIL_REV[TASK_FID] !== f.updated_at) fetchTaskDetail(TASK_FID);
+  const full = fullDetail(TASK_FID, d);
+  const merged = full ? {...full, ...f, deliverable: full.deliverable, requirements: full.requirements} : pendingRow(f, d);
   const err = d && d.error
     ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load task detail: " + d.error)+'</div>'
     : "";
@@ -2008,9 +2051,12 @@ async function fetchCardDetail(fid){
     const f = await api(FEAT + encodeURIComponent(fid));
     if (CARD_FID !== fid || seq !== CARD_DETAIL_SEQ[fid]) return;
     CARD_DETAIL = {fid: fid, feature: f};
+    rememberDetail(fid, f);
   } catch (e) {
     if (CARD_FID !== fid || seq !== CARD_DETAIL_SEQ[fid]) return;
     CARD_DETAIL = {fid: fid, error: "" + ((e && e.message) || e)};
+    // Retried like fetchTaskDetail: once per failure, fenced on the card and the ticket.
+    setTimeout(() => { if (CARD_FID === fid && seq === CARD_DETAIL_SEQ[fid]) fetchCardDetail(fid); }, DETAIL_RETRY_MS);
   }
   syncCardDrawer();
 }
@@ -2028,7 +2074,13 @@ function syncCardDrawer(force){
   else {
     const d = CARD_DETAIL && CARD_DETAIL.fid === CARD_FID ? CARD_DETAIL : null;
     if (d && d.feature && d.feature.updated_at && f.updated_at && d.feature.updated_at !== f.updated_at) fetchCardDetail(CARD_FID);
-    const merged = d && d.feature ? {...f, ...d.feature, state: f.state, next_action: f.next_action, next_action_hint: f.next_action_hint} : f;
+    // The poll row is a summary (#805): the body's text comes from the single-card read —
+    // this open's, else the last good one, so an in-flight or failed re-read keeps it —
+    // and with no read at all the text sections say they are loading / retrying.
+    // Live poll metadata wins over cached detail, as in the Task drawer. Only the
+    // comment-derived deliverable and requirement ledger must override list previews.
+    const full = fullDetail(CARD_FID, d);
+    const merged = full ? {...full, ...f, deliverable: full.deliverable, requirements: full.requirements} : pendingRow(f, d);
     html = (d && d.error ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load card detail: " + d.error)+'</div>' : "")
       + cardDetail(merged);
   }
@@ -2043,7 +2095,8 @@ function syncCardDrawer(force){
 const INTERNAL_LABEL = /^(project|gens|diff|merged-verified|review-clean-sha|verified):/;
 function cardDetail(f){
   const fact = (k, v) => v === "" || v == null ? "" : '<div class="cf"><dt>'+esc(k)+'</dt><dd>'+v+'</dd></div>';
-  const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts) || 0;
+  // `attempts_count`: the summary row's stand-in for the attempts list (#805).
+  const tries = Array.isArray(f.attempts) ? f.attempts.length : Number(f.attempts ?? f.attempts_count) || 0;
   let h = '<div class="cflags">'+flags({...f, difficulty: ""})+'</div>'          // difficulty is a fact below
     + nextActionDetail(f)                                                       // the chip's full status
     + '<dl class="cfacts">'
@@ -2067,8 +2120,8 @@ function cardDetail(f){
       + '<span title="'+esc(g.detail || "")+'">'+esc(g.spec || "")+'</span></li>').join("")+'</ul>';
   const labels = (f.labels || []).filter(l => !INTERNAL_LABEL.test(l));
   if (labels.length) h += '<div class="tdlbl">labels</div><div class="clabels">'+labels.map(l => '<span class="pl-badge">'+esc(l)+'</span>').join("")+'</div>';
-  h += '<div class="tdlbl">spec</div>' + prose(f.spec)
-    + '<div class="tdlbl">acceptance criteria</div>' + prose(f.acceptance_criteria);
+  h += '<div class="tdlbl">spec</div>' + fullText(f, "spec")
+    + '<div class="tdlbl">acceptance criteria</div>' + fullText(f, "acceptance_criteria");
   h += taskRequirements(f);
   const planned = f.files_to_modify || [];
   if (planned.length) h += '<div class="tdlbl">planned files</div><ul class="cfiles">'+planned.map(p => '<li><code>'+esc(p)+'</code></li>').join("")+'</ul>';
