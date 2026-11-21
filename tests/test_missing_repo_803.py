@@ -159,3 +159,59 @@ async def test_manual_dispatch_refreshes_missing_repos(monkeypatch, registered):
     loop.cfg["default_project"] = "deleted"
     await loop.dispatch_now()
     assert len(observed) == 2  # missing default stops before preflight/claims
+
+
+class _Host:
+    def __init__(self):
+        self.calls = []
+
+    def report_setup_gap(self, key, message, *, label=None):
+        self.calls.append((key, message))
+
+
+def test_missing_secondary_stays_on_the_host_warning_until_restored(registered):
+    """Skipping must not hide it: the repo check is ok (no pause) but the host's operator
+    warning keeps naming the deleted project, and clears once the folder is back."""
+    cfg, repos = registered
+    host = _Host()
+    reporter = setup_check.GapReporter(host)
+    kw = {"which": lambda name: "/bin/true", "delegates": lambda name: True}
+
+    status = setup_check.setup_status(cfg, **kw)
+    assert status["repo"]["ok"] is True and "repo" not in status["loop_blockers"]
+    reporter.report(status)
+    message = dict(host.calls)["repo"]
+    assert "deleted" in message and str(repos["deleted"]) in message
+    assert "remove the project or restore the folder" in message
+
+    host.calls.clear()
+    reporter.report(setup_check.setup_status(cfg, **kw))  # steady state: edge-triggered, no spam
+    assert "repo" not in dict(host.calls)
+
+    subprocess.run(["git", "init", "-q", str(repos["deleted"])], check=True)
+    reporter.report(setup_check.setup_status(cfg, **kw))
+    assert ("repo", None) in host.calls
+
+
+def test_missing_default_hint_points_at_settings_not_project_removal(registered):
+    cfg, repos = registered
+    cfg["default_project"] = "deleted"
+    result = setup_check._repo_check(cfg, os.path.isdir)
+    assert result["ok"] is False
+    assert "(project 'deleted')" in result["hint"] and "fix project_board.repo" in result["hint"]
+    assert "remove the project" not in result["hint"]
+
+    flat = setup_check._repo_check({"repo": str(repos["deleted"])}, os.path.isdir)
+    assert flat["ok"] is False and str(repos["deleted"]) in flat["hint"]
+    assert "fix project_board.repo" in flat["hint"] and "remove the project" not in flat["hint"]
+
+
+def test_missing_flat_repo_store_error_does_not_invent_a_project(monkeypatch, registered):
+    _, repos = registered
+    monkeypatch.setattr(store, "BR", shutil.which("git"))
+    board = store.BeadsBoard(db=str(repos["healthy"] / "board.db"), repo=str(repos["deleted"]))
+    with pytest.raises(store.BoardError) as error:
+        board.list_features()
+    text = str(error.value)
+    assert str(repos["deleted"]) in text and "fix project_board.repo" in text
+    assert "remove the project" not in text

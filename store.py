@@ -2059,7 +2059,12 @@ class BeadsBoard:
             repo = self.repo or "."
             if not os.path.isdir(repo):
                 names = [name for name, entry in self.projects.items() if entry.get("repo") == repo]
-                project = ", ".join(repr(name) for name in names) or repr(self.default_project or "default")
+                if not names:
+                    # The board's own (flat / default) repo: there is no project to remove.
+                    raise BoardError(
+                        f"board repo folder {repo!r} is missing — restore the folder or fix project_board.repo"
+                    ) from exc
+                project = ", ".join(repr(name) for name in names)
                 raise BoardError(
                     f"project {project}: repo folder {repo!r} is missing — remove the project or restore the folder"
                 ) from exc

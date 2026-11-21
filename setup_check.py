@@ -777,10 +777,18 @@ def _repo_check(cfg: dict, isdir) -> dict:
         return {"ok": True, "path": default_repo, "hint": ""}
     default = resolve_default_project(cfg)
     blocked = default in missing or len(missing) == len(projects)
-    hints = [
-        f"repo {path!r} does not exist (project {name!r}) — remove the project or restore the folder"
-        for name, path in missing.items()
-    ]
+    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
+    hints = []
+    for name, path in missing.items():
+        where = f" (project {name!r})" if explicit else ""
+        if blocked and (name == default or not explicit):
+            # The repo the board itself is bound to: "remove the project" is not the fix.
+            action = (
+                "fix project_board.repo (or the projects: entry) in Settings ▸ Project Board, or restore the folder"
+            )
+        else:
+            action = "remove the project or restore the folder"
+        hints.append(f"repo {path or default_repo!r} does not exist{where} — {action}")
     # Keep the finding visible even when healthy siblings can continue.
     return {
         "ok": not blocked,
@@ -1300,6 +1308,11 @@ class GapReporter:
             else:
                 check = (status or {}).get(key) or {}
                 msg = None if check.get("ok", False) else (str(check.get("hint") or "") or f"{key} check failed")
+                # #803: a missing SECONDARY project no longer fails the repo check (healthy
+                # projects keep building), but the operator must still see it — keep the
+                # warning up until the folder is restored or the project removed.
+                if msg is None and key == "repo" and check.get("missing_projects"):
+                    msg = str(check.get("hint") or "") or None
             if not first and key in self._reported and self._reported[key] == msg:
                 continue
             self._reported[key] = msg
