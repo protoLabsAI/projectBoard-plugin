@@ -231,7 +231,7 @@ STORE_SEAMS: dict[str, str] = {
     "_prepare_ready": "UNCOVERED",
     "_show_by_id": "REAL",  # #401: live_cards' detail reads, real `br` (test_work_snapshot_review_401.py)
     "add_dependency": "REAL",
-    "archive_stale": "UNCOVERED",
+    "archive_stale": "REAL",  # #793: age + count cap through real `br` (tests/test_store.py)
     "attach_pr": "REAL",  # #402: every shape through real `br` in tests/test_attach_pr_402.py
     "block_from_review": "REAL",  # #401 review: real `br` in tests/test_work_snapshot_review_401.py
     "bounce_ci_fail": "UNCOVERED",
@@ -289,7 +289,7 @@ STORE_SEAMS: dict[str, str] = {
 # seam is now REAL or an honestly-recorded EXEMPT, so the worktree UNCOVERED floor is 0 and a
 # newly-added UNCOVERED worktree seam fails this file outright.
 MAX_UNCOVERED_WORKTREE = 0
-MAX_UNCOVERED_STORE = 15
+MAX_UNCOVERED_STORE = 14
 
 # The EXEMPT ratchet. An EXEMPT drops a seam from MAX_UNCOVERED_WORKTREE, so EXEMPT must itself be
 # bounded or the label would let real debt vanish (the review finding on the UNCOVERED → EXEMPT
