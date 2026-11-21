@@ -562,6 +562,9 @@ class DriveMixin(HostDiskMixin):
                     new = str(section.get(key) or "").strip()
                 else:
                     new = _knob_int(section, key, cur, floor=LIVE_KNOB_FLOORS[key])
+                    if key == "archive_after_days":
+                        # Settings uses whole days; preserve the constructor/store's float type.
+                        new = float(new)
             except (TypeError, ValueError):
                 log.warning("[project_board] reload: %s=%r is malformed — keeping %r", key, section.get(key), cur)
                 continue

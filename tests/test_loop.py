@@ -189,6 +189,29 @@ def test_reload_floors_like_the_constructor_and_keeps_bad_values(caplog):
     assert loop.max_concurrent == 1  # untouched by a payload without the key
 
 
+def test_reload_archive_settings_updates_shared_config_and_preserves_bad_values():
+    cfg = {"archive_after_days": 7, "archive_keep_done": 100}
+    loop = BoardLoop(cfg)
+    assert loop.reload(_HostConfig({"archive_after_days": 3, "archive_keep_done": 20})) == {
+        "archive_after_days": (7, 3),
+        "archive_keep_done": (100, 20),
+    }
+    assert (loop.archive_after_days, loop.archive_keep_done) == (3, 20)
+    assert isinstance(loop.archive_after_days, float)
+    assert cfg == {"archive_after_days": 3, "archive_keep_done": 20}
+    assert loop.reload({"archive_after_days": "bad", "archive_keep_done": None}) == {}
+    assert (loop.archive_after_days, loop.archive_keep_done) == (3, 20)
+    assert cfg == {"archive_after_days": 3, "archive_keep_done": 20}
+    assert loop.reload({"archive_after_days": 0, "archive_keep_done": -1}) == {
+        "archive_after_days": (3, 1),
+        "archive_keep_done": (20, 0),
+    }
+    assert (loop.archive_after_days, loop.archive_keep_done) == (1, 0)
+    assert cfg == {"archive_after_days": 1, "archive_keep_done": 0}
+    assert loop.reload({}) == {}
+    assert (loop.archive_after_days, loop.archive_keep_done) == (1, 0)
+
+
 def test_reload_flips_auto_merge_and_rejects_garbage():
     loop = BoardLoop({})
     assert loop.auto_merge is False
@@ -6134,9 +6157,14 @@ async def test_sweep_runs_the_archive_pass_with_the_configured_window(monkeypatc
     store = _SweepStore()
     monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
     monkeypatch.setattr(worktree, "list_feature_worktrees", lambda repo, root: [])
-    await BoardLoop({"archive_after_days": 3, "archive_keep_done": keep_done})._sweep()
+    loop = BoardLoop({"archive_after_days": 3, "archive_keep_done": keep_done})
+    await loop._sweep()
     assert store.archive_windows == [3.0]
     assert store.archive_caps == [keep_done]
+    loop.reload({"archive_after_days": 2, "archive_keep_done": 5})
+    await loop._sweep()
+    assert store.archive_windows == [3.0, 2.0]
+    assert store.archive_caps == [keep_done, 5]
 
 
 async def test_sweep_survives_an_archive_pass_failure(monkeypatch):
