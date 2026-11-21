@@ -851,29 +851,19 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     @router.delete("/projects/{name}")
     async def _delete_project(name: str):
         """Delete a project only after proving no active board card references it."""
-        from .project_registry import ProjectRegistryConflict, ProjectRegistryError, delete_project
+        from .project_registry import (
+            ProjectRegistryConflict,
+            ProjectRegistryError,
+            delete_project,
+            unused_project_guard,
+        )
 
-        async def assert_unused(project: str, effective_default: str) -> None:
-            try:
-                features = await asyncio.to_thread(store().list_features, include_archived=True)
-            except BoardError as exc:
-                raise ProjectRegistryConflict(f"cannot prove project {project!r} is unused: {exc}") from exc
-            terminal = {"done", "cancelled"}
-            references = [
-                str(f.get("id") or "")
-                for f in features
-                if (
-                    str(f.get("project") or "") == project
-                    or (not str(f.get("project") or "") and effective_default == project)
-                )
-                and str(f.get("board_state") or f.get("state") or "") not in terminal
-            ]
-            if references:
-                sample = ", ".join(references[:5])
-                more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
-                raise ProjectRegistryConflict(
-                    f"project {project!r} is still referenced by active board card(s): {sample}{more}"
-                )
+        # The shared guard (#803): the `board_remove_project` tool builds its check from the
+        # same function, so the route and the tool refuse the same cards.
+        assert_unused = unused_project_guard(
+            lambda **kw: store().list_features(**kw),
+            read_errors=(BoardError,),
+        )
 
         try:
             result = await delete_project(name, assert_unused=assert_unused)

@@ -74,6 +74,20 @@ possible on a host without the registry. Deleting the board project removes the 
 only if the registration added it, it is still read-only, and no other board project uses the
 checkout. See [Multi-project](configuration.md#multi-project).
 
+## Removing a project
+
+`board_remove_project(name)` (in `project_registry.py`, #803) removes a board project that is
+retired or whose repo folder is gone, from chat. It runs the same active-card check as
+`DELETE /projects/{name}` (`unused_project_guard`): while any card that is not done or
+cancelled uses the project, including an unstamped card when the project is the effective
+default, it refuses, names up to five of those cards, and removes nothing. An unknown name
+is a plain `Error:` listing the registered projects. On success the reply says the project
+was removed, the new default project if it changed, and whether a host work-folder entry
+still points at the folder: a managed project or `filesystem.projects` entry the board did
+not add (or may not remove) is named with its path so the agent can tell the operator, and
+when the board removed the entry it added, the reply says none is left. It never deletes the
+folder on disk or any card.
+
 ## Notes
 
 - Every tool returns **JSON on success** and a plain `Error: …` string on failure. They

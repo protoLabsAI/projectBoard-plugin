@@ -1259,12 +1259,114 @@ async def delete_project(
             plan=lambda live, board: _plan_managed_removal(live, board, prior),
         )
         managed = decided["managed"]
+        repo = str(prior.get("repo") or "") if isinstance(prior, dict) else ""
         return {
             "project": project,
             "deleted": True,
             "default_project": default,
+            "previous_default_project": current_default,
+            "repo": repo,
             "managed_project": managed,
+            # What the host still holds for that checkout, read back AFTER the apply (#803):
+            # the board removes only an entry it added, so an operator's own entry stays.
+            "host_entries_left": host_entries_for(repo),
         }
+
+
+#: Card states that no longer need their project: a finished or cancelled card keeps its
+#: label as history, and never dispatches again.
+_TERMINAL_CARD_STATES = frozenset({"done", "cancelled"})
+
+
+def unused_project_guard(
+    list_features: Callable[..., Any],
+    *,
+    read_errors: tuple[type[BaseException], ...] = (Exception,),
+) -> Callable[[str, str], Awaitable[None]]:
+    """The ONE "no active card still uses this project" check (#803), as the
+    ``assert_unused`` callable ``delete_project`` runs inside its mutation lock. Both
+    ``DELETE /projects/{name}`` and ``board_remove_project`` build theirs here, so the two
+    cannot drift.
+
+    ``list_features(include_archived=True)`` is the board store's listing; it runs off the
+    event loop because the store can shell out to ``br``. A card counts when it is stamped
+    with the project, or is unstamped while the project is the effective default, and is
+    not done/cancelled. A listing that fails with one of ``read_errors`` refuses too: an
+    unreadable board proves nothing."""
+
+    async def assert_unused(project: str, effective_default: str) -> None:
+        try:
+            features = await asyncio.to_thread(list_features, include_archived=True)
+        except read_errors as exc:
+            raise ProjectRegistryConflict(f"cannot prove project {project!r} is unused: {exc}") from exc
+        references = [
+            str(f.get("id") or "")
+            for f in features
+            if (
+                str(f.get("project") or "") == project
+                or (not str(f.get("project") or "") and effective_default == project)
+            )
+            and str(f.get("board_state") or f.get("state") or "") not in _TERMINAL_CARD_STATES
+        ]
+        if references:
+            sample = ", ".join(references[:5])
+            more = f" (+{len(references) - 5} more)" if len(references) > 5 else ""
+            raise ProjectRegistryConflict(
+                f"project {project!r} is still referenced by active board card(s): {sample}{more}"
+            )
+
+    return assert_unused
+
+
+def host_entries_for(repo: Any) -> list[dict[str, str]]:
+    """The host's own work-folder entries that point at ``repo``, read from the live
+    config: managed projects (the top-level ``projects:`` registry) and explicit
+    ``filesystem.projects`` entries. Each is ``{kind, name, path}``. Empty host-free, and
+    when ``repo`` is blank."""
+    if not str(repo or "").strip():
+        return []
+    live = _live_host()
+    if live is None:
+        return []
+    found: list[dict[str, str]] = []
+    for kind, attr in (("managed project", "projects"), ("filesystem.projects entry", "filesystem_projects")):
+        for entry in _dict_list(getattr(live, attr, None)):
+            if _same_path(entry.get("path"), repo):
+                found.append({"kind": kind, "name": str(entry.get("name") or ""), "path": str(entry.get("path") or "")})
+    return found
+
+
+def removal_note(result: dict[str, Any]) -> str:
+    """Plain words for what a ``delete_project`` result left on the HOST side: which
+    work-folder entries still point at the removed project's checkout (and why the board
+    kept them), or that none is left."""
+    managed = result.get("managed_project") or {}
+    repo = str(result.get("repo") or "")
+    left = result.get("host_entries_left") or []
+    if left:
+        listed = "; ".join(f"{e['kind']} '{e['name']}' → {e['path']}" for e in left)
+        if managed.get("action") == "kept" and managed.get("detail"):
+            why = f"The board left it alone: {managed['detail']}."
+        else:
+            why = "The board did not add it, so it left it alone."
+        return (
+            f" A host work-folder entry for that folder is still left: {listed}. {why} "
+            "The agent's filesystem tools can still reach that path; if the operator wants it gone "
+            "too, they remove it in Settings ▸ Projects."
+        )
+    where = f" for {repo}" if repo else ""
+    if managed.get("action") == "removed":
+        return (
+            f" No host work-folder entry is left{where}: the board also removed the managed project "
+            f"'{managed.get('name') or ''}' it had added."
+        )
+    if managed.get("action") == "kept" and managed.get("name"):
+        detail = managed.get("detail") or "it no longer belongs to the board"
+        return (
+            f" No host work-folder entry points at that folder any more{where}. The managed project "
+            f"'{managed['name']}' was left alone: {detail}."
+        )
+    return f" No host work-folder entry is left{where}."
 
 
 #: The only non-blank gate value the agent tool accepts: the discovery sentinel the
@@ -1386,3 +1488,55 @@ def build_register_tool(cfg: dict):
         )
 
     return board_register_project
+
+
+def build_remove_tool(cfg: dict, list_features: Callable[..., Any]):
+    """The ``board_remove_project`` tool (#803), or ``None`` when langchain isn't importable.
+
+    ``list_features`` is the board store's listing (resolved lazily by the caller); the
+    tool hands it to ``unused_project_guard``, the same check ``DELETE /projects/{name}``
+    runs, so a project that active cards still use is never removed from chat either."""
+    try:
+        from langchain_core.tools import tool
+    except Exception:  # noqa: BLE001 — host-free import; the helpers above still test
+        return None
+
+    @tool
+    async def board_remove_project(name: str) -> str:
+        """Remove a board project that is retired or whose repo folder is gone, so the operator
+        does not have to open Settings. Refused, changing nothing, while any card that is not
+        done or cancelled still uses the project: the reply names those cards; finish, cancel or
+        re-home them first. Removes only the board's project entry — never the folder on disk,
+        and never a card. The reply says the new default project if it changed, and whether a
+        host work-folder entry (a managed project or a filesystem.projects entry) still points
+        at the folder; pass that on to the operator.
+
+        Args:
+            name: the board project to remove (board_projects lists the names)."""
+        try:
+            project = _validate_name(name)
+            known = _projects_from_section(_live_section(required=True), required=True)
+            if project not in known:
+                names = ", ".join(sorted(known)) or "none"
+                return f"Error: unknown project {project!r}. Registered projects: {names}. Nothing was removed."
+            result = await delete_project(project, assert_unused=unused_project_guard(list_features))
+        except ProjectRegistryConflict as exc:
+            return f"Error: {exc}. Nothing was removed."
+        except ProjectRegistryError as exc:
+            return f"Error: {exc}."
+        repo = result.get("repo") or ""
+        was = f" (was → {repo})" if repo else ""
+        new_default, old_default = result.get("default_project") or "", result.get("previous_default_project") or ""
+        default_note = ""
+        if new_default != old_default:
+            default_note = (
+                f" The default project is now '{new_default}'."
+                if new_default
+                else " There is no default project now, so a new card must name its project."
+            )
+        return (
+            f"Removed board project '{result['project']}'{was}. The running board applied it live; "
+            f"no restart is required.{default_note}{removal_note(result)}"
+        )
+
+    return board_remove_project
