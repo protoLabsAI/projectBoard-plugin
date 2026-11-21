@@ -65,6 +65,7 @@ from .. import gates as publish_gates
 from ..coder_seam import _GATE_NOT_FOUND_EXITS, _MISSING_CMD_RE, _missing_gate_command_hint
 from ..failures import (
     DESIGN_BLOCK_CLASS,
+    HOST_DISK_CLASS,
     ORACLE_MISSING_CLASS,
     ORACLE_TIMEOUT_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
@@ -2290,6 +2291,7 @@ __all__ = [
     "RELEASE_FREEZE_BLOCKER",
     "WAITING_ON_PUBLISH",
     "DESIGN_BLOCK_CLASS",
+    "HOST_DISK_CLASS",
     "ORACLE_MISSING_CLASS",
     "ORACLE_TIMEOUT_CLASS",
     "PRE_MODEL_DISPATCH_CLASS",

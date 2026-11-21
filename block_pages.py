@@ -7,6 +7,8 @@ import logging
 import threading
 from urllib.parse import quote
 
+from .failures import HOST_DISK_CLASS, is_host_disk
+
 log = logging.getLogger("protoagent.plugins.project_board")
 
 
@@ -22,8 +24,40 @@ def serialized(method):
     return wrapped
 
 
+# The whole lead of a host-disk page (#801): what is wrong and what to do, in plain words.
+HOST_DISK_LEAD = (
+    "This computer is almost out of disk space, so this card can't start. "
+    "Free up space and it will start again on its own."
+)
+
+
+def _last_clause(raw: str) -> str:
+    """The last line of an error, cut to the text after its final ": " — the part that
+    names the cause ("…/bd-1.lock': No space left on device"). Empty when the reason is
+    one clause, so there is nothing to tell apart from its start."""
+    lines = [" ".join(line.split()) for line in str(raw or "").splitlines()]
+    lines = [line.rstrip(".").rstrip() for line in lines if line.strip(". \t")]
+    if not lines:
+        return ""
+    tail = lines[-1].rsplit(": ", 1)[-1].strip()
+    return tail if len(lines) > 1 or tail != lines[-1] else ""
+
+
+def _host_disk_page(fid: str, title: str, link: str) -> str:
+    # Budget order: the lead and the link always survive; the card id goes last (the link
+    # carries it too, so it is the first to go on a very long id); the title takes
+    # whatever room is left, and is dropped when that is too little to read.
+    link_md = f"[Open the card]({link})"
+    last = f" {fid}" if len(f"{HOST_DISK_LEAD} {link_md} {fid}") <= 200 else ""
+    room = 200 - len(f"{HOST_DISK_LEAD}  {link_md}{last}")
+    if len(title) > room:
+        title = title[: room - 1].rstrip() + "…" if room >= 12 else ""
+    return f"{HOST_DISK_LEAD} {title} {link_md}{last}" if title else f"{HOST_DISK_LEAD} {link_md}{last}"
+
+
 def page_text(fid: str, feature: dict) -> str:
     title = " ".join(str(feature.get("title") or "Untitled card").split())[:55]
+    raw_reason = str(feature.get("blocked_reason") or "")
     reason = " ".join(str(feature.get("blocked_reason") or "").split()).rstrip(".")
     link = f"/plugins/project_board/board?card={quote(fid, safe='')}"
     if feature.get("blocked_class") == "needs-review" and reason.startswith(
@@ -32,6 +66,10 @@ def page_text(fid: str, feature: dict) -> str:
         # Recovery evidence must retain the PR and exact head, even on long URLs.
         return f"{fid} is blocked: {reason}. [Open the card]({link})"
     hold = feature.get("blocked_class") == "preflight-hold"
+    if feature.get("blocked_class") == HOST_DISK_CLASS or (reason and not hold and is_host_disk(reason)):
+        # #801: a full disk is the host's problem, not the card's. Lead with the cause and
+        # the fix; never with the card id, the class or the raw git error.
+        return _host_disk_page(fid, title, link)
     if not reason:
         action = f"is blocked; [open the card]({link}) to review the reason and choose the next step."
         if hold:
@@ -43,17 +81,29 @@ def page_text(fid: str, feature: dict) -> str:
     # needed. Budget order: the link always survives; the reason is trimmed with
     # an ellipsis; the title is dropped only when trimming would leave almost
     # nothing of the reason.
+    # The trim takes the MIDDLE (#801): the last line of an error is usually the one
+    # that says what went wrong, so its last clause is kept whole and the ellipsis
+    # goes before it. A one-clause reason has no such tail and is trimmed at the end.
     state = "is waiting for its project check" if hold else "is blocked"
+    tail = _last_clause(raw_reason)
 
-    def page(t: str) -> tuple[int, str]:
+    def page(t: str) -> tuple[int, bool, str]:
         head = f"{fid}: {t} {state}: " if t else f"{fid} {state}: "
         room = 200 - len(head) - len(f" [Open the card]({link})")
-        said = f"{reason}." if len(reason) < room else reason[: max(0, room - 1)].rstrip() + "…"
-        return room, f"{head}{said} [Open the card]({link})"
+        front = room - len(f"… {tail}.")  # what is left for the start of the reason
+        whole = True
+        if len(reason) < room:
+            said = f"{reason}."
+        elif tail and front >= 0:
+            said = f"{reason[:front].rstrip()}… {tail}."
+        else:
+            whole = not tail
+            said = (tail or reason)[: max(0, room - 1)].rstrip() + "…"
+        return room, whole, f"{head}{said} [Open the card]({link})"
 
-    room, text = page(title)
-    if len(reason) >= room and room < 24:
-        room, text = page("")
+    room, whole, text = page(title)
+    if len(reason) >= room and (room < 24 or not whole):
+        room, whole, text = page("")
     return text
 
 
