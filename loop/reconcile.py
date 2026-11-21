@@ -216,7 +216,16 @@ class WorktreeCleanup:
         self._reap_deferred.discard(fid)
         return await worktree.reap_feature_worktree(repo, self.root, fid)
 
-    async def _retire_merged_work_locations(self, store, fid: str, repo: str, *, stall_ends_tick: bool = False) -> None:
+    def _merged_location_retirable(self, entry: dict, fid: str, repo: str) -> bool:
+        if entry.get("retired") or not work_locations.skip_recovery(entry, "done"):
+            return False
+        path = entry.get("path") or ""
+        tree = worktree.feature_tree_for_path(repo, self.root, fid, path) if path else None
+        return tree is not None and not os.path.lexists(tree)
+
+    async def _retire_merged_work_locations(
+        self, store, fid: str, repo: str, *, stall_ends_tick: bool = False, listed_ledger: dict | None = None
+    ) -> None:
         """A merged card's tree was just reaped (#752): re-record each of its work-location
         entries that pointed INTO that tree with ``retired: true`` (the field bd-uu9z6 adds),
         so the location sweep stops raising ``[recovery] Recorded work needs recovery`` for
@@ -227,6 +236,14 @@ class WorktreeCleanup:
         remaining entry or card."""
         if self._reap_held_by_drive(fid):
             return
+        # The sweep's fresh, batched done listing already carries the ledger. Use it
+        # only to rule out settled cards; eligible cards still get a fresh read before
+        # writing. No remembered IDs: new reports, repaired histories and trees reaped
+        # since the last pass are automatically reconsidered, including after restart.
+        # Missing projections retain the direct-read fallback used by other callers.
+        if listed_ledger is not None and not listed_ledger.get("errors"):
+            if not any(self._merged_location_retirable(e, fid, repo) for e in listed_ledger.get("entries", [])):
+                return
         try:
             ledger = await asyncio.to_thread(store.list_work_locations, fid)
         except Exception as exc:  # noqa: BLE001 — retirement is best-effort; a close must never hinge on it
@@ -239,18 +256,9 @@ class WorktreeCleanup:
             log.warning("[project_board] %s work-location history is malformed — not retiring after merge", fid)
             return
         for entry in ledger.get("entries", []):
-            if entry.get("retired"):
-                continue
-            # A missing tree is not evidence that its work was saved. Preserve the
-            # terminal recovery policy for recorded unpushed commits, including
-            # when a later health sweep retries after external tree removal.
-            if not work_locations.skip_recovery(entry, "done"):
-                continue
-            path = entry.get("path") or ""
-            tree = worktree.feature_tree_for_path(repo, self.root, fid, path) if path else None
-            # The reap's boolean only describes canonical/slugged trees. Candidates
-            # with unsaved work may remain, even when their recorded file is missing.
-            if tree is None or os.path.lexists(tree):
+            # Preserve unpushed commits and candidates that survived the reap, even
+            # when their recorded file is missing. Only a reaped containing tree counts.
+            if not self._merged_location_retirable(entry, fid, repo):
                 continue
             revision = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
             revision["retired"] = True
@@ -1050,7 +1058,13 @@ class ReconcileMixin(WorktreeCleanup):
                 try:
                     await step(
                         f"merged work-location retirement {f['id']}",
-                        self._retire_merged_work_locations(store, f["id"], self._repo_for(f), stall_ends_tick=True),
+                        self._retire_merged_work_locations(
+                            store,
+                            f["id"],
+                            self._repo_for(f),
+                            stall_ends_tick=True,
+                            listed_ledger=f.get("work_locations"),
+                        ),
                     )
                 except store_mod.BoardTimeout:
                     raise  # stop after one stalled store call, rather than retrying for every done card
