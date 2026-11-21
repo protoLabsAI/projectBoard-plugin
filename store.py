@@ -315,6 +315,11 @@ LABEL_CANCELLED = "cancelled"
 # into "the last archive_after_days days" (the #114 class, one layer up).
 LABEL_ARCHIVED = "archived"
 ARCHIVE_AFTER_DAYS_DEFAULT = 7.0
+# The count half of archival (#793): a busy board closes more cards inside the age
+# window than a Done column can show, so `archive_stale(keep_done=N)` also keeps only
+# the newest N terminal cards live. This is the default the loop will pass; the store
+# method's own default stays 0 (no cap), so a caller that does not ask gets age-only.
+ARCHIVE_KEEP_DONE_DEFAULT = 100
 # A feature others build *on*: dependents gate on its MERGE, never its review (vs a
 # non-foundation blocker, which can release dependents at in_review under dep_gate:
 # review). Inert under the default dep_gate: merge (then every blocker gates on merge).
@@ -4527,7 +4532,11 @@ class BeadsBoard:
 
     # ── archival (#115): age terminal features out of the live view — never delete ─
     def archive_stale(
-        self, archive_after_days: float = ARCHIVE_AFTER_DAYS_DEFAULT, now: float | None = None
+        self,
+        archive_after_days: float = ARCHIVE_AFTER_DAYS_DEFAULT,
+        now: float | None = None,
+        *,
+        keep_done: int = 0,
     ) -> list[str]:
         """Label every terminal feature (``_TERMINAL_STATES``: done/cancelled) whose
         ``closed_at`` is older than ``archive_after_days`` with ``archived`` — the
@@ -4536,22 +4545,44 @@ class BeadsBoard:
         written — the bead, its history, and the git-backed JSONL are untouched, and
         ``list_features(include_archived=True)`` still returns everything. A feature
         with no parseable ``closed_at`` is left alone (fail visible — never archive
-        on a guess). Best-effort per feature; returns the ids archived this pass."""
+        on a guess). Best-effort per feature; returns the ids archived this pass.
+
+        ``keep_done`` (#793) adds a count cap after the age pass: when more than
+        ``keep_done`` terminal features with a parseable ``closed_at`` are still live,
+        the oldest of them (by ``closed_at``) are archived too, until only the newest
+        ``keep_done`` remain. 0 (the default) or less means no cap — age only. A
+        feature with no parseable ``closed_at`` is neither archived nor counted, since
+        it cannot be placed in the order."""
         cutoff = (time.time() if now is None else now) - float(archive_after_days) * 86400.0
-        archived: list[str] = []
+        due: list[str] = []
+        # Terminal features inside the age window, as (closed_at, id).
+        fresh: list[tuple[float, str]] = []
         # The default listing already excludes `archived`, so an archived bead never
         # takes a second (redundant) label write on every sweep.
         for f in self.list_features():
             if f["board_state"] not in _TERMINAL_STATES:
                 continue
             ts = _parse_closed_at(f.get("closed_at"))
-            if ts is None or ts > cutoff:
+            if ts is None:
                 continue
+            if ts > cutoff:
+                fresh.append((ts, f["id"]))
+            else:
+                due.append(f["id"])
+        cap = max(0, int(keep_done or 0))
+        if cap and len(fresh) > cap:
+            # Every aged-out feature is older than every fresh one, so the oldest beyond
+            # the cap are simply the oldest fresh ones. Oldest first; the id breaks a tie
+            # so equal timestamps archive in a stable order.
+            fresh.sort()
+            due.extend(fid for _ts, fid in fresh[: len(fresh) - cap])
+        archived: list[str] = []
+        for fid in due:
             try:
-                self._run("update", f["id"], "--add-label", LABEL_ARCHIVED)
-                archived.append(f["id"])
+                self._run("update", fid, "--add-label", LABEL_ARCHIVED)
+                archived.append(fid)
             except BoardError:
-                log.warning("[project_board] archive pass: labeling %s failed (skipped this sweep)", f["id"])
+                log.warning("[project_board] archive pass: labeling %s failed (skipped this sweep)", fid)
         return archived
 
     def _work_location_hold_reason(self, fid: str, reason: str, feature: dict) -> str:

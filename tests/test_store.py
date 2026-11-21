@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -3754,6 +3755,175 @@ def test_archive_stale_archives_a_terminal_task(make_board):
     assert b.archive_stale(archive_after_days=7, now=_NOW) == ["bd-task-done"]
     labeled = {a[1] for a in br.cmds("update") if ("--add-label", "archived") == a[-2:]}
     assert labeled == {"bd-task-done"}
+
+
+# ── #793: archival by count — keep only the newest N terminal cards live ─────────
+# A board that closes ~40 cards a day fills the Done column well inside the 7-day age
+# window, so `archive_stale(keep_done=N)` also archives the oldest terminal cards
+# beyond the newest N. Same rule as the age pass: only the `archived` label is written.
+
+_requires_real_br = pytest.mark.skipif(
+    shutil.which(store.BR) is None,
+    reason="real `br` (beads) CLI not on PATH (CI installs the pinned binary; "
+    "tests/test_integration.py's guard fails the run when PB_REQUIRE_BR=1 and it is absent)",
+)
+
+
+def _closed(fid, closed_at, labels=()):
+    return {"id": fid, "status": "closed", "labels": list(labels), "closed_at": closed_at}
+
+
+def _archive_labeled(br):
+    return [a[1] for a in br.cmds("update") if ("--add-label", "archived") == a[-2:]]
+
+
+@_requires_real_br
+def test_archive_stale_keep_done_archives_the_oldest_beyond_the_cap_through_real_br(tmp_path):
+    """Real `br`, real timestamps: five terminal cards all closed inside the age window.
+    Without a cap none is archived (the #793 reproduction); with ``keep_done=3`` exactly
+    the two oldest by ``closed_at`` are, and nothing is lost."""
+    b = BeadsBoard(repo=str(tmp_path), actor="test")
+    still_open = b.create_feature("still open", spec="s")["id"]
+    for i in range(5):
+        fid = b.create_feature(f"card {i}", spec="s")["id"]
+        if i % 2:
+            b._run("close", fid, "-r", "shipped")  # done
+        else:
+            b.cancel_feature(fid, "not needed")  # cancelled
+    terminal = [f for f in b.list_features() if f["board_state"] in ("done", "cancelled")]
+    assert len(terminal) == 5
+    stamps = {f["id"]: store._parse_closed_at(f["closed_at"]) for f in terminal}
+    assert all(ts is not None for ts in stamps.values())
+    oldest_first = sorted(stamps, key=lambda fid: (stamps[fid], fid))
+
+    # Today's behaviour, and the default: every card is inside the window, none archived.
+    assert b.archive_stale() == []
+    assert b.archive_stale(keep_done=0) == []
+    assert len(b.list_features()) == 6
+
+    archived = b.archive_stale(keep_done=3)
+    assert archived == oldest_first[:2]
+    live = {f["id"] for f in b.list_features()}
+    assert live == set(oldest_first[2:]) | {still_open}
+    # Hidden, not deleted: the exhaustive view still returns all of them, labeled.
+    everything = {f["id"]: f for f in b.list_features(include_archived=True)}
+    assert set(everything) == set(oldest_first) | {still_open}
+    assert {fid for fid, f in everything.items() if f["archived"]} == set(archived)
+    assert all(everything[fid]["board_state"] in ("done", "cancelled") for fid in archived)
+    # A second sweep finds exactly the cap live and writes nothing.
+    assert b.archive_stale(keep_done=3) == []
+
+
+def test_archive_stale_keep_done_archives_exactly_the_oldest_beyond_the_newest_n(make_board):
+    beads = [
+        _closed("bd-c", "2026-07-24T10:00:00Z"),
+        _closed("bd-a", "2026-07-24T08:00:00Z", ["cancelled"]),
+        _closed("bd-e", "2026-07-25T11:00:00Z"),
+        _closed("bd-b", "2026-07-24T09:00:00Z"),
+        _closed("bd-d", "2026-07-25T10:00:00Z", ["cancelled"]),
+        {"id": "bd-open", "status": "open", "labels": [], "closed_at": "2026-07-01T00:00:00Z"},  # not terminal
+    ]
+    br = Br({"list": beads})
+    b = make_board(br)
+    assert b.archive_stale(archive_after_days=7, now=_NOW, keep_done=2) == ["bd-a", "bd-b", "bd-c"]
+    assert _archive_labeled(br) == ["bd-a", "bd-b", "bd-c"]
+    # Only the label is written: nothing is deleted or closed.
+    assert not br.cmds("delete") and not br.cmds("close")
+    assert all(a[2:] == ("--add-label", "archived") for a in br.cmds("update"))
+
+
+def test_archive_stale_keep_done_at_or_above_the_live_count_archives_nothing(make_board):
+    beads = [_closed("bd-a", "2026-07-24T08:00:00Z"), _closed("bd-b", "2026-07-24T09:00:00Z")]
+    for cap in (2, 3, 100):
+        br = Br({"list": beads})
+        assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, keep_done=cap) == []
+        assert not br.cmds("update")
+
+
+def test_archive_stale_keep_done_still_ages_out_and_ignores_cards_without_closed_at(make_board):
+    """The age pass runs first and is unchanged by a cap. A card with no parseable
+    ``closed_at`` is never archived, and it does not take one of the N kept places."""
+    beads = [
+        _closed("bd-old", "2026-07-01T00:00:00Z"),  # past the 7-day window
+        _closed("bd-no-ts", None),
+        _closed("bd-junk-ts", "yesterday-ish", ["cancelled"]),
+        _closed("bd-f1", "2026-07-23T12:00:00Z"),
+        _closed("bd-f2", "2026-07-24T12:00:00Z"),
+        _closed("bd-f3", "2026-07-25T11:00:00Z"),
+    ]
+    # Cap 3 = the three dated fresh cards. Were the two undated cards counted, two of
+    # the fresh ones would be archived here; only the aged-out card is.
+    br = Br({"list": beads})
+    assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, keep_done=3) == ["bd-old"]
+    assert _archive_labeled(br) == ["bd-old"]
+
+    # Cap 1: the age pass takes bd-old, the cap takes the two oldest fresh cards, and
+    # the undated cards are still left alone.
+    br = Br({"list": beads})
+    assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, keep_done=1) == ["bd-old", "bd-f1", "bd-f2"]
+    assert _archive_labeled(br) == ["bd-old", "bd-f1", "bd-f2"]
+
+
+def test_archive_stale_without_a_cap_is_age_only(make_board):
+    """``keep_done`` defaults to 0 = no cap: any number of terminal cards inside the
+    window stay live, exactly as before #793. A negative value means the same."""
+    beads = [_closed("bd-old", "2026-07-01T00:00:00Z")] + [
+        _closed(f"bd-fresh-{i}", f"2026-07-24T{i:02d}:00:00Z") for i in range(12)
+    ]
+    for kwargs in ({}, {"keep_done": 0}, {"keep_done": -5}):
+        br = Br({"list": beads})
+        assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, **kwargs) == ["bd-old"]
+        assert _archive_labeled(br) == ["bd-old"]
+    assert store.ARCHIVE_KEEP_DONE_DEFAULT == 100
+
+
+def test_archive_stale_keep_done_breaks_equal_timestamps_by_id(make_board):
+    same = "2026-07-24T08:00:00Z"
+    br = Br({"list": [_closed("bd-z", same), _closed("bd-x", same), _closed("bd-y", same)]})
+    assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, keep_done=1) == ["bd-x", "bd-y"]
+
+
+def test_archive_stale_keep_done_survives_a_failed_label_write_without_retrying_it(make_board):
+    """Best-effort per card, as in the age pass: a failed label write gets one attempt
+    per sweep, never stops the rest of the pass, and does not make the cap archive a
+    newer card in its place."""
+    beads = [
+        _closed("bd-old", "2026-07-01T00:00:00Z"),  # age pass: write fails
+        _closed("bd-f1", "2026-07-23T12:00:00Z"),  # cap pass: write fails
+        _closed("bd-f2", "2026-07-24T12:00:00Z"),
+        _closed("bd-f3", "2026-07-25T11:00:00Z"),
+    ]
+
+    def _update(args):
+        if args[1] in ("bd-old", "bd-f1"):
+            raise BoardError("br update failed")
+        return ""
+
+    br = Br({"list": beads, "update": _update})
+    # Cap 1 keeps bd-f3. The other three are due; two writes fail and bd-f2 still lands.
+    assert make_board(br).archive_stale(archive_after_days=7, now=_NOW, keep_done=1) == ["bd-f2"]
+    assert _archive_labeled(br) == ["bd-old", "bd-f1", "bd-f2"]
+
+
+def test_cards_archived_by_the_cap_stay_in_the_exhaustive_listing(make_board):
+    """The cap hides, it does not delete: after the pass the default listing shows the
+    newest N and ``include_archived=True`` still returns every card."""
+    beads = [_closed(f"bd-{i}", f"2026-07-24T{i:02d}:00:00Z") for i in range(5)]
+
+    def _update(args):
+        if args[2:] == ("--add-label", "archived"):
+            next(x for x in beads if x["id"] == args[1])["labels"].append("archived")
+        return ""
+
+    br = Br({"list": lambda _args: beads, "update": _update})
+    b = make_board(br)
+    assert b.archive_stale(archive_after_days=7, now=_NOW, keep_done=2) == ["bd-0", "bd-1", "bd-2"]
+    assert [f["id"] for f in b.list_features()] == ["bd-3", "bd-4"]
+    everything = b.list_features(include_archived=True)
+    assert [f["id"] for f in everything] == ["bd-0", "bd-1", "bd-2", "bd-3", "bd-4"]
+    assert [f["archived"] for f in everything] == [True, True, True, False, False]
+    assert all(f["board_state"] == "done" for f in everything)
+    assert b.archive_stale(archive_after_days=7, now=_NOW, keep_done=2) == []  # nothing left to do
 
 
 def test_project_exposes_archived_and_closed_at(make_board):
