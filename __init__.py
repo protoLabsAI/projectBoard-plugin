@@ -1888,6 +1888,12 @@ def _board_tools(cfg: dict, registry=None):
 
     if (register_tool := build_register_tool(cfg)) is not None:
         tools.append(register_tool)
+    # Its inverse (#803): remove a retired project, behind the same active-card guard as
+    # DELETE /projects/{name}. The store is resolved lazily, inside the guard's worker thread.
+    from .project_registry import build_remove_tool
+
+    if (remove_tool := build_remove_tool(cfg, lambda **kw: get_store(**store_kw).list_features(**kw))) is not None:
+        tools.append(remove_tool)
     # Every description rides on every model call, and @tool keeps the docstring's
     # source indentation verbatim (8 spaces a line). Dedent it: same text, fewer tokens.
     for t in tools:

@@ -483,6 +483,7 @@ _MINIMAL_ARGS = {
     "board_retro": {},
     "board_check_gates": {},
     "board_attach_pr": {"feature_id": "bd-1", "pr_url": "https://github.com/o/r/pull/1"},
+    "board_remove_project": {"name": "x"},
 }
 
 # Tools that never read the beads store: they answer with their own record (board_dispatch's

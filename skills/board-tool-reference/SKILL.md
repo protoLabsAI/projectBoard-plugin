@@ -134,6 +134,9 @@ The card is created whether or not `ready_check.ok`; fix what it lists, then
   repo the worktree/branch/PR target and which repo the Ready gate checks the files
   against; stamped as an immutable `project:<name>` label. Defaults to `default_project`
   (`board_projects` lists the names). A single-repo board can ignore it.
+  `board_remove_project(name)` removes a retired project (or one whose repo folder is gone);
+  it refuses, naming the cards, while any card that is not done or cancelled still uses it,
+  and its reply says whether a host work-folder entry for that folder is still left.
 - Every string input has one layer of literal wrapping double quotes stripped first.
 
 ### Re-homing a card (`board_update_feature(project=…)`)
