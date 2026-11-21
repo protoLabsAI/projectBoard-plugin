@@ -27,12 +27,26 @@ class Policy:
 
 PROVIDER_STALL_CLASS = "provider_stall"
 
+# The host ran out of room (#801): a full disk, a spent quota, or no writable temp
+# directory. The class of the error, and the `blocked-class:` the card carries. It is the
+# HOST's condition, not the card's: every card set up while it lasts fails the same way,
+# and no retry or stronger model clears it until space is freed. Not retryable by the
+# generic sweep, and absent from its self-healing set: a blind requeue would only fail
+# again on the same full disk. The host-disk hold owns the release.
+HOST_DISK_CLASS = "host-disk"
+_HOST_DISK_PATTERN = r"no space left on device|\benospc\b|disk quota exceeded|no usable temporary directory"
+
 
 # Ordered: first match wins. Patterns are matched case-insensitively against the
 # error message. Only genuinely transient/infra classes are retryable — a stronger
 # model can't clear a rate limit, and a re-dispatch off the latest base can clear a
 # merge conflict, but an auth error or an unknown failure needs a human.
 _RULES: tuple[tuple[str, Policy], ...] = (
+    # First (#801): git reports a full disk as "worktree add failed … Unable to create
+    # '…/refs/heads/feat/bd-….lock': No space left on device", and the paths and branch
+    # names such a message quotes can contain any later rule's words. It used to match no
+    # rule at all and fall to `terminal`.
+    (_HOST_DISK_PATTERN, Policy(HOST_DISK_CLASS, False, 0.0, 1)),
     (r"\bprovider_stall\b", Policy(PROVIDER_STALL_CLASS, True, 15.0, 3)),
     (
         # The provider can't serve its model AT ALL (#420): the model was retired, the
@@ -107,6 +121,11 @@ def classify(error: str, *, provider_rules: bool = True) -> Policy:
         if re.search(pattern, text):
             return policy
     return TERMINAL
+
+
+def is_host_disk(error: str) -> bool:
+    """Does this error text say the host is out of disk space (the ``host-disk`` rule)?"""
+    return bool(re.search(_HOST_DISK_PATTERN, (error or "").lower()))
 
 
 # The `blocked-class:` of a card the loop PARKED because its fresh builds keep timing out

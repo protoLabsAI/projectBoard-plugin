@@ -9,9 +9,11 @@ from __future__ import annotations
 import pytest
 
 from project_board.failures import (
+    HOST_DISK_CLASS,
     PRE_MODEL_DISPATCH_CLASS,
     TERMINAL,
     classify,
+    is_host_disk,
     is_pre_model_dispatch_failure,
 )
 
@@ -285,3 +287,54 @@ def test_a_bare_remote_rejection_stays_terminal():
     assert classify("git push failed: ! [remote rejected] feat/x (protected branch hook declined)").category == (
         "terminal"
     )
+
+
+# #801: a full disk is the host's condition, not the card's. It used to match no rule and
+# fall to `terminal`. The first message is the shape git gave bd-o7oyw and bd-tndqq.
+_DISK_FULL = (
+    "worktree add failed: Preparing worktree (new branch 'feat/bd-1')\n"
+    "fatal: Unable to create '/x/refs/heads/feat/bd-1.lock': No space left on device"
+)
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        _DISK_FULL,
+        "setup_cmd exited 2: OSError: [Errno 28] ENOSPC",
+        "write failed: Disk quota exceeded",
+        "FileNotFoundError: No usable temporary directory found in ['/tmp', '/var/tmp']",
+    ],
+)
+def test_host_disk_is_its_own_class_and_never_blindly_retried(msg):
+    p = classify(msg)
+    assert p.category == HOST_DISK_CLASS == "host-disk"
+    assert p.retryable is False and p.max_attempts == 1
+    assert is_host_disk(msg)
+    # a reviewer / gh text path classifies it the same way
+    assert classify(msg, provider_rules=False).category == "host-disk"
+
+
+def test_host_disk_rule_wins_over_the_words_a_path_or_branch_can_quote():
+    # First in the table: the lock path and branch name are free text, and without the
+    # ordering a branch called "network-timeout" would read as transient and be retried
+    # into the same full disk.
+    msg = (
+        "worktree add failed: Unable to create "
+        "'/x/refs/heads/feat/network-timeout-conflict-auth.lock': No space left on device"
+    )
+    assert classify(msg).category == "host-disk"
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "git fetch origin main timed out after 60s",
+        "the model has no notion of whitespace left on devices",
+        "enospcial handling",
+        "",
+    ],
+)
+def test_host_disk_rule_does_not_claim_other_failures(msg):
+    assert classify(msg).category != "host-disk"
+    assert not is_host_disk(msg)
