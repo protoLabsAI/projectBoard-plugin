@@ -421,6 +421,8 @@ class PreflightMixin:
             names.append(name)
         pending = set()
         for name in names:
+            if name in getattr(self, "_missing_repos", {}):
+                continue
             feature = {"project": name}
             cmd = self._preflight_cmd_for(feature)
             if not cmd:

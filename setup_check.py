@@ -764,22 +764,30 @@ def _repo_check(cfg: dict, isdir) -> dict:
         if isdir(os.path.join(default_repo, ".beads")):
             return {"ok": True, "path": default_repo, "hint": ""}
         return {"ok": False, "path": default_repo, "hint": REPO_UNBOUND_HINT}
-    explicit = isinstance(cfg.get("projects"), dict) and bool(cfg.get("projects"))
     # NB: a multi-entry projects: map with an explicitly blank db_path is NOT a repo
     # failure — since D3 (#260) the blank resolves to the instance store, so the board
     # runs correctly on one shared db. The stale override is the `db` ADVISORY in
     # setup_status, not a pause.
-    for name, entry in projects.items():
-        path = str((entry or {}).get("repo") or "").strip()
-        if not path or not isdir(path):
-            where = f" (project {name!r})" if explicit else ""
-            return {
-                "ok": False,
-                "path": path or default_repo,
-                "hint": f"repo {path or default_repo!r} does not exist{where} — fix project_board.repo "
-                "(or the projects: entry) in Settings ▸ Project Board",
-            }
-    return {"ok": True, "path": default_repo, "hint": ""}
+    missing = {
+        name: str((entry or {}).get("repo") or "").strip()
+        for name, entry in projects.items()
+        if not isdir(str((entry or {}).get("repo") or "").strip())
+    }
+    if not missing:
+        return {"ok": True, "path": default_repo, "hint": ""}
+    default = resolve_default_project(cfg)
+    blocked = default in missing or len(missing) == len(projects)
+    hints = [
+        f"repo {path!r} does not exist (project {name!r}) — remove the project or restore the folder"
+        for name, path in missing.items()
+    ]
+    # Keep the finding visible even when healthy siblings can continue.
+    return {
+        "ok": not blocked,
+        "path": missing.get(default, next(iter(missing.values()))) if blocked else default_repo,
+        "hint": "; ".join(hints),
+        "missing_projects": missing,
+    }
 
 
 def setup_status(
