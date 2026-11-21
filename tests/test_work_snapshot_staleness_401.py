@@ -132,7 +132,7 @@ class _Board:
     def requeue(self, fid):
         self.rows[fid]["board_state"] = "ready"
 
-    def archive_stale(self, archive_after_days=7):
+    def archive_stale(self, archive_after_days=7, *, keep_done=0):
         return []
 
 

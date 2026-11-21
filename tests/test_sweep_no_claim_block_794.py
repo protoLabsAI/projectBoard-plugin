@@ -41,7 +41,7 @@ class _Store:
     def live_cards(self):
         return []
 
-    def archive_stale(self, _days):
+    def archive_stale(self, _days, *, keep_done=0):
         return []
 
     def ready_queue(self, relaxed=False):

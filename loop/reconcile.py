@@ -1085,7 +1085,10 @@ class ReconcileMixin(WorktreeCleanup):
         # ONCE per sweep (project-independent — the board db is shared), after the
         # per-repo worktree reap above.
         try:
-            archived = await step("archive", asyncio.to_thread(store.archive_stale, self.archive_after_days))
+            archived = await step(
+                "archive",
+                asyncio.to_thread(store.archive_stale, self.archive_after_days, keep_done=self.archive_keep_done),
+            )
             if archived:
                 log.info(
                     "[project_board] sweep: archived %d terminal feature(s): %s", len(archived), ", ".join(archived)
