@@ -38,6 +38,7 @@ from .link_events import after_terminal
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import json
 import logging
@@ -273,6 +274,83 @@ def _warn_blocking_on_event_loop(op: str) -> None:
         "[project_board] blocking `br %s` on the event-loop thread — wrap the store call in asyncio.to_thread (#258)",
         op,
     )
+
+
+# A call that waited this long IN TOTAL for the single-flight `br` lock says so (#805): the
+# board tool's reply carries one line, and the lock wait is logged at WARNING. `br` itself
+# was not slow in that case, it had not started; `_BR_SLOW_S` covers a slow `br`.
+_BR_WAIT_NOTICE_S = 2.0
+
+
+class BrWait:
+    """Seconds one logical call (a board tool call) spent waiting for the `br` lock,
+    summed over every `br` command it ran. One call can fan out across threads
+    (``asyncio.to_thread`` copies the context, so the workers share this object), hence
+    the lock around the sum."""
+
+    __slots__ = ("_lock", "_seconds")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._seconds = 0.0
+
+    def add(self, seconds: float) -> None:
+        with self._lock:
+            self._seconds += max(0.0, seconds)
+
+    @property
+    def seconds(self) -> float:
+        with self._lock:
+            return self._seconds
+
+
+# The CURRENT call's counter, or None outside a tracked call (the loop, the sweep, the
+# routes: they pay nothing but the one `.get()`). Context-local, so two calls on two
+# threads, or two tasks on one event loop, never see each other's counter.
+_BR_WAIT: contextvars.ContextVar[BrWait | None] = contextvars.ContextVar("project_board_br_wait", default=None)
+
+
+@contextlib.contextmanager
+def track_br_wait():
+    """Count the `br`-lock wait of everything run inside the ``with`` block, per call.
+
+    Yields the ``BrWait`` to read once the work is done. A nested block gets its own
+    counter and adds its total to the enclosing one on exit, so neither loses time."""
+    outer = _BR_WAIT.get()
+    wait = BrWait()
+    token = _BR_WAIT.set(wait)
+    try:
+        yield wait
+    finally:
+        _BR_WAIT.reset(token)
+        if outer is not None:
+            outer.add(wait.seconds)
+
+
+def br_wait_notice(seconds: float, *, failed: bool = False) -> str:
+    """The one line a board tool adds to its reply when it waited ``seconds`` in total for
+    the board store, or ``""`` under ``_BR_WAIT_NOTICE_S`` (the reply is then unchanged)."""
+    if seconds < _BR_WAIT_NOTICE_S:
+        return ""
+    waited = f"Waited {seconds:.1f} s for the board store (busy with other board work)"
+    if failed:
+        return f"{waited} before this error; the wait was a queue, not a hang."
+    return f"{waited}; the answer is current."
+
+
+def _note_br_lock_wait(args: tuple[str, ...], waited: float) -> None:
+    """Record one `br` command's wait for ``_br_lock`` (#805): add it to the current
+    call's counter, and warn when this one wait alone passed ``_BR_WAIT_NOTICE_S``."""
+    wait = _BR_WAIT.get()
+    if wait is not None:
+        wait.add(waited)
+    if waited >= _BR_WAIT_NOTICE_S:
+        log.warning(
+            "[project_board] `br %s` waited %.1fs for the board store lock (other board work "
+            "held it) before it started; that is queueing, not a slow `br`",
+            _brief_cmd(args),
+            waited,
+        )
 
 
 # Labels that encode board state / escalation (everything else is free-form).
@@ -2101,8 +2179,12 @@ class BeadsBoard:
         delay = _DB_RETRY_DELAY
         retries = 0
         for attempt in range(_DB_RETRY_ATTEMPTS):
+            queued = time.monotonic()
             with _br_lock():  # single-flight per process — see _br_lock
                 started = time.monotonic()
+                # The wait for the lock is NOT `br` run time (#805): counted on its own,
+                # before `br` starts, so a stall that raises below still reports it.
+                _note_br_lock_wait(args, started - queued)
                 # A stall raises BoardTimeout with the tree already stopped (#404).
                 proc = _run_br_process(cmd, cwd=self.repo or ".", args=args)
                 elapsed = time.monotonic() - started

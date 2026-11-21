@@ -614,6 +614,70 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
     return None
 
 
+# The host's component-v1 sentinel (protoAgent graph/components.py). A reply that carries a
+# component ends with ``"\n" + sentinel + <json>`` and the host reads everything after the
+# sentinel as the payload, so nothing may follow it.
+_COMPONENT_SENTINEL = "\x1e[component-v1]"
+
+
+def _with_store_wait(result, seconds: float):
+    """``result`` plus the store-wait line when the call queued for the board store past
+    the threshold (#805); ``result`` itself, untouched, otherwise.
+
+    The line goes at the end of the reply TEXT. A reply that ends in a component-v1
+    payload (board_show_cards, board_card_form) keeps that payload last, byte for byte:
+    the line is put before it, because the host parses everything after the sentinel."""
+    if not isinstance(result, str):
+        return result
+    from .store import br_wait_notice
+
+    notice = br_wait_notice(seconds, failed=result.startswith("Error:"))
+    if not notice:
+        return result
+    at = result.find(_COMPONENT_SENTINEL)
+    if at < 0:
+        return f"{result}\n\n{notice}"
+    if at > 0 and result[at - 1] == "\n":
+        at -= 1  # the tail is "\n" + payload: keep its newline with it
+    text, tail = result[:at], result[at:]
+    return f"{text}\n\n{notice}{tail}" if text else f"{notice}{tail}"
+
+
+def _report_store_wait(t) -> None:
+    """Make board tool ``t`` say when it waited for the busy board store (#805).
+
+    Every `br` command takes one process-wide lock, so a tool call made while the loop
+    or the sweep is using the store queues behind it and answers late. The store counts
+    that wait per call (``store.track_br_wait``); a call that waited past the threshold
+    gets one plain line on its reply, so the agent can tell "queued" from "stuck". A
+    call that did not wait replies exactly as before. The wrappers keep the tool's
+    signature (``functools.wraps``), which is what langchain inspects."""
+    import functools
+
+    from .store import track_br_wait
+
+    func = getattr(t, "func", None)
+    if func is not None:
+
+        @functools.wraps(func)
+        def _sync(*args, **kwargs):
+            with track_br_wait() as wait:
+                result = func(*args, **kwargs)
+            return _with_store_wait(result, wait.seconds)
+
+        t.func = _sync
+    coroutine = getattr(t, "coroutine", None)
+    if coroutine is not None:
+
+        @functools.wraps(coroutine)
+        async def _async(*args, **kwargs):
+            with track_br_wait() as wait:
+                result = await coroutine(*args, **kwargs)
+            return _with_store_wait(result, wait.seconds)
+
+        t.coroutine = _async
+
+
 def _board_tools(cfg: dict, registry=None):
     from .failures import PREFLIGHT_HOLD_CLASS
     from .projects import default_project as resolve_default_project
@@ -1898,4 +1962,5 @@ def _board_tools(cfg: dict, registry=None):
     # source indentation verbatim (8 spaces a line). Dedent it: same text, fewer tokens.
     for t in tools:
         t.description = inspect.cleandoc(t.description or "")
+        _report_store_wait(t)
     return tools
