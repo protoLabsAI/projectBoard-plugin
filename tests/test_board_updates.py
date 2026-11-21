@@ -507,8 +507,8 @@ def test_update_feature_applies_good_deps_and_names_the_failed_one(make_board, m
 
 def test_record_merge_clears_blocked_and_drops_open_edges_before_close(make_board, monkeypatch):
     """A merged PR is ground truth: record_merge on a blocked card removes the blocked
-    label and drops open incoming blocks edges (the #145 class — `br close` refuses
-    while they remain) before closing, so the card lands in `done` without a hand-unblock."""
+    label after closing and drops open incoming blocks edges before closing (the #145
+    class — `br close` refuses while they remain), so the card lands in `done`."""
     br = _StatefulBr({})
     board = make_board(br)
     feature = {
@@ -529,8 +529,8 @@ def test_record_merge_clears_blocked_and_drops_open_edges_before_close(make_boar
     assert ("update", "bd-blk", "--remove-label", "blocked") in br.calls
     assert dropped == [("bd-blk", "bd-dep")]
     assert ("close", "bd-blk", "-r", "merged: https://example/pr/9") in br.calls
-    # order: the label clear + edge drops land BEFORE the close
-    assert br.calls.index(("update", "bd-blk", "--remove-label", "blocked")) < br.calls.index(
+    # Labels stay until after close; blocker edges were dropped before closing.
+    assert br.calls.index(("update", "bd-blk", "--remove-label", "blocked")) > br.calls.index(
         ("close", "bd-blk", "-r", "merged: https://example/pr/9")
     )
 

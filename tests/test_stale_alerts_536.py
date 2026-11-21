@@ -200,7 +200,7 @@ def _raise_on_close(args):
 
 def test_record_merge_removes_every_stale_state_label(make_board, monkeypatch):
     """r3: record_merge strips ``blocked``, the ``blocked-class:*`` class, ``in-review`` and
-    ``review-pending`` before closing, and keeps audit labels (``merged-verified:``)."""
+    ``review-pending`` after closing, and keeps audit labels (``merged-verified:``)."""
     url = "https://example/pr/4184"
     labels = ["blocked", "blocked-class:terminal", "in-review", "review-pending", "merged-verified:abc123"]
     rows = [{"id": "bd-g1d3", "external_ref": url, "status": "in_progress", "labels": labels}]
@@ -247,8 +247,7 @@ def test_mark_done_removes_every_stale_state_label(make_board, monkeypatch):
 
 
 def test_cancel_feature_sheds_every_stale_state_label(make_board, monkeypatch):
-    """The cancel edge (its own atomic tag write) folds the same cleanup in: one `br
-    update` adds ``cancelled`` and removes every live-state label."""
+    """Cancel tags before close and sheds stale labels afterward."""
     labels = ["blocked", "blocked-class:terminal", "in-review", "review-pending"]
     br = Br()
     b = make_board(br)
@@ -259,13 +258,14 @@ def test_cancel_feature_sheds_every_stale_state_label(make_board, monkeypatch):
     )
     b.cancel_feature("bd-9", "duplicate")
     tag = next(c for c in br.calls if c[0] == "update" and "cancelled" in _added(c))
-    assert _removed(tag) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+    assert not _removed(tag)
+    strip = next(c for c in br.calls if c[0] == "update" and _removed(c))
+    assert _removed(strip) == set(labels)
+    assert br.calls.index(strip) > next(i for i, c in enumerate(br.calls) if c[0] == "close")
 
 
-def test_cancel_feature_rollback_re_adds_every_stale_label(make_board, monkeypatch):
-    """Atomic-or-clean (#106) generalised: if `br close` fails after the cleanup landed, the
-    undo re-adds EVERY stripped live-state label, so the card rolls back to its exact
-    pre-cancel labels — never a half-cancelled, silently-unblocked/unreviewed zombie."""
+def test_cancel_feature_rollback_preserves_every_stale_label(make_board, monkeypatch):
+    """A failed cancel rolls back the tag without touching live labels."""
     labels = ["blocked", "blocked-class:terminal", "in-review", "review-pending"]
     br = Br(returns={"close": _raise_on_close})
     b = make_board(br)
@@ -273,18 +273,15 @@ def test_cancel_feature_rollback_re_adds_every_stale_label(make_board, monkeypat
     with pytest.raises(BoardError, match="failed"):
         b.cancel_feature("bd-9", "scope cut")
     undo = next(c for c in br.calls if c[0] == "update" and "cancelled" in _removed(c))
-    assert _added(undo) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+    assert not _added(undo)
 
 
 def _timeout_on_close(args):
     raise BoardTimeout("`br close` timed out")
 
 
-def test_record_merge_close_failure_re_adds_every_stripped_label(make_board):
-    """The strip lands BEFORE `br close`, so a failed close must not drop the card out of the
-    merge poll's retry set (it scans only `in_review`/`blocked`). On a close that raises, the
-    undo re-adds EXACTLY the stripped labels, so a still-open card keeps its `in-review` /
-    `blocked` label and the next poll retries it — the pre-#536 retry behaviour, kept."""
+def test_record_merge_close_failure_preserves_every_live_label(make_board):
+    """Failed merge closes leave live labels untouched for the next poll."""
     url = "https://example/pr/4184"
     labels = ["blocked", "blocked-class:terminal", "in-review", "review-pending", "merged-verified:abc"]
     rows = [{"id": "bd-g1d3", "external_ref": url, "status": "in_progress", "labels": labels}]
@@ -292,32 +289,22 @@ def test_record_merge_close_failure_re_adds_every_stripped_label(make_board):
     b = make_board(br)
     with pytest.raises(BoardError, match="failed"):
         b.record_merge(pr_url=url)
-    strip = next(c for c in br.calls if c[0] == "update" and "--remove-label" in c)
-    assert _removed(strip) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
-    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
-    assert _added(undo) == {"blocked", "blocked-class:terminal", "in-review", "review-pending"}
+    assert not any(c[0] == "update" for c in br.calls)
 
 
-def test_mark_done_close_failure_re_adds_every_stripped_label(make_board, monkeypatch):
-    """Manual mark_done gets the SAME atomic-or-clean rollback: a close that raises re-adds the
-    stripped live-state labels so the still-open card stays in the lane that was retrying it."""
+def test_mark_done_close_failure_preserves_every_live_label(make_board, monkeypatch):
+    """Failed manual closes leave live labels untouched."""
     labels = ["blocked", "blocked-class:transient", "in-review", "review-pending", "verified:me"]
     br = Br(returns={"close": _raise_on_close})
     b = make_board(br)
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review", "labels": labels})
     with pytest.raises(BoardError, match="failed"):
         b.mark_done("bd-1", reason="shipped off-board")
-    strip = next(c for c in br.calls if c[0] == "update" and "--remove-label" in c)
-    assert _removed(strip) == {"blocked", "blocked-class:transient", "in-review", "review-pending"}
-    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
-    assert _added(undo) == {"blocked", "blocked-class:transient", "in-review", "review-pending"}
+    assert not any(c[0] == "update" for c in br.calls)
 
 
 def test_close_timeout_that_actually_closed_keeps_the_labels_shed(make_board, monkeypatch):
-    """A `br close` that TIMES OUT may have committed then hung (#404), so the edge LOOKS before
-    undoing: a card the close actually shut (now `done`) keeps its stale labels SHED — re-adding
-    `blocked`/`in-review` blind would make a done card read as a live block again, the very #536
-    bug. No undo add-label, and mark_done returns the closed/done card."""
+    """A timeout that committed the close still sheds stale labels."""
     labels = ["blocked", "in-review", "verified:me"]
     reads = {"n": 0}
 
@@ -337,10 +324,8 @@ def test_close_timeout_that_actually_closed_keeps_the_labels_shed(make_board, mo
     assert not any(c[0] == "update" and "--add-label" in c for c in br.calls), "a closed card must NOT be re-labelled"
 
 
-def test_close_timeout_still_open_undoes_the_strip_and_raises(make_board, monkeypatch):
-    """The other timeout branch: a close that timed out and left the card OPEN undoes the strip
-    (re-adds the stripped labels) and re-raises, so an open card is never a half-closed zombie
-    that silently dropped its `in-review`/`blocked` label."""
+def test_close_timeout_still_open_preserves_labels_and_raises(make_board, monkeypatch):
+    """A timeout that left the card open preserves labels and raises."""
     labels = ["blocked", "in-review", "review-pending"]
 
     def _gf(fid):  # the card is STILL open on every read — the close never landed
@@ -351,8 +336,7 @@ def test_close_timeout_still_open_undoes_the_strip_and_raises(make_board, monkey
     monkeypatch.setattr(b, "get_feature", _gf)
     with pytest.raises(BoardTimeout):
         b.mark_done("bd-1", reason="shipped")
-    undo = next(c for c in br.calls if c[0] == "update" and "--add-label" in c)
-    assert _added(undo) == {"blocked", "in-review", "review-pending"}
+    assert not any(c[0] == "update" for c in br.calls)
 
 
 # ── 3: board_list(state="blocked") is left alone — the FLAG is the live block (#401) ─────
@@ -466,3 +450,123 @@ def test_a_live_blocked_terminal_card_is_still_listed_as_blocked(tmp_path):
 
     f = board.get_feature(live)
     assert "blocked" in f["labels"] and "blocked-class:terminal" in f["labels"] and f["blocked"] is True
+
+
+class StatefulBr(Br):
+    """Apply writes and sample the actual Board projection at every write boundary."""
+
+    def __init__(self, *, outcome="success", blocked=False):
+        super().__init__()
+        self.row = {
+            "id": "bd-1",
+            "external_ref": "https://example/pr/1",
+            "status": "in_progress",
+            "assignee": "coder",
+            "labels": ["in-review", "review-pending", "changes-requested", "verified:me"],
+        }
+        if blocked:
+            self.row["labels"] += ["blocked", "blocked-class:terminal"]
+        self.outcome = outcome
+        self.strip_fails = False
+        self.states = [BeadsBoard.board_state(self.row)]
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(args)
+        if args[0] == "list":
+            return [self.row]
+        if args[0] == "show":
+            return [self.row]
+        if args[0] == "close":
+            if self.outcome in {"success", "timeout_closed"}:
+                self.row["status"] = "closed"
+            self.states.append(BeadsBoard.board_state(self.row))
+            if self.outcome.startswith("timeout"):
+                raise BoardTimeout("close timed out")
+            if self.outcome == "failure":
+                raise BoardError("close failed")
+        elif args[0] == "update":
+            if self.strip_fails and "--remove-label" in args:
+                self.states.append(BeadsBoard.board_state(self.row))
+                raise BoardError("cleanup failed")
+            labels = set(self.row["labels"])
+            labels.update(_added(args))
+            labels.difference_update(_removed(args))
+            self.row["labels"] = sorted(labels)
+            if "--assignee" in args:
+                self.row["assignee"] = args[args.index("--assignee") + 1]
+            self.states.append(BeadsBoard.board_state(self.row))
+        elif args[0] == "comments":
+            self.states.append(BeadsBoard.board_state(self.row))
+        return ""
+
+
+def _terminal_edge(board, edge):
+    if edge == "record_merge":
+        return board.record_merge(pr_url="https://example/pr/1")
+    return getattr(board, edge)("bd-1")
+
+
+@pytest.mark.parametrize("edge", ["record_merge", "mark_done", "cancel_feature"])
+@pytest.mark.parametrize("blocked", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "failure", "timeout_closed", "timeout_open"])
+def test_terminal_write_boundaries_keep_the_original_lane(make_board, monkeypatch, edge, blocked, outcome):
+    br = StatefulBr(outcome=outcome, blocked=blocked)
+    board = make_board(br)
+    monkeypatch.setattr(board, "get_feature", lambda fid: board._project(br.row))
+    original_labels = set(br.row["labels"])
+    original_lane = br.states[0]
+    if outcome in {"failure", "timeout_open"}:
+        with pytest.raises(BoardTimeout if outcome == "timeout_open" else BoardError):
+            _terminal_edge(board, edge)
+        assert set(br.row["labels"]) == original_labels
+        assert br.row["assignee"] == "coder"
+        assert set(br.states) == {original_lane}
+    else:
+        result = _terminal_edge(board, edge)
+        terminal = "cancelled" if edge == "cancel_feature" else "done"
+        assert result["board_state"] == terminal
+        assert br.states[-1] == terminal
+        assert list(dict.fromkeys(br.states)) == [original_lane, terminal]
+        assert not store_mod._terminal_stale_labels(br.row["labels"])
+        assert "verified:me" in br.row["labels"]
+
+
+@pytest.mark.parametrize("edge", ["record_merge", "mark_done", "cancel_feature"])
+def test_post_close_cleanup_failure_is_logged_and_merge_retry_heals(make_board, monkeypatch, caplog, edge):
+    br = StatefulBr(blocked=True)
+    board = make_board(br)
+    monkeypatch.setattr(board, "get_feature", lambda fid: board._project(br.row))
+    br.strip_fails = True
+    result = _terminal_edge(board, edge)
+    assert result["board_state"] == ("cancelled" if edge == "cancel_feature" else "done")
+    assert "could not strip stale terminal labels" in caplog.text
+    if edge == "record_merge":
+        br.strip_fails = False
+        br.calls.clear()
+        board.record_merge(pr_url=br.row["external_ref"])
+        assert not store_mod._terminal_stale_labels(br.row["labels"])
+        assert not any(c[0] == "close" for c in br.calls)
+        br.calls.clear()
+        board.record_merge(pr_url=br.row["external_ref"])
+        assert not any(c[0] in {"update", "close"} for c in br.calls)
+
+
+@pytest.mark.parametrize("edge", ["record_merge", "mark_done", "cancel_feature"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_close_timeout_unknown_read_keeps_live_labels(make_board, monkeypatch, edge, missing):
+    br = StatefulBr(outcome="timeout_open")
+    board = make_board(br)
+    original = set(br.row["labels"])
+
+    def read(fid):
+        if any(c[0] == "close" for c in br.calls):
+            if missing:
+                return None
+            raise BoardError("read failed")
+        return board._project(br.row)
+
+    monkeypatch.setattr(board, "get_feature", read)
+    with pytest.raises(BoardTimeout):
+        _terminal_edge(board, edge)
+    assert original <= set(br.row["labels"])
+    assert set(br.states) == {"in_review"}
