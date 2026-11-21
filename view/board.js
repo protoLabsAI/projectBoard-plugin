@@ -2077,8 +2077,10 @@ function syncCardDrawer(force){
     // The poll row is a summary (#805): the body's text comes from the single-card read —
     // this open's, else the last good one, so an in-flight or failed re-read keeps it —
     // and with no read at all the text sections say they are loading / retrying.
+    // Live poll metadata wins over cached detail, as in the Task drawer. Only the
+    // comment-derived deliverable and requirement ledger must override list previews.
     const full = fullDetail(CARD_FID, d);
-    const merged = full ? {...f, ...full, state: f.state, next_action: f.next_action, next_action_hint: f.next_action_hint} : pendingRow(f, d);
+    const merged = full ? {...full, ...f, deliverable: full.deliverable, requirements: full.requirements} : pendingRow(f, d);
     html = (d && d.error ? '<div class="pl-callout pl-callout--error">'+esc("Couldn't load card detail: " + d.error)+'</div>' : "")
       + cardDetail(merged);
   }

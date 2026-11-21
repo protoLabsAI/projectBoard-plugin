@@ -166,8 +166,8 @@ def _js(name):
 
 def _drawer(script):
     """Run `script` against the real drawer helpers and merge expressions under node."""
-    task = re.search(r"const merged = (full \? \{\.\.\.full, \.\.\.f,.*);", BOARD_PAGE).group(1)
-    card = re.search(r"const merged = (full \? \{\.\.\.f, \.\.\.full,.*);", BOARD_PAGE).group(1)
+    task = re.search(r"const merged = (.*);", _js("syncTaskDrawer")).group(1)
+    card = re.search(r"const merged = (.*);", _js("syncCardDrawer")).group(1)
     pre = (
         "const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');\n"
         "const DETAIL_CACHE = new Map(), DETAIL_CACHE_MAX = 40;\n"
@@ -188,9 +188,13 @@ def test_drawers_never_render_a_summary_row_as_an_empty_spec():
     single-card read has not landed, or failed, must not show them as empty ("—")."""
     got = _drawer(
         """
-        const f = {id:'bd-1', state:'done', next_action:'live', spec_preview:'First line', updated_at:'2'};
+        const f = {id:'bd-1', state:'done', next_action:'live', spec_preview:'First line', updated_at:'2',
+                   blocked:false, blocked_reason:'', labels:[], pr_url:'', priority:0,
+                   depends_on:[], open_depends_on:[], deliverable:'preview'};
         const full = {id:'bd-1', state:'in_review', next_action:'old', spec:'FULL SPEC', acceptance_criteria:'FULL AC',
-                      deliverable:'shipped', requirements:[{id:'r1'}]};
+                      deliverable:'shipped', requirements:[{id:'r1'}], blocked:true, blocked_reason:'old',
+                      labels:['old'], pr_url:'https://example.test/old', priority:3,
+                      depends_on:['old'], open_depends_on:['old'], files_to_modify:['a.py'], gates:{tests:'passed'}};
         const text = r => fullText(r, 'spec') + fullText(r, 'acceptance_criteria');
         const out = {};
         // 1. nothing read yet → a loading note under the preview line, for both drawers
@@ -209,6 +213,7 @@ def test_drawers_never_render_a_summary_row_as_an_empty_spec():
         out.taskAfterFail = taskRow('bd-1', f, {fid:'bd-1', error:'boom'});
         out.cardAfterFail = cardRow('bd-1', f, {fid:'bd-1', error:'boom'});
         out.cardReopened = cardRow('bd-1', f, null);
+        out.taskReopened = taskRow('bd-1', f, null);
         // 5. another card never inherits it
         out.other = taskRow('bd-2', {id:'bd-2'}, null);
         // 6. a card whose full read has NO text still renders the plain empty marker
@@ -225,10 +230,15 @@ def test_drawers_never_render_a_summary_row_as_an_empty_spec():
     for key in ("taskFailed", "cardFailed"):
         assert "First line" in got[key] and got[key].count("Couldn't load the full text. Retrying…") == 2
         assert "—" not in got[key]
-    for key in ("task", "card", "taskAfterFail", "cardAfterFail", "cardReopened"):
+    for key in ("task", "card", "taskAfterFail", "cardAfterFail", "cardReopened", "taskReopened"):
         row = got[key]
         assert (row["spec"], row["acceptance_criteria"]) == ("FULL SPEC", "FULL AC"), key
         assert (row["state"], row["next_action"]) == ("done", "live"), key
+        assert row["blocked"] is False and row["blocked_reason"] == "", key
+        assert row["labels"] == [] and row["pr_url"] == "" and row["priority"] == 0, key
+        assert row["depends_on"] == [] and row["open_depends_on"] == [], key
+        assert row["deliverable"] == "shipped" and row["requirements"] == [{"id": "r1"}], key
+        assert row["files_to_modify"] == ["a.py"] and row["gates"] == {"tests": "passed"}, key
         assert "detail_state" not in row
     assert got["task"]["deliverable"] == "shipped" and got["task"]["requirements"] == [{"id": "r1"}]
     assert got["taskAfterFail"]["deliverable"] == "shipped"
