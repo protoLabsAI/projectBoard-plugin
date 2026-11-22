@@ -158,7 +158,8 @@ async def test_budget_bounds_retries_then_falls_through(monkeypatch, spent, expe
     store.budgets["bd-1:provider-stall"] = spent  # durable count survives a restart
     await loop._drive(_CARD)
     assert dispatched == ["a"] * expected
-    assert store.budgets == {"bd-1:provider-stall": 2, "bd-1:timeout": 1}
+    # #753: the first timeout also earns the once-per-card raised timeout (1.5x 1800s).
+    assert store.budgets == {"bd-1:provider-stall": 2, "bd-1:timeout": 1, "bd-1:timeout-raise-ms": 2_700_000}
     assert len(notes) == expected - 1
     assert store.asked == [("bd-1", 1)]  # once spent, the ordinary too-wide park runs
     assert _blocks(store)[-1][3] == "too-wide"
@@ -170,7 +171,7 @@ async def test_short_gap_counts_toward_too_wide(monkeypatch):
     loop, store, dispatched, notes = _board(monkeypatch, gap=120)
     await loop._drive(_CARD)
     assert dispatched == ["a"] and not notes
-    assert store.budgets == {"bd-1:timeout": 1}
+    assert store.budgets == {"bd-1:timeout": 1, "bd-1:timeout-raise-ms": 2_700_000}  # #753 raise
     assert store.asked == [("bd-1", 1)]
     assert _blocks(store)[-1][3] == "too-wide"
     assert "last event 120s before timeout" in _blocks(store)[-1][2]
@@ -181,7 +182,7 @@ async def test_unknown_gap_behaves_exactly_as_before(monkeypatch):
     loop, store, dispatched, notes = _board(monkeypatch, blind=True)
     await loop._drive(_CARD)
     assert dispatched == ["a"] and not notes
-    assert store.budgets == {"bd-1:timeout": 1}
+    assert store.budgets == {"bd-1:timeout": 1, "bd-1:timeout-raise-ms": 2_700_000}  # #753 raise
     assert store.asked == [("bd-1", 1)]
     assert _blocks(store)[-1][3] == "too-wide"
     assert "before timeout" not in _blocks(store)[-1][2]
@@ -213,6 +214,6 @@ async def test_ordinary_block_reason_includes_known_gap(monkeypatch):
     )
     await loop._drive(_CARD)
     assert len(dispatched) == 1 and not notes and not store.asked
-    assert store.budgets == {"bd-1:timeout": 1}
+    assert store.budgets == {"bd-1:timeout": 1, "bd-1:timeout-raise-ms": 2_700_000}  # #753 raise
     assert _blocks(store)[-1][3] == "transient"
     assert "last event 42s before timeout" in _blocks(store)[-1][2]
