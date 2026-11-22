@@ -2162,6 +2162,10 @@ class BeadsBoard:
             raise BoardError(f"could not run beads CLI {BR!r}: {exc}") from exc
         finally:
             if args and args[0] in _PROJECTION_WRITES:
+                if args[0] == "create":
+                    # Before the revision moves: a reader that sees the new revision must
+                    # also see that the listing it has cached lacks a card (#820).
+                    work_snapshot.note_card_created()
                 work_snapshot.note_board_write()
             if args and args[0] not in _BR_READS:
                 wait = _BR_WAIT.get()
@@ -5391,7 +5395,10 @@ class BeadsBoard:
             want_json=True,
             with_has_more=True,
         )
-        rows = rows or []
+        # Empty stdout/JSON null is not a successful empty board. Reject malformed
+        # reads before the shared cache can replace a valid listing with [].
+        if not isinstance(rows, list) or any(not isinstance(row, dict) or not row.get("id") for row in rows):
+            raise BoardError("`br list` returned an invalid feature listing; expected a list of issues")
         # #138/#114: on br 0.2.x the envelope reports has_more — turn `--limit 0` = unbounded
         # from an ASSUMPTION into an assertion. A `--limit 0` page that still reports more rows
         # means the exhaustiveness invariant is broken and this projection would be silently

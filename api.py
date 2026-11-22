@@ -713,7 +713,9 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     # The ONE board listing the read routes serve from (/features, /cards…): cached,
     # single-flight, invalidated by writes, never queued behind the drive loop's `br` lock.
     read_cache = BoardReadCache(
-        lambda include_archived: store().list_features(include_archived=include_archived), _read_token
+        lambda include_archived: store().list_features(include_archived=include_archived),
+        _read_token,
+        work_snapshot.cards_created,
     )
     # The board_list tool reads this same cache (#805): it finds it under the board's file.
     read_cache_mod.publish(_db_file(), read_cache)
