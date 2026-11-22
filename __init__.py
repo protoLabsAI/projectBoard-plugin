@@ -275,6 +275,15 @@ def register(registry) -> None:
     except Exception:  # noqa: BLE001 — planning layer is best-effort
         log.exception("[project_board] registering planning subagents/skill failed")
 
+    # Carding helper: the lead hands one issue to each of these in the background instead of
+    # reading issues and code in its own thread (the `card-github-issues` skill).
+    try:
+        from .subagents import CARD_WRITER_CONFIG
+
+        registry.register_subagent(CARD_WRITER_CONFIG)
+    except Exception:  # noqa: BLE001 — without it the lead cards in its own thread, as before
+        log.exception("[project_board] registering the card-writer subagent failed")
+
     try:
         from .subagents import SPEC_COMPREHENSION_CONFIG, SPEC_READINESS_CONFIG
 
