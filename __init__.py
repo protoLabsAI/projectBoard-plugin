@@ -1763,8 +1763,9 @@ def _board_tools(cfg: dict, registry=None):
         `npm:<pkg>@<range>` specs. A bad spec returns an `Error:` and changes nothing.
         board_get_feature shows each spec's cached verdict in `merge_hold_until`, and
         board_release_merge_hold refuses while any is unmet. Re-holding a held card with a new
-        reason or `until` replaces both (one audit comment records old → new); identical
-        values, or a plain re-hold with no `until` either side, are a no-op. Valid in any
+        reason or `until` replaces both (one audit comment records old → new); a re-hold
+        without `until` keeps the stored condition; identical values, or a plain re-hold
+        with no `until` either side, are a no-op. Valid in any
         non-terminal state. Never auto-released. Lift it with board_release_merge_hold."""
         try:
             reason = _strip_wrapping_quotes(reason).strip()

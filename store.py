@@ -5308,7 +5308,9 @@ class BeadsBoard:
         then refuses to lift the hold while any of them is unmet. Re-holding a held card
         that has (or is given) an ``until`` REPLACES its reason and ``until`` with one
         ``merge-hold updated:`` audit comment recording old → new; identical values stay a
-        no-op. A plain re-hold (no ``until`` before or after) is the no-op it always was.
+        no-op. A re-hold with no ``until`` keeps the stored condition (#856) — only its
+        reason can change; release the hold to drop the condition. A plain re-hold (no
+        ``until`` before or after) is the no-op it always was.
         The update runs the fresh hold's work-location gate too (``_work_location_hold_reason``):
         a new reason citing an unrecorded SHA/branch is refused before any write.
 
@@ -5335,6 +5337,10 @@ class BeadsBoard:
         stored_specs = list(f.get("merge_hold_until_specs") or [])
         if LABEL_MERGE_HOLD in (f.get("labels") or []):
             old_reason = str(f.get("merge_hold_reason") or "")
+            if not specs:
+                # No `until` on a re-hold KEEPS the stored condition (#856): a retry or a
+                # reason edit must never silently strip it. Releasing clears it.
+                specs = stored_specs
             if not specs and not stored_specs:
                 return f  # a plain re-hold — idempotent, no duplicate comment (#532)
             if specs == stored_specs and reason == old_reason:
