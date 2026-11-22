@@ -437,6 +437,8 @@ LABEL_REVIEW_CLEAN = "review-clean"
 # verified, reviewed PR the operator still wants to QA by hand (a console layout
 # change, a risky migration). The loop never sets or clears it.
 LABEL_MERGE_HOLD = "merge-hold"
+# A per-card hands-off hold while an agent or operator rewrites its worktree branch.
+LABEL_WORKTREE_HOLD = "worktree-hold"
 # Pre-ready DESIGN state (plan M6, optional): a large/architectural feature parked
 # while its design/due-diligence is worked out (`mark_designing`). Informational for
 # the projection/console — the HARD gate is in `mark_ready` (a design referencing an
@@ -5026,6 +5028,42 @@ class BeadsBoard:
         self._run("comments", "add", fid, "merge-hold released", actor=who)
         return self.get_feature(fid)
 
+    def set_worktree_hold(self, fid: str, reason: str, *, actor: str = "") -> dict:
+        """Hold a non-terminal card's worktree for manual branch edits (#754).
+
+        Require an audit reason before adding the label. Repeated sets are no-ops;
+        unknown and terminal cards are rejected without changing them.
+        """
+        reason = str(reason or "").strip()
+        if not reason:
+            raise BoardError(f"{fid}: a worktree-hold needs a reason — say why this worktree must be left alone")
+        f = self._require(fid)
+        state = f.get("board_state")
+        if state in _TERMINAL_STATES:
+            raise BoardError(f"{fid} is {state} — cannot place a worktree-hold on a terminal card")
+        if LABEL_WORKTREE_HOLD in (f.get("labels") or []):
+            return f
+        who = str(actor or self.actor or "operator").strip() or "operator"
+        # A failed audit write must never leave a hold with no recorded reason.
+        self._run("comments", "add", fid, f"worktree-hold set: {reason}", actor=who)
+        self._run("update", fid, "--add-label", LABEL_WORKTREE_HOLD, actor=who)
+        return self.get_feature(fid)
+
+    def release_worktree_hold(self, fid: str, *, actor: str = "") -> dict:
+        """Release a worktree hold with an audit comment; unheld cards are no-ops.
+
+        Like release_merge_hold, unknown ids are rejected and terminal cards may
+        be released. Actor attribution defaults to the store actor.
+        """
+        f = self._require(fid)
+        if LABEL_WORKTREE_HOLD not in (f.get("labels") or []):
+            return f
+        who = str(actor or self.actor or "operator").strip() or "operator"
+        # Remove first so a failed update cannot leave a misleading release note.
+        self._run("update", fid, "--remove-label", LABEL_WORKTREE_HOLD, actor=who)
+        self._run("comments", "add", fid, "worktree-hold released", actor=who)
+        return self.get_feature(fid)
+
     # ── escalation ladder (D10) — mechanical; the *policy* (whether to climb at
     #    all) lives in the loop, which only escalates when distinct per-tier coders
     #    are configured. With a single coder these are simply never called, so a
@@ -6066,6 +6104,7 @@ class BeadsBoard:
             # here so the merge edge (merge_posture), the tool payload and the API all see
             # the same bool. The loop never sets or clears it — set_merge_hold does.
             "merge_hold": LABEL_MERGE_HOLD in labels,
+            "worktree_hold": LABEL_WORKTREE_HOLD in labels,
             "cancelled": LABEL_CANCELLED in labels,
             # archived is VISIBILITY, not a state: the feature stays done/cancelled;
             # the label only drops it from the default list_features projection (#115).
