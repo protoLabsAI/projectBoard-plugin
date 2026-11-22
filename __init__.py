@@ -1610,18 +1610,17 @@ def _board_tools(cfg: dict, registry=None):
         from . import read_cache
         from .store import credit_br_wait
 
-        key = read_cache.db_file(store_kw.get("db"), store_kw.get("repo"))
+        # Cached reads bypass `br`, including its missing-workspace error. Check on
+        # every call, even when the default board's database lives outside its repo.
+        missing = store.missing_repo_error()
+        if missing is not None:
+            raise missing
+
+        key = read_cache.db_file(store.db, store.repo)
         cache = read_cache.published(key)
         if cache is None:
             # No data router (the API is best-effort): this board's own cache, same rules.
             cache = read_cache.own_cache(store, key)
-        elif (getattr(store, "repo", "") or ".") != (store_kw.get("repo") or "."):
-            # The routes' listing runs `br` in the board's repo, not in this project's. A
-            # project whose folder is gone must still be refused by name, as its own
-            # listing refused it (#803).
-            missing = store.missing_repo_error()
-            if missing is not None:
-                raise missing
         snap = cache.snapshot(include_archived)
         credit_br_wait(snap.waited_s)  # the listing's queueing, on its own thread, was this call's wait
         rows = snap.rows

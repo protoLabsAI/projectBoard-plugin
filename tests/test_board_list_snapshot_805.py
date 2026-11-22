@@ -57,8 +57,8 @@ LIVE = [
 ARCHIVED, DONE = 40, 4
 
 
-@pytest.fixture
-def board(tmp_path):
+@pytest.fixture(name="board")
+def seeded_board(tmp_path):
     """A real ``br`` workspace: ARCHIVED archived cards, DONE merged ones and LIVE."""
     if not shutil.which("br"):
         pytest.skip("real br required")
@@ -244,6 +244,74 @@ def test_annotations_never_reach_the_cached_rows(board, br_calls):
         "awaiting-merge (auto_merge off)"
     )
     assert br_calls == []
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_dependency_filters_match_direct_listing(board, monkeypatch, shared):
+    """Cancelled dependency expansion belongs to live_cards, not list_features.
+    Keep the latter's rows AND next_action hints for each state/archive filter."""
+    store = _store(board)
+    store._run("update", "snap-00000", "--add-label", "cancelled")
+    for fid in ("snap-00100", "snap-00106"):
+        for dep in ("snap-00000", "snap-00109"):
+            store._run("dep", "add", fid, dep)
+    direct = _Direct(store)
+    with monkeypatch.context() as m:
+        m.setattr("project_board.store.get_store", lambda **_kw: direct)
+        previous = _tools(board)["board_list"]
+    if shared:
+        assert _client(board).get(BASE + "/features").status_code == 200
+    board_list = _tools(board)["board_list"]
+    for archived in (False, True):
+        for state in ("", "backlog", "blocked", "cancelled"):
+            for project in ("", "alpha", "beta"):
+                query = dict(state=state, include_archived=archived, project=project)
+                assert board_list.invoke(query) == previous.invoke(query), query
+        cancelled = _by_id(board_list.invoke(dict(state="cancelled", include_archived=archived)))
+        assert ("snap-00000" in cancelled) is archived
+    assert store.get_feature("snap-00100")["depends_on"]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_default_repo_removed_after_warming_cache_is_refused(board, tmp_path, br_calls, shared):
+    # Keep the database outside the repo: removing cwd must not change the cache token.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    board.update(repo=str(repo), projects={}, default_project="")
+    board_list = _tools(board)["board_list"]
+    if shared:
+        assert _client(board).get(BASE + "/features").status_code == 200
+    first = board_list.invoke({})
+    assert not first.startswith("Error:")
+    moved = tmp_path / "moved"
+    repo.rename(moved)
+    br_calls.clear()
+    reply = board_list.invoke({})
+    assert reply == f"Error: {_store(board).missing_repo_error()}"
+    assert str(repo) in reply and "restore the folder" in reply
+    assert br_calls == []
+    moved.rename(repo)
+    assert board_list.invoke({}) == first
+    assert br_calls == []
+
+
+def test_relative_db_uses_the_selected_projects_cache(board, tmp_path, br_calls):
+    other = tmp_path / "other"
+    other.mkdir()
+    other_cfg = seeded_board.__wrapped__(other)
+    _store(other_cfg)._run("update", "snap-00100", "--title", "Other database")
+    board["db_path"] = ".beads/beads.db"
+    board["projects"]["other"] = {"repo": str(other)}
+    _store(other_cfg)._run("update", "snap-00100", "--add-label", "project:other", "--remove-label", "project:alpha")
+    assert _client(board).get(BASE + "/features").status_code == 200
+    board_list = _tools(board)["board_list"]
+    reply = board_list.invoke({"project": "other"})
+    assert _by_id(reply)["snap-00100"]["title"] == "Other database"
+    br_calls.clear()
+    assert board_list.invoke({"project": "other"}) == reply
+    assert br_calls == []
+    _store(other_cfg)._run("update", "snap-00100", "--title", "Other database changed")
+    assert _by_id(board_list.invoke({"project": "other"}))["snap-00100"]["title"] == "Other database changed"
 
 
 # ── r3: read-after-write ────────────────────────────────────────────────────────────

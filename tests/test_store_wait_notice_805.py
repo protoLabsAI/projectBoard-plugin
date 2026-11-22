@@ -37,12 +37,12 @@ WAIT_LINE = re.compile(
 
 
 @pytest.fixture
-def real_run_board(monkeypatch):
+def real_run_board(monkeypatch, tmp_path):
     """A ``BeadsBoard`` whose ``_run`` is the real one (lock, timing, retries, parsing).
     Only the ``br`` process is faked: it records its args and can take ``br_seconds``."""
     monkeypatch.setattr(store_mod.shutil, "which", lambda *_a, **_k: "/usr/bin/br")
     monkeypatch.setattr(store_mod, "_BR_WAIT_NOTICE_S", THRESHOLD)
-    board = store_mod.BeadsBoard(db=None, repo="/repo", base_branch="main")
+    board = store_mod.BeadsBoard(db=None, repo=str(tmp_path), base_branch="main")
     board._workspace_ready = True  # no `br init` — there is no real workspace here
     board.br_seconds = 0.0
     board.br_calls = []
@@ -164,6 +164,7 @@ def test_wait_does_not_leak_into_a_call_on_another_thread(real_run_board, monkey
     carry its wait into its next call."""
     # `_run` faked, so this board never takes the br lock.
     free_board = make_board(lambda *a, **k: ([], False) if k.get("with_has_more") else [])
+    free_board.repo = real_run_board.repo
     waiter = threading.current_thread()
     monkeypatch.setattr(
         "project_board.store.get_store",
