@@ -549,7 +549,7 @@ class ReconcileMixin(WorktreeCleanup):
         # resume through the drive's integration/verification/publication boundary
         # before allowing that PR back into review. Requeue preserves its PR link.
         if feature.get("pr_url") and await worktree.pending_integration(
-            self._repo_for(feature), self.root, fid, feature.get("title") or ""
+            self._repo_for(feature), self.root, fid, worktree.branch_title_for(feature)
         ):
             if await self._still_orphaned_then(store, fid, store.requeue):
                 # #757: say when a requeued fix round is waiting behind the repair — the
@@ -565,7 +565,7 @@ class ReconcileMixin(WorktreeCleanup):
                     pending_note,
                 )
             return
-        branch = worktree.branch_name(fid, feature.get("title") or "")
+        branch = worktree.branch_name(fid, worktree.branch_title_for(feature))
         with worktree.capture_gh_timeouts() as timeouts:
             pr_url = await worktree.pr_url_for_branch(branch, cwd=self._repo_for(feature))
         self._note_gh_timeouts(fid, branch, timeouts)
@@ -703,7 +703,7 @@ class ReconcileMixin(WorktreeCleanup):
             log.warning("[project_board] %s stranded-resume check failed — rebuild fresh", fid, exc_info=True)
             return False
         repo = self._repo_for(f)
-        title_raw = f.get("title") or ""
+        title_raw = worktree.branch_title_for(f)
         wt = branch = ""
         try:
             # Outside the claim lock (git fetches and adds a tree here; the claim scan must
@@ -782,7 +782,7 @@ class ReconcileMixin(WorktreeCleanup):
             if not sha:
                 return False
             repo = self._repo_for(f)
-            title_raw = f.get("title") or ""
+            title_raw = worktree.branch_title_for(f)
             branch = worktree.branch_name(fid, title_raw)
             wt = os.path.join(repo, self.root, worktree.worktree_dir(fid, title_raw))
             if not os.path.isdir(wt):
@@ -948,7 +948,7 @@ class ReconcileMixin(WorktreeCleanup):
                 "detail": f"only a stranded card can be salvaged (in_progress with no drive, or blocked); "
                 f"{fid} is {state}{hint}",
             }
-        repo, base, title = self._repo_for(f), self._base_branch_for(f), f.get("title") or ""
+        repo, base, title = self._repo_for(f), self._base_branch_for(f), worktree.branch_title_for(f)
         trees, strays = [], []
         for path, branch in worktree.feature_worktrees(repo, self.root, fid):
             if not await worktree.own_worktree(repo, path):
@@ -1572,12 +1572,12 @@ class ReconcileMixin(WorktreeCleanup):
                         if cls == "merge-conflict" and fresh.get("pr_url"):
                             try:
                                 repo = self._repo_for(fresh)
-                                branch = worktree.branch_name(fid, fresh.get("title") or "")
+                                branch = worktree.branch_name(fid, worktree.branch_title_for(fresh))
                                 if await worktree.recovery_context(repo, branch):
                                     from .prompt import integration_feedback
 
                                     pending = await worktree.pending_integration(
-                                        repo, self.root, fid, fresh.get("title") or ""
+                                        repo, self.root, fid, worktree.branch_title_for(fresh)
                                     )
                                     context = await worktree.refresh_integration_context(
                                         repo,
@@ -2520,7 +2520,7 @@ class ReconcileMixin(WorktreeCleanup):
             # A live drive can start while the merge is in flight. Keep the published
             # ref when reaping is deferred or fails so later cleanup still sees it (#752).
             if await self._reap_feature_worktree(repo, fid):
-                branch = worktree.branch_name(fid, (feature or {}).get("title") or "")
+                branch = worktree.branch_name(fid, worktree.branch_title_for(feature or {}))
                 if not await worktree.delete_remote_branch(repo, branch):
                     log.info("[project_board] %s remote branch %s not deleted (already gone or protected)", fid, branch)
             return True
@@ -2691,7 +2691,7 @@ class ReconcileMixin(WorktreeCleanup):
         if mss not in ("BEHIND", "DIRTY"):
             return False  # CLEAN / BLOCKED(checks) / UNKNOWN(computing) / DRAFT → not ours
         base = self._base_branch_for(feature)
-        branch = worktree.branch_name(fid, feature.get("title") or "")
+        branch = worktree.branch_name(fid, worktree.branch_title_for(feature))
         if await self._worktree_hold_current(store, feature):
             return True
         outcome, detail = await worktree.rebase_onto_base(repo, branch, base, root=self.root)
@@ -2862,7 +2862,7 @@ class ReconcileMixin(WorktreeCleanup):
                 pr_url,
             )
             return False
-        branch = worktree.branch_name(fid, feature.get("title") or "")
+        branch = worktree.branch_name(fid, worktree.branch_title_for(feature))
         if await self._worktree_hold_current(store, feature):
             return True
         outcome, detail = await worktree.merged_state_worktree(repo, branch, base_sha, root=self.root)
