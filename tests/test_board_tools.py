@@ -459,6 +459,7 @@ _MINIMAL_ARGS = {
     "board_update_feature": {"feature_id": "bd-1", "title": "t"},
     "board_remove_dependency": {"feature_id": "bd-1", "depends_on": "bd-2"},
     "board_get_feature": {"feature_id": "bd-1"},
+    "board_feature_progress": {"feature_id": "bd-1"},
     "board_comments": {"feature_id": "bd-1"},
     "board_record_work_location": {
         "feature_id": "bd-1",
@@ -945,3 +946,91 @@ def test_board_remove_dependency_strips_wrapping_quotes(make_board, monkeypatch)
 
     assert out["removed"] == ["bd-2"]
     assert ("dep", "remove", "bd-1", "bd-2", "--type", "blocks") in br.calls
+
+
+# ── #769: board_feature_progress reads the live coder monitor without the bearer ────
+
+
+@pytest.fixture
+def _clean_progress():
+    from project_board import coder_seam
+
+    coder_seam._progress.clear()
+    yield coder_seam
+    coder_seam._progress.clear()
+
+
+def test_board_feature_progress_is_registered_beside_get_feature():
+    names = [t.name for t in pb._board_tools({})]
+    assert "board_feature_progress" in names
+    assert names.index("board_feature_progress") == names.index("board_get_feature") + 1
+
+
+def test_board_feature_progress_reports_the_latest_live_gen(make_board, monkeypatch, _clean_progress):
+    """r1/r4: a live gen in the ring buffer comes back as live=true with its stage and last
+    activity — read in-process, no HTTP route (so no operator bearer)."""
+    seam = _clean_progress
+    _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_progress", "assignee": "coder-claude"})
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network")))
+    seam.progress_begin("bd-1", 1, "standard")
+    seam.progress_end("bd-1", 1)
+    seam.progress_begin("bd-1", 2, "reasoning")
+    seam.progress_thought("bd-1", 2, "thinking " * 200)
+    seam.progress_tool("bd-1", 2, {"phase": "start", "id": "t1", "name": "Read tests/test_x.py"})
+    seam.progress_tool("bd-1", 2, {"phase": "end", "id": "t1", "name": "Read tests/test_x.py"})
+    seam.progress_tool("bd-1", 2, {"phase": "start", "id": "t2", "name": "Run pytest", "kind": "execute"})
+
+    out = json.loads(_get_tool("board_feature_progress").invoke({"feature_id": "bd-1"}))
+
+    assert out["live"] is True
+    assert out["id"] == "bd-1" and out["state"] == "in_progress"
+    assert out["assignee"] == "coder-claude"
+    assert out["gens"] == 2
+    assert out["gen"] == 2 and out["tier"] == "reasoning"
+    assert isinstance(out["elapsed_s"], (int, float)) and out["done"] is False
+    assert out["current_tool"]["name"] == "Run pytest" and out["current_tool"]["status"] == "running"
+    assert out["latest_activity"].startswith("Run pytest") and out["latest_activity_source"] == "tool"
+    assert isinstance(out["idle_s"], (int, float)) and isinstance(out["last_activity_at"], (int, float))
+    # Capped: the whole buffer (recent_tools, the 500-char thought tail) is not dumped.
+    assert "recent_tools" not in out and "thought_tail" not in out
+    assert all(len(v) <= 240 for v in out.values() if isinstance(v, str))
+
+
+def test_board_feature_progress_falls_back_to_the_narration_line(make_board, monkeypatch, _clean_progress):
+    seam = _clean_progress
+    _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "in_progress"})
+    seam.progress_begin("bd-1", 1, "standard")
+    seam.progress_thought("bd-1", 1, "Looking at the store.\nNow writing the test")
+
+    out = json.loads(_get_tool("board_feature_progress").invoke({"feature_id": "bd-1"}))
+
+    assert out["live"] is True and out["current_tool"] is None
+    assert out["latest_activity"].endswith("Now writing the test")
+    assert out["latest_activity_source"] == "narration"
+    assert "assignee" not in out
+
+
+def test_board_feature_progress_with_no_drive_is_not_an_error(make_board, monkeypatch, _clean_progress):
+    """r2: a known card with nothing in memory answers live=false with a clear message."""
+    _wire(make_board, monkeypatch, {"id": "bd-1", "board_state": "ready"})
+
+    raw = _get_tool("board_feature_progress").invoke({"feature_id": "bd-1"})
+
+    assert not raw.startswith("Error")
+    assert json.loads(raw) == {
+        "id": "bd-1",
+        "state": "ready",
+        "live": False,
+        "message": "no live drive for this card in this process",
+    }
+
+
+def test_board_feature_progress_unknown_id_and_unusable_store(make_board, monkeypatch, _clean_progress):
+    """r3: an unknown id reads like board_get_feature's; a BoardError is an `Error: …` result."""
+    _wire(make_board, monkeypatch, None)
+    out = _get_tool("board_feature_progress").invoke({"feature_id": "bd-nope"})
+    assert out.startswith("Error: unknown feature")
+
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _UnusableStore())
+    out = _get_tool("board_feature_progress").invoke({"feature_id": "bd-1"})
+    assert out.startswith("Error:") and "beads workspace" in out
