@@ -14,6 +14,7 @@ tools:
   - board_update_feature
   - board_remove_dependency
   - board_get_feature
+  - board_feature_progress
   - board_check_ready
   - board_mark_ready
   - board_list
@@ -206,6 +207,16 @@ work_locations, depends_on, open_depends_on, project, waits_for`, plus when rele
   checkout, the line that says what broke, and the last 30 lines (secrets redacted). That
   is an environment fault, not the card's: report it to the operator. The loop lifts the
   hold once the gate passes.
+
+### `board_feature_progress`: is a building coder still working?
+
+`board_get_feature` shows only `state: in_progress` for a building card. `board_feature_progress`
+reads the live coder monitor (the Board drawer's buffer) without the operator bearer:
+`live`, `state`, `assignee`, and for the latest gen `gen`, `tier`, `elapsed_s`, `done`,
+`current_tool`, `latest_activity`, `idle_s` and `last_activity_at` (epoch seconds). A long
+`elapsed_s` with a small `idle_s` is a coder still working; a large `idle_s` is a stalled
+stream. `live: false` ("no live drive for this card in this process") means nothing is in
+memory: the card hasn't dispatched since the host started, or the buffer aged it out. Read-only.
 
 ### `next_action` values (`board_list`, `board_get_feature`)
 

@@ -261,6 +261,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_attempt": "UNCOVERED",
     "record_budget": "REAL",
     "record_delivery": "REAL",
+    "record_fix_feedback_delivery": "REAL",  # Real br receipt + restart/no-replay in test_requeue_feedback_durable_757.py.
     "record_work_location": "REAL",  # #572: real beads restart roundtrip in tests/test_work_locations.py
     "record_gens_spent": "REAL",
     "record_merged_verified": "REAL",

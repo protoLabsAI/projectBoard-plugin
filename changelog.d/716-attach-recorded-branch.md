@@ -1,0 +1,1 @@
+Attaching a hand-pushed PR to a renamed card now checks the card's recorded branch instead of one re-derived from its new title, so the card's own PR is no longer refused (#716). A card from before branches were recorded accepts a PR on its own `feat/<id>-<slug>` branch and records that slug, while a PR on any other branch is still refused.

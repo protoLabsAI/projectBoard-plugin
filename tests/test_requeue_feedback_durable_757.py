@@ -1,14 +1,47 @@
 """Operator fix briefs survive restart and acknowledge only delivered occurrences."""
 
 from copy import deepcopy
+import shutil
 
 import pytest
 
 import project_board as pb
 from project_board import loop
-from project_board.store import BoardError
+from project_board import store as store_mod
+from project_board.store import BeadsBoard, BoardError
 
 FID = "bd-757"
+
+
+@pytest.mark.br_shape
+@pytest.mark.skipif(shutil.which(store_mod.BR) is None, reason="real br CLI required (installed in CI)")
+def test_delivery_receipt_survives_restart_real_br(tmp_path, monkeypatch):
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    fid = board.create_feature("Durable feedback", spec="Original task")["id"]
+    board._run("update", fid, "--add-label", "ready")
+    assert board.claim(fid, assignee="test")
+    board.open_review(fid, pr_url="https://github.com/acme/repo/pull/7")
+    board.record_review_bounce(fid, "X: retain the review fix")
+    board.bounce_ci_fail(fid, "Y: failing CI test")
+    board.record_ci_fix_feedback(fid, "Y: failing CI test")
+    board.requeue(fid)
+
+    # A new store and loop must recover both briefs without the memory bridge.
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    monkeypatch.setattr(loop, "get_store", lambda **kw: board)
+    monkeypatch.setattr(loop, "_PENDING_FEEDBACK", {})
+    assert loop.has_undelivered_fix_feedback(board, fid)
+    prompt = loop.BoardLoop({})._build_prompt(board.get_feature(fid))
+    assert "X: retain the review fix" in prompt
+    assert "Y: failing CI test" in prompt
+    assert any(text.startswith(loop._FEEDBACK_DELIVERED_PREFIX) for text in board.feature_comments(fid))
+
+    # The strict receipt written by prompt construction must persist in beads.
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    assert not loop.has_undelivered_fix_feedback(board, fid)
+    prompt = loop.BoardLoop({})._build_prompt(board.get_feature(fid))
+    assert "X: retain the review fix" not in prompt
+    assert "Y: failing CI test" not in prompt
 
 
 @pytest.fixture
