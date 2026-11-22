@@ -5,6 +5,7 @@ import json
 import pytest
 
 from project_board.loop import BoardLoop
+from project_board.loop.drive import _is_livelock_skip_reason
 from project_board.store import BoardError
 from test_api import _client
 from test_store import Br
@@ -83,6 +84,19 @@ def test_bug_ready_reproduction(make_board, issue_type):
     assert str(exc.value) == message(issue_type)
     assert beads.cmds("create") == []
     assert beads.rows == {}
+
+
+@pytest.mark.parametrize("issue_type", ["bug", "chore"])
+def test_ready_card_of_unpullable_type_is_never_queued(make_board, issue_type):
+    # The #775 defect as it stood on main (create + mark_ready used to produce exactly
+    # this card): the board shows it "ready", yet the puller's queue never returns it.
+    beads = Beads()
+    board = make_board(beads)
+    fid = legacy(board, beads, issue_type, ready=True)
+    assert board.get_feature(fid)["board_state"] == "ready"
+    assert board.ready_queue() == []
+    # The fix: the same scan now names the card instead of dropping it silently.
+    assert board.ready_queue_unpullable == [{"id": fid, "issue_type": issue_type}]
 
 
 @pytest.mark.parametrize("issue_type", ["feature", "task"])
@@ -182,3 +196,22 @@ async def test_only_unpullable_ready_still_emits_decision(make_board, monkeypatc
     beads.returns["ready"] = []
     assert await loop._spawn_ready() is False
     assert loop._last_claim_decision["skipped"] == []
+
+
+async def test_unpullable_skip_is_never_flagged_as_a_livelock(make_board, monkeypatch):
+    # A type mismatch is not a stuck dispatch: past the skip threshold the card must not
+    # be blocked with claim-race evidence (#356 bound), and it must stay in the decision.
+    assert not _is_livelock_skip_reason("unpullable-type")
+    beads = Beads()
+    board = make_board(beads)
+    fid = legacy(board, beads, ready=True)
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_: board)
+    loop = BoardLoop({"max_concurrent": 2, "ready_skip_max": 2})
+    flagged = []
+    monkeypatch.setattr(loop, "_flag_blocked", lambda *a, **k: flagged.append((a, k)))
+    for _ in range(4):
+        assert await loop._spawn_ready() is False
+        assert loop._last_claim_decision["skipped"] == [{"fid": fid, "reason": "unpullable-type", "issue_type": "bug"}]
+    assert flagged == []
+    assert loop._ready_skips[fid] == ("unpullable-type", 4)
+    assert board.get_feature(fid)["board_state"] == "ready"
