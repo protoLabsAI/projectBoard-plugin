@@ -548,6 +548,7 @@ def evidence_is_grounded(evidence: str, diff: str) -> bool:
 # Such a finding names the changed file but quotes the untouched one, so grounding it
 # against the diff would demote exactly the findings hardest to make and easiest to lose.
 _CROSS_FILE_CATEGORY = "cross-file"
+_DECLARED_NO_QUOTE_PREFIXES = ("no verbatim quote available", "no quote", "not quoted")
 
 
 def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
@@ -555,7 +556,8 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
 
     Two pass-throughs, both for findings that legitimately quote something `gh pr diff`
     never carries: one whose ``file`` is absent from the diff, and one whose ``category``
-    is ``cross-file``. That keeps the guard aimed at the case it was built for — a quote
+    is ``cross-file`` with substantial evidence that does not declare a missing quote.
+    That keeps the guard aimed at the case it was built for — a quote
     from a CHANGED file that the changed file does not contain.
 
     Attributes are read defensively: the ``Finding`` shape comes from the HOST
@@ -565,9 +567,17 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
     for f in findings:
         path = str(getattr(f, "file", "") or "")
         category = str(getattr(f, "category", "") or "").strip().lower()
-        if (path and path not in diff) or category == _CROSS_FILE_CATEGORY:
+        evidence = str(getattr(f, "evidence", "") or "")
+        if path and path not in diff:
             grounded.append(f)
-        elif evidence_is_grounded(str(getattr(f, "evidence", "") or ""), diff):
+        elif category == _CROSS_FILE_CATEGORY:
+            # The quote can come from an untouched file, but the category alone
+            # cannot ground an empty quote or an explicitly speculative scenario.
+            if evidence.lstrip().lower().startswith(_DECLARED_NO_QUOTE_PREFIXES) or not _groundable_lines(evidence):
+                ungrounded.append(f)
+            else:
+                grounded.append(f)
+        elif evidence_is_grounded(evidence, diff):
             grounded.append(f)
         else:
             ungrounded.append(f)
