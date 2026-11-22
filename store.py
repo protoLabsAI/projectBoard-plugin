@@ -1175,14 +1175,18 @@ _REQ_HEADING_RE = re.compile(r"^##\s*Requirements\b", re.MULTILINE)
 # space around it — never `done-ish`) and a NOTE: coders cite their evidence
 # (`- r1: done — ChatMessageView renders it…`), and reading that as silence blocked a
 # finished card after two fix rounds (bd-9wh1). A note that opens with a hedge (`— but…`,
-# `— partially`, `— not yet`) is still no disposition. `declined` needs a real separator
+# `— partially`, `— not yet`) is still no disposition. A full stop followed by whitespace
+# is a separator too (`- r1: done. <explanation>`): on bd-xhirv every row took that form,
+# each read as malformed, and the gate blocked a finished card after two fix rounds (#861).
+# The hedge guard reads the text after the full stop the same way (`done. but not the e2e`
+# stays open), and `done.but…` with no space is still malformed. `declined` needs a real separator
 # and a non-empty reason: a decline is the "won't do, and here is why" record, and a bare
 # one says nothing. An explicit `open` is well-formed but is not a disposition, so it, like
 # any other status, leaves the item as it was.
 _REQ_HEDGE = r"(?:but|except|partial(?:ly)?|not|mostly|almost|pending|blocked|todo|wip|tbd|in\s+progress)\b"
 _REQ_LINE_RE = re.compile(
     r"^\s*(?:[-*+]\s+)?`?(?P<id>[A-Za-z0-9][\w.-]*)`?\s*[:\-—–]\s*"
-    r"(?:(?P<done>done)(?:\.|(?:\s*[:—–]|\s+-)\s+(?!" + _REQ_HEDGE + r")\S.*?)?"
+    r"(?:(?P<done>done)(?:(?:\s*[:—–]|\s+-|\.)\s+(?!" + _REQ_HEDGE + r")\S.*?|\.)?"
     r"|(?P<declined>declined)(?:\s*[:—–]|\s+-)\s*(?P<reason>\S.*?))\s*$",
     re.IGNORECASE,
 )
@@ -1235,6 +1239,25 @@ def parse_requirement_dispositions(text: str) -> list[dict]:
             out.append({"id": m.group("id"), "status": "done"})
         else:
             out.append({"id": m.group("id"), "status": "declined", "decline_reason": m.group("reason").strip()})
+    return out
+
+
+def unparsed_requirement_lines(text: str) -> list[str]:
+    """The non-blank lines of a reply's LAST ``## Requirements`` section that are not a
+    well-formed disposition row — the rows ``parse_requirement_dispositions`` skips as
+    silence (#861), so a re-dispatch can tell the coder which lines it did not understand.
+    Same rules as the parser: fenced blocks are dropped first, the last heading wins, and
+    the section ends at the next ``##``. No section → ``[]``."""
+    text = _without_fenced_blocks(text or "")
+    headings = list(_REQ_HEADING_RE.finditer(text))
+    if not headings:
+        return []
+    out: list[str] = []
+    for line in text[headings[-1].end() :].splitlines():
+        if line.strip().startswith("##"):
+            break
+        if line.strip() and not _REQ_LINE_RE.match(line):
+            out.append(line.strip())
     return out
 
 
