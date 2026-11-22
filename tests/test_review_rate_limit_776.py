@@ -218,8 +218,19 @@ async def test_sweep_waits_for_the_reset_then_returns_the_card_to_review(monkeyp
     assert ("requeue", "bd-1") not in store.calls
 
 
-async def test_non_rate_limit_failure_still_retries_then_blocks_terminal(monkeypatch):
-    loop, store, calls = _env(monkeypatch, [_failed(BROKEN)])
+@pytest.mark.parametrize(
+    "error",
+    [
+        BROKEN,
+        "Error: step 'find_crossfile' raised ValueError: insufficient capacity for batch",
+        "Error: step 'find_crossfile' raised ValueError: overloaded local queue",
+        "Error: step 'find_crossfile' raised ValueError: disk quota exceeded",
+        "Error: step 'find_crossfile' raised OSError: connection reset by peer",
+        "Error: step 'find_crossfile' raised ValueError: " + "x" * 400 + " capacity",
+    ],
+)
+async def test_non_rate_limit_failure_still_retries_then_blocks_terminal(monkeypatch, error):
+    loop, store, calls = _env(monkeypatch, [_failed(error)])
     assert loop.review_run_max == 3
     for attempt in (1, 2):
         await loop._review_gate(store, "bd-1", PR, "/repo")
@@ -229,27 +240,13 @@ async def test_non_rate_limit_failure_still_retries_then_blocks_terminal(monkeyp
     assert store.state == "blocked" and store.blocked_class == "terminal"
     assert store.blocked_reason.startswith("review gate could not complete after 3 attempt(s)")
     assert "had failed step(s): find_crossfile" in store.blocked_reason
-    assert "ValueError: boom" in store.blocked_reason
+    assert error[:_REVIEW_STEP_ERROR_CAP] in store.blocked_reason
     assert "resets-at:" not in store.blocked_reason
     assert "review-pending" in store.labels
     # Terminal: the sweep leaves it for a human.
     monkeypatch.setattr("project_board.loop.reconcile.time.time", lambda: NOW + 86400)
     await loop._recover_blocked(store)
     assert store.state == "blocked" and store.cleared == []
-
-
-async def test_self_healing_review_gate_block_returns_to_review_not_to_a_coder(monkeypatch):
-    """The step's error text now reaches the block reason, so a reviewer that died on a
-    network fault classifies ``transient``. The sweep clears that block by itself; for a
-    card in review that must mean back to review, never a coder dispatched with no findings."""
-    loop, store, _ = _env(monkeypatch, [_failed("Error: step 'verify' raised OSError: connection reset by peer")])
-    loop.review_run_max = 1
-    await loop._review_gate(store, "bd-1", PR, "/repo")
-    assert store.state == "blocked" and store.blocked_class == "transient"
-    monkeypatch.setattr(loop, "_reconcile_prs", None)  # the sweep alone
-    await loop._recover_blocked(store)
-    assert store.cleared == ["bd-1"] and store.state == "in_review"
-    assert "review-pending" in store.labels and ("requeue", "bd-1") not in store.calls
 
 
 async def test_coder_rate_limit_block_is_still_requeued(monkeypatch):

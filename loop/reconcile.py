@@ -116,11 +116,21 @@ _REVIEW_GATE_RATE_LIMITED = "review gate rate-limited"
 # the step's text. Matched here, not in `failures.classify`: for a coder's failure those
 # words alone are deliberately not a rate limit (pinned in tests/test_failures.py).
 _REVIEW_SESSION_LIMIT_RE = re.compile(r"\bsession limit\b", re.I)
+# Workflow errors also describe local resources. Bare capacity/quota/overloaded
+# matches from the shared coder policy are not evidence of a provider throttle.
+_REVIEW_PROVIDER_LIMIT_RE = re.compile(
+    r"rate.?limit|\b429\b|too many requests|usage ?limit|usagelimitexceeded"
+    r"|usage credits|usage_limit_reached",
+    re.I,
+)
 
 
 def _review_rate_limited(text: str) -> bool:
     """True when a could-not-review reason is the provider limiting the reviewer (#776)."""
-    return classify(text).category == "rate_limit" or bool(_REVIEW_SESSION_LIMIT_RE.search(text or ""))
+    return bool(
+        (classify(text).category == "rate_limit" and _REVIEW_PROVIDER_LIMIT_RE.search(text or ""))
+        or _REVIEW_SESSION_LIMIT_RE.search(text or "")
+    )
 
 
 def _failed_step_excerpts(failed: list, steps, *, now: float) -> str:
@@ -4241,6 +4251,9 @@ class ReconcileMixin(WorktreeCleanup):
                     fid,
                     f"review gate could not complete after {n} attempt(s) — {reason} — "
                     f"needs operator attention: {pr_url}",
+                    # Excerpts may contain generic capacity/quota or network words.
+                    # An exhausted review-run budget remains a sticky terminal block.
+                    "terminal",
                 )
                 await self._budget_reset(store, fid, "review-run")
                 log.warning("[project_board] %s blocked (review gate unrunnable %d times: %s)", fid, n, reason)
