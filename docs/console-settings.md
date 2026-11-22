@@ -342,6 +342,16 @@ to the coder.
 
 Host workflow recipe used by the blocking review gate.
 
+### Model for required reviews (`review_model`)
+
+Pins the model for the required review workflow. The default is
+`anthropic-oauth:claude-sonnet-5` (Sonnet, Josh’s decision on #712). Set `review_model`
+to `""` to keep host routing. An explicit host `subagents.<name>.model` pin still
+wins over this workflow override. The `board/review-gate` status description names
+the model override used, `host routing` when no override is available, or
+`reviewer <name>` when the A2A fallback produced the verdict. Pending statuses name
+the configured model; long model names are truncated to preserve the verdict text.
+
 ### Agent for pull request reviews (`reviewer`)
 
 | Label | Help |
