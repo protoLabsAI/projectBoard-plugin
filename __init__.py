@@ -371,20 +371,18 @@ def _open_duplicate(features: list, title: str, depends_on: list | None = None) 
 
 
 def _pr_references_issue(pr: dict, n: int, slug: str) -> bool:
-    """True when the PR's title/body mechanically references issue ``n`` — either the
-    ``#N`` shorthand (word-bounded, so ``#12`` never matches inside ``#123``) or the
-    full issue URL for ``slug`` (``owner/repo``). ANY mention counts, not just closing
-    keywords: a PR that says ``see #12`` is still in-flight work on that issue and a
-    new card would duplicate it."""
-    text = f"{pr.get('title', '')}\n{pr.get('body', '')}"
-    if re.search(rf"#{n}\b", text):
-        return True
-    return bool(re.search(rf"github\.com/{re.escape(slug)}/issues/{n}\b", text, re.IGNORECASE))
+    """True when the PR's title/body uses a GitHub closing keyword for issue ``n``.
+    Accept ``#N``, ``owner/repo#N`` for ``slug``, or the full issue URL, with a
+    number boundary so ``#12`` never matches ``#123``. Plain mentions do not count.
+    Keywords are case-insensitive and may be followed by a colon."""
+    issue = rf"(?:#|{re.escape(slug)}#|https://github\.com/{re.escape(slug)}/issues/){n}\b"
+    pattern = rf"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+{issue}"
+    return any(re.search(pattern, str(pr.get(field, "")), re.IGNORECASE) for field in ("title", "body"))
 
 
 def _find_open_pr_for_issue(source_issue: str) -> dict | None:
-    """The first OPEN PR in the source issue's repo whose title/body references the
-    issue number, or None — the PR-side dedup for board_create_feature (#174): a card
+    """The first OPEN PR in the source issue's repo whose title/body closes the
+    issue, or None — the PR-side dedup for board_create_feature (#174): a card
     created for an issue that already has an open PR dispatches a coder against work
     that's already in flight.
 
@@ -564,7 +562,9 @@ def _waits_for_refusal(waits_for) -> str | None:
     return None
 
 
-def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str | None:
+def _dedup_skip_message(
+    store, title: str, deps: list, source_issue: str, *, allow_shared_source_issue: bool = False
+) -> str | None:
     """The ``Skipped — …`` message a create verb returns when a new card would DUPLICATE
     existing/in-flight work, or None when it's clear to create — the ONE dedup contract
     board_create_feature and board_create_task (#217) share, so the two verbs can never
@@ -574,7 +574,8 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
     2. a `depends_on` that names a feature already `in_review` with an open PR (work built
        on in-flight work — a fix round that belongs on THAT feature's PR, steered to
        board_requeue_feature);
-    3. an open PR in `source_issue`'s repo that already references the issue.
+    3. an open PR in `source_issue`'s repo that already closes the issue, unless
+       `allow_shared_source_issue` skips only this PR-side check.
 
     BEST-EFFORT: a store read (or the gh probe inside `_find_open_pr_for_issue`) failing
     never blocks creation — a possible dup beats a stuck board."""
@@ -608,17 +609,18 @@ def _dedup_skip_message(store, title: str, deps: list, source_issue: str) -> str
             "the same work; re-check the board before creating again, or pass "
             "force=true to create a second copy anyway."
         )
-    # PR-side dedup (#174): an open PR that already references the source issue means the
+    # PR-side dedup (#174): an open PR that already closes the source issue means the
     # work is IN FLIGHT — a new card would dispatch a second coder at it. Mechanical,
     # best-effort: a gh failure logs a warning inside the helper and never blocks creation.
-    if str(source_issue or "").strip():
+    if not allow_shared_source_issue and str(source_issue or "").strip():
         pr = _find_open_pr_for_issue(source_issue)
         if pr is not None:
             return (
                 f"Skipped — open PR #{pr.get('number', '?')} ({pr.get('url', '')}) already "
-                f"references issue {source_issue}: that work is in flight. Review or "
+                f"closes issue {source_issue}: that work is in flight. Review or "
                 "contribute to the existing PR instead of creating a duplicate card. "
-                "Pass force=true to create anyway."
+                "For board_create_feature, pass allow_shared_source_issue=true to skip only this "
+                "PR check, or pass force=true to bypass all duplicate checks."
             )
     return None
 
@@ -874,6 +876,7 @@ def _board_tools(cfg: dict, registry=None):
         waits_for: str = "",
         coder_timeout_s: float | str | None = None,
         state: Annotated[Any, InjectedState] = None,
+        allow_shared_source_issue: bool = False,
     ) -> str:
         """Create a coding feature (starts in backlog). Ready needs a self-sufficient `spec`,
         testable `acceptance_criteria` and `files_to_modify`: comma-separated paths that exist in
@@ -892,7 +895,8 @@ def _board_tools(cfg: dict, registry=None):
         The reply's `ready_check` dry-runs the Ready gate; fix what it lists before
         board_mark_ready. Refuses a likely duplicate: a same-title open card, a `depends_on` onto
         an in_review card with an open PR (that is a fix round: board_requeue_feature(fid,
-        findings=...)), or a `source_issue` an open PR already references. `force=true` bypasses.
+        findings=...)), or a `source_issue` an open PR already closes.
+        `allow_shared_source_issue=true` skips only the PR check; `force=true` bypasses all three.
         Breadth caps, shared files, gate grammar: board-tool-reference skill."""
         try:
             # Resolve the store against THIS feature's project (#90): its repo/base_branch
@@ -926,7 +930,9 @@ def _board_tools(cfg: dict, registry=None):
                 _strip_wrapping_quotes(coder_timeout_s) if isinstance(coder_timeout_s, str) else coder_timeout_s
             )
             if not force:
-                skip = _dedup_skip_message(store, title, deps, source_issue)
+                skip = _dedup_skip_message(
+                    store, title, deps, source_issue, allow_shared_source_issue=allow_shared_source_issue
+                )
                 if skip is not None:
                     return skip
             # Passed only when set, so a store double without the kwarg keeps working.

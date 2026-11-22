@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import logging
 
+import pytest
+
 import project_board as pb
 
 
@@ -98,10 +100,10 @@ def test_board_create_feature_allows_recreating_after_the_first_is_done(monkeypa
     assert json.loads(second)["id"] == "bd-2"
 
 
-# ── PR-side dedup (#174): source_issue with an open PR already referencing it ──────
+# ── PR-side dedup (#174): source_issue with an open PR already closing it ──────
 # The real incident: a card was created (and a coder dispatched) for an issue that
 # already had an open, CI-passing PR. The check is mechanical (gh pr list + a scan of
-# each PR's title/body for the issue number) and fail-open — a gh failure warns and
+# each PR's title/body for a closing keyword and issue number) and fail-open — a gh failure warns and
 # never blocks creation, same posture as the title dedup's store-read failure.
 
 
@@ -111,7 +113,7 @@ def test_pr_references_issue_matches_hash_number():
 
 
 def test_pr_references_issue_matches_number_in_title():
-    pr = {"title": "fix the crash (#12)", "body": ""}
+    pr = {"title": "fix the crash (Closes #12)", "body": ""}
     assert pb._pr_references_issue(pr, 12, "acme/widgets")
 
 
@@ -121,12 +123,12 @@ def test_pr_references_issue_never_partial_matches_a_longer_number():
 
 
 def test_pr_references_issue_matches_full_issue_url():
-    pr = {"title": "", "body": "See https://github.com/acme/widgets/issues/12 for context"}
+    pr = {"title": "", "body": "Fixed https://github.com/acme/widgets/issues/12 for context"}
     assert pb._pr_references_issue(pr, 12, "acme/widgets")
 
 
 def test_pr_references_issue_url_never_partial_matches():
-    pr = {"title": "", "body": "See https://github.com/acme/widgets/issues/123"}
+    pr = {"title": "", "body": "Fixed https://github.com/acme/widgets/issues/123"}
     assert not pb._pr_references_issue(pr, 12, "acme/widgets")
 
 
@@ -192,19 +194,27 @@ def test_find_open_pr_for_issue_unnormalizable_ref_skips_gh_entirely(monkeypatch
     assert pb._find_open_pr_for_issue("#12") is None  # create_feature rejects it with its own error
 
 
-def test_board_create_feature_refuses_when_open_pr_references_source_issue(monkeypatch):
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Fixes #12",
+        "closes: #12",
+        "Resolves acme/widgets#12",
+        "Fixed https://github.com/acme/widgets/issues/12",
+    ],
+)
+def test_board_create_feature_refuses_when_open_pr_closes_source_issue(monkeypatch, body):
     fake = _FakeStore()
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
-    monkeypatch.setattr(
-        "project_board._find_open_pr_for_issue",
-        lambda _src: {"number": 41, "url": "https://github.com/acme/widgets/pull/41"},
-    )
+    prs = [{"number": 41, "title": "Fix crash", "body": body, "url": "https://github.com/acme/widgets/pull/41"}]
+    monkeypatch.setattr(pb.subprocess, "run", lambda *_a, **_kw: _FakeProc(stdout=json.dumps(prs)))
     create = _get_tool("board_create_feature")
 
     out = create.invoke({"title": "Fix the crash", "spec": "s", "source_issue": "acme/widgets#12"})
     assert "Skipped" in out
     assert "#41" in out and "https://github.com/acme/widgets/pull/41" in out
-    assert "force=true" in out
+    assert "closes issue" in out
+    assert out.index("allow_shared_source_issue=true") < out.index("force=true")
     assert fake.created == []  # refused, not created
 
 
@@ -252,3 +262,75 @@ def test_board_create_feature_gh_failure_does_not_block_creation(monkeypatch, ca
         out = create.invoke({"title": "Fix the crash", "spec": "s", "source_issue": "acme/widgets#12"})
     assert json.loads(out)["id"] == "bd-1"  # created despite the gh failure
     assert any("PR-dedup" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "keyword", ["close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"]
+)
+@pytest.mark.parametrize("ref", ["#12", "acme/widgets#12", "https://github.com/acme/widgets/issues/12"])
+def test_pr_closing_keywords(keyword, ref):
+    assert pb._pr_references_issue({"body": f"{keyword.upper()}: {ref}"}, 12, "acme/widgets")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "see #12",
+        "Refs #12",
+        "Fixes #123",
+        "Fixes acme/widgets#123",
+        "Fixed https://github.com/acme/widgets/issues/123",
+        "Fixes other/repo#12",
+        "Fixes https://github.com/other/repo/issues/12",
+        "See https://github.com/acme/widgets/issues/12",
+        "prefixes #12",
+    ],
+)
+def test_board_create_feature_allows_non_closing_references(monkeypatch, body):
+    fake = _FakeStore()
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    prs = [{"number": 41, "title": "Context", "body": body, "url": "u41"}]
+    monkeypatch.setattr(pb.subprocess, "run", lambda *_a, **_kw: _FakeProc(stdout=json.dumps(prs)))
+    out = _get_tool("board_create_feature").invoke({"title": "Next slice", "source_issue": "acme/widgets#12"})
+    assert json.loads(out)["id"] == "bd-1"
+
+
+@pytest.mark.parametrize("guard", [None, "title", "dependency"])
+def test_shared_source_override_skips_only_pr_check(monkeypatch, guard):
+    fake = _FakeStore()
+    if guard:
+        fake.created.append(
+            {
+                "id": "bd-existing",
+                "title": "Next slice" if guard == "title" else "Previous slice",
+                "board_state": "in_review",
+                "pr_url": "https://github.com/acme/widgets/pull/41",
+            }
+        )
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: fake)
+    calls = []
+
+    def _find(src):
+        calls.append(src)
+        return {"number": 41, "body": "Fixes #12", "url": "u41"}
+
+    monkeypatch.setattr(pb, "_find_open_pr_for_issue", _find)
+    out = _get_tool("board_create_feature").invoke(
+        {
+            "title": "Next slice",
+            "source_issue": "acme/widgets#12",
+            "allow_shared_source_issue": True,
+            "depends_on": "bd-existing" if guard == "dependency" else "",
+        }
+    )
+    assert calls == []
+    if guard:
+        assert "Skipped" in out and "bd-existing" in out
+        assert len(fake.created) == 1
+    else:
+        assert json.loads(out)["id"] == "bd-1"
+        assert "allow_shared_source_issue" not in fake.created[0]
+
+
+def test_pr_closing_keyword_with_null_title():
+    assert pb._pr_references_issue({"title": None, "body": "Fixes #12"}, 12, "acme/widgets")
