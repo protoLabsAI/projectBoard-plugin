@@ -3351,10 +3351,11 @@ async def dispatch(
     verified build instead of rebuilding fresh. ``commit_message`` names the commit
     that gives the verified tree its sha (the loop passes the PR title, so the
     shipped commit message is unchanged from what ``open_pr`` would have written).
-    ``title`` (#227) is the RAW feature title — it picks the promoted canonical
-    branch/dir's human ``-<slug>`` tail (via ``worktree.branch_name``), so the branch the
-    loop later recovers/reaps by ``branch_name(fid, title)`` matches the one promoted
-    here. Absent (candidate worktrees never slug), the canonical stays the bare
+    ``title`` is the resolved branch identity supplied by the loop: the recorded
+    slug when available, otherwise the feature title. It picks the promoted canonical
+    branch/dir tail (via ``worktree.branch_name``), matching recovery and reaping
+    through ``worktree.branch_title_for(feature)`` even after a card rename.
+    Absent (candidate worktrees never slug), the canonical stays the bare
     ``feat-<id>``.
     ``_solve``/``_budget_cls``/``_verdict_cls`` are test-injection seams for
     ``solve()``/``Budget``/``Verdict``; production callers never pass them (the real

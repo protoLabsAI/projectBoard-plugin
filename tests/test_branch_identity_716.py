@@ -1,4 +1,4 @@
-"""#716 (1/2): a card's branch is recorded once, so renaming the card never moves it.
+"""#716: a card's branch is recorded once, so renaming the card never moves it.
 
 Real git (a working clone of a bare origin) and the REAL `br` store; only `gh` is faked.
 The bug: the branch/dir names were derived from the CURRENT title, so a card renamed after
@@ -356,3 +356,119 @@ def test_branch_title_for_prefers_a_valid_recorded_slug_without_gh(monkeypatch):
     assert worktree.branch_title_for({**card, "branch_slug": "Bad/Slug"}) == "New title"
     assert worktree.branch_title_for({"id": "bd-x"}) == ""
     assert worktree.branch_name("bd-x", worktree.branch_title_for({**card, "branch_slug": ""})) == "feat/bd-x"
+
+
+# Recovery must share the same identity as build and attach, including after restart.
+def _recovery_card(repo):
+    board = BeadsBoard(repo=str(repo), actor="test")
+    fid = _ready_card(board, "Old title")["id"]
+    assert board.claim(fid)
+    return board, fid
+
+
+def _recovery_loop(repo):
+    from project_board.loop import BoardLoop
+
+    # Use the actual store through the loop's normal configuration.
+    return BoardLoop(
+        {
+            "db_path": str(repo / ".beads" / "beads.db"),
+            "repo": str(repo),
+            "base_branch": "main",
+            "coder": "proto",
+            "local_gate_cmd": "",
+        }
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True])
+async def test_renamed_orphan_adopts_original_pr(repo, monkeypatch, linked):
+    board, fid = _recovery_card(repo)
+    branch, sha = await _first_build_and_push(board, repo, fid)
+    if linked:
+        board.record_pr_url(fid, _PR)
+    board.update_feature(fid, title="New title")
+    seen = []
+
+    async def gh(*args, cwd, timeout=60):
+        assert args[:2] == ("pr", "view")
+        seen.append(args[2])
+        return (0, _PR, "") if args[2] == branch else (1, "", "no PR")
+
+    monkeypatch.setattr(worktree, "_gh", gh)
+    await _recovery_loop(repo)._reconcile_orphan(fid)
+
+    assert seen == [branch]
+    assert board.get_feature(fid)["board_state"] == "in_review"
+    assert board.get_feature(fid)["pr_url"] == _PR
+    assert git(repo, "rev-parse", f"origin/{branch}") == sha
+    assert _remote_feature_branches(repo) == [branch]
+
+
+async def test_renamed_stranded_resume_and_reap_keep_original_commit(repo):
+    board, fid = _recovery_card(repo)
+    branch, sha = await _first_build_and_push(board, repo, fid)
+    wt, _ = await worktree.create_worktree(str(repo), "main", fid, ROOT, title="old-title", resume=True)
+    # A shutdown saves the current checkout and persists its resume record.
+    saved = await worktree.preserve_worktree(str(repo), wt, branch)
+    board.record_stranded_work(fid, ref=saved.ref, sha=git(repo, "rev-parse", saved.ref))
+    await worktree.remove_worktree(str(repo), wt, branch)
+    board.update_feature(fid, title="New title")
+    loop = _recovery_loop(repo)
+
+    assert await loop._resume_stranded_work(board, fid)
+    assert board.get_feature(fid)["board_state"] == "ready"
+    assert pathlib.Path(wt).is_dir()
+    assert git(wt, "branch", "--show-current") == branch
+    assert git(wt, "rev-parse", "HEAD") == sha
+    assert await loop._reap_feature_worktree(str(repo), fid)
+    assert not pathlib.Path(wt).exists()
+    assert git(repo, "rev-parse", f"origin/{branch}") == sha
+    assert _remote_feature_branches(repo) == [branch]
+    assert not git(repo, "branch", "--list", f"feat/{fid}-new-title")
+
+
+async def test_renamed_orphan_resumes_retained_integration_before_adopting_pr(repo, monkeypatch):
+    board, fid = _recovery_card(repo)
+    branch, _ = await _first_build_and_push(board, repo, fid)
+    board.record_pr_url(fid, _PR)
+    wt, _ = await _fix_round(board, repo, fid)
+    # A real pending merge on the original checkout survives the card rename.
+    (repo / "sibling").write_text("sibling change\n")
+    git(repo, "add", "sibling")
+    git(repo, "commit", "-m", "sibling change")
+    git(repo, "push", "origin", "main")
+    git(wt, "merge", "--no-commit", "--no-ff", "main")
+    board.update_feature(fid, title="New title")
+
+    async def gh(*args, **kwargs):
+        pytest.fail("pending repair must be resumed before adopting the existing PR")
+
+    monkeypatch.setattr(worktree, "_gh", gh)
+    await _recovery_loop(repo)._reconcile_orphan(fid)
+
+    assert board.get_feature(fid)["board_state"] == "ready"
+    assert board.get_feature(fid)["pr_url"] == _PR
+    assert await worktree.pending_integration(str(repo), ROOT, fid, "old-title") == (wt, branch)
+    assert _remote_feature_branches(repo) == [branch]
+
+    # Restart through publication: the existing PR receives the repaired head.
+    restarted = BeadsBoard(repo=str(repo), actor="test")
+    resumed, actual = await _fix_round(restarted, repo, fid)
+    assert (resumed, actual) == (wt, branch)
+    await worktree.finish_integration(wt, branch, "main")
+
+    async def existing_pr(*args, cwd, timeout=60):
+        if args[:2] == ("pr", "create"):
+            assert args[args.index("--head") + 1] == branch
+            return 1, "", "a pull request already exists"
+        assert args[:3] == ("pr", "view", branch)
+        return 0, _PR, ""
+
+    monkeypatch.setattr(worktree, "_gh", existing_pr)
+    assert await worktree.open_pr(wt, branch, title="New title", base="main", promote_draft=False) == _PR
+    assert git(repo, "rev-parse", f"origin/{branch}") == git(wt, "rev-parse", "HEAD")
+    assert git(wt, "show", "HEAD:feature.txt") == "the change"
+    assert git(wt, "show", "HEAD:sibling") == "sibling change"
+    assert _remote_feature_branches(repo) == [branch]
+    assert await worktree.pending_integration(str(repo), ROOT, fid, "old-title") is None
