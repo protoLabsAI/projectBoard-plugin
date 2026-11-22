@@ -1928,6 +1928,7 @@ class BeadsBoard:
         self.actor = actor
         self.repo = repo
         self.base_branch = base_branch
+        self.ready_queue_unpullable: list[dict] = []  # unsupported rows from the last ready scan
         # Per-project resolution (#90): the board's `projects:` map (name → settings,
         # resolved by projects.resolve_projects) so a single instance can serve several
         # repos. Copied so a caller's dict can't mutate it under us. `default_project` is
@@ -2321,6 +2322,7 @@ class BeadsBoard:
         `execute=True` adds the execution-task routing label. `origin_session` records the
         originating chat the create tool resolved from its turn (ADR 0131 P2b-3) — "" when
         the host has no resolver; it rides the bead `notes` (see NOTES_ORIGIN_PREFIX)."""
+        self._require_pullable_type(issue_type)
         # A card on a hot file is created AND chained under the chain lock (#458). Chaining
         # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
         # a racing card could chain while an older one was still invisible (or created but
@@ -3570,6 +3572,14 @@ class BeadsBoard:
             return f"set via {key}, because {orphan_note(name, self.projects)}"
         return f"set via {key}"
 
+    @staticmethod
+    def _require_pullable_type(issue_type: str) -> None:
+        if issue_type not in PULLABLE_ISSUE_TYPES:
+            raise BoardError(
+                f"issue_type {issue_type!r} is never claimed by the board; "
+                f"use one of: {', '.join(PULLABLE_ISSUE_TYPES)}"
+            )
+
     def _prepare_ready(self, fid: str) -> None:
         """Enforce the Ready gate and materialize the requirement ledger for ``fid``
         WITHOUT flipping the ``ready`` label — the prep half of ``mark_ready``, split
@@ -3579,6 +3589,7 @@ class BeadsBoard:
         BoardError if the gate rejects the feature — naming EVERY failed check at once
         (#455), so one round of fixes clears the card instead of one per refusal."""
         f = self._require(fid)
+        self._require_pullable_type(f.get("issue_type", "feature"))
         if f["board_state"] not in ("backlog", "ready"):
             raise BoardError(f"can't mark ready from {f['board_state']!r}")
         refusals = self._ready_findings(f)["refusals"]
@@ -5540,7 +5551,15 @@ class BeadsBoard:
         # `--limit 0` = unlimited: `br ready` defaults `--limit 20`, but the puller's queue
         # must see EVERY ready feature (the exhaustiveness invariant) — a cap here would
         # drop ready work past row 20 from the scan and the relaxed-gate cross-reference.
+        # Last-scan diagnostics for claim_decision (#775). Clear before reading so a
+        # failed scan cannot retain evidence from an earlier tick.
+        self.ready_queue_unpullable = []
         ready = self._run("ready", "--label", LABEL_READY, "--limit", "0", want_json=True) or []
+        self.ready_queue_unpullable = [
+            {"id": b["id"], "issue_type": b.get("issue_type")}
+            for b in ready
+            if b.get("id") and b.get("issue_type") not in (*PULLABLE_ISSUE_TYPES, "epic", "milestone")
+        ]
         # Supported feature/task filter + priority order in one pass: keep `br ready`'s
         # own (priority-ordered) sequence, admitting only PULLABLE_ISSUE_TYPES with an id
         # (structural epic/milestone beads are never claimed). Iterate these ids — never

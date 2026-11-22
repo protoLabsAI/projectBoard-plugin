@@ -132,6 +132,10 @@ _READY_SKIP_MAX_DEFAULT = 5
 #  - "host-disk": the volume holding the card's checkout is out of room (#801). The loop
 #    pages the operator once for the volume and claims again when space is back; a
 #    terminal block per card is exactly what that hold replaces.
+#  - "unpullable-type": a legacy ready card whose issue_type the board never claims
+#    (#775). It is a type mismatch, not a stuck dispatch or a claim race: no retry clears
+#    it and the livelock evidence would misdescribe it. It stays visible in
+#    claim_decision every tick until the card is recreated as a feature or task.
 # Waiting for a verdict is not a code failure or claim livelock.
 _NON_LIVELOCK_SKIP_REASONS = frozenset(
     {
@@ -141,6 +145,7 @@ _NON_LIVELOCK_SKIP_REASONS = frozenset(
         "preflight-hold",
         "preflight-pending",
         "reserved",
+        "unpullable-type",
         WAITING_ON_PUBLISH,
         HOST_DISK_CLASS,
     }
@@ -1205,9 +1210,15 @@ class DriveMixin(HostDiskMixin):
         busy = set(file_owner)
         selected: list[str] = []
         overlaps: list[dict] = []  # advisory collisions, including allowed parallel work
-        skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
+        # {fid, reason, …} per passed-over candidate, priority order. Legacy unpullable-type
+        # rows (#775) lead the list: they were never candidates, so they hold no queue position.
+        skipped: list[dict] = []
         parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
         ready = await asyncio.to_thread(store.ready_queue, relaxed=self.relaxed_gate)
+        skipped.extend(
+            {"fid": row["id"], "reason": "unpullable-type", "issue_type": row["issue_type"]}
+            for row in getattr(store, "ready_queue_unpullable", ())
+        )
         disk_probed: dict = {}  # checkout → this scan's free-space reading (#801)
         self._host_disk_scan_start()
         for candidate in ready:  # priority order, dep-unblocked
