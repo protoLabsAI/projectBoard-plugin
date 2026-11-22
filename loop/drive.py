@@ -20,10 +20,13 @@ from .prompt import LEDGER_ONLY_OPENING, STRANDED_RESUME_NOTE, is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
-from .. import host_friction, work_location_sweep, work_location_capture
+from .. import host_friction, work_location_sweep, work_location_capture, work_locations
 from ..failures import PROVIDER_STALL_CLASS
 from . import host_disk
 from .host_disk import HostDiskMixin
+
+# #753: the work-location id a timed-out dispatch's worktree is recorded under.
+TIMEOUT_WORKTREE_LOCATION_ID = "timeout-worktree"
 
 
 def _host_shutdown(exc: BaseException | None) -> bool:
@@ -692,6 +695,10 @@ class DriveMixin(HostDiskMixin):
         if not wt:
             return ""
         removed, record = await worktree.discard_worktree(repo, wt, branch or "", base=base, why="clearing")
+        if removed or not os.path.exists(wt):
+            # Keep the timeout's evidence, but stop probing a deliberately discarded
+            # checkout. A failed save/removal leaves the location live for recovery.
+            await self._retire_timeout_worktree(store, fid, wt)
         if record is None:
             return (
                 "worktree reaped" if removed or not os.path.exists(wt) else "worktree reap failed (directory remains)"
@@ -2634,9 +2641,15 @@ class DriveMixin(HostDiskMixin):
                                 )
                                 return
                             await worktree.remove_worktree(repo, wt, branch or "")
+                            # #753: a retry, tier climb or provider-stall rebuild removes the
+                            # timed-out tree here; its ledger entry stops being probed.
+                            await self._retire_timeout_worktree(store, fid, wt)
                             self._inflight.pop(fid, None)
                             wt = branch = None
                         saved, unsaved = await worktree.set_aside_stranded_worktrees(repo, self.root, fid, base=base)
+                        for kept in saved:
+                            if kept.removed:  # #753: a timed-out tree a rebuild set aside
+                                await self._retire_timeout_worktree(store, fid, kept.path)
                         if saved:
                             await self._note_preserved(fid, repo, saved, base=base, store=store)
                         if unsaved:
@@ -3478,6 +3491,14 @@ class DriveMixin(HostDiskMixin):
                         ):
                             self._inflight.pop(fid, None)
                         return
+                    # #753: a timed-out dispatch's tree is recorded on the card BEFORE anything
+                    # below can discard it or block/park the card, and every block that follows
+                    # names that tree and the coder's last output (on lines after the first, so
+                    # the reason's leading `coder timed out after …` text is unchanged).
+                    timeout_detail = ""
+                    if isinstance(exc, worktree.CoderTimeout):
+                        await self._record_timeout_worktree(store, fid, wt, branch)
+                        timeout_detail = self._timeout_block_detail(fid, wt)
                     policy = classify(str(exc))
                     # A PROVIDER failure is only ever the dispatch's own. The same words in a
                     # reviewer's gap, a failing test's output or a `gh` error say nothing
@@ -3844,7 +3865,7 @@ class DriveMixin(HostDiskMixin):
                     #     incident added none, so the next build resumes the tier the card
                     #     had earned, or its difficulty-selected one (#339).
                     if pre_model:
-                        reason = f"pre-model dispatch failure — infra triage, no tier climb: {exc}"
+                        reason = f"pre-model dispatch failure — infra triage, no tier climb: {exc}" + timeout_detail
                         log.warning(
                             "[project_board] %s blocked (pre-model dispatch — no model work, tier untouched): %s",
                             fid,
@@ -3922,7 +3943,9 @@ class DriveMixin(HostDiskMixin):
                                     why=f"it then timed out ({str(exc)[:200]}), and was not parked for a split",
                                 )
                                 return
-                            await self._park_for_split(store, fid, timeouts, exc, feature=feature)
+                            await self._park_for_split(
+                                store, fid, timeouts, exc, feature=feature, detail=timeout_detail
+                            )
                             await self._discard_tree(store, fid, repo, wt, branch, base=base)  # save first (#405)
                             self._inflight.pop(fid, None)
                             return
@@ -3991,7 +4014,9 @@ class DriveMixin(HostDiskMixin):
                     if not await self._block_or_stand_aside(
                         store,
                         fid,
-                        reason + (f"; routing.exclusive [{', '.join(exclusive)}] exhausted" if exclusive else ""),
+                        reason
+                        + (f"; routing.exclusive [{', '.join(exclusive)}] exhausted" if exclusive else "")
+                        + timeout_detail,
                         category=policy.category,
                         repo=repo,
                         wt=wt,
@@ -4182,7 +4207,7 @@ class DriveMixin(HostDiskMixin):
         return self.decompose_after_timeouts_by_difficulty.get(difficulty, self.decompose_after_timeouts)
 
     async def _park_for_split(
-        self, store, fid: str, timeouts: int, exc: Exception, *, feature: dict | None = None
+        self, store, fid: str, timeouts: int, exc: Exception, *, feature: dict | None = None, detail: str = ""
     ) -> None:
         """Park a card whose fresh builds keep timing out, and hand its split to the board's
         own agent (#378) — in the one order that is safe:
@@ -4214,7 +4239,7 @@ class DriveMixin(HostDiskMixin):
             reason = (
                 f"timed out {timeouts}x; not split: {no_split}; raise coder_timeout_s and unblock it "
                 f"(unblocking resets its timeout count): {exc}"
-            )
+            ) + detail
             log.warning(
                 "[project_board] %s timed out %dx — blocked as too wide, NOT split (%s)", fid, timeouts, no_split
             )
@@ -4246,6 +4271,7 @@ class DriveMixin(HostDiskMixin):
                 f"too wide to build in one dispatch — timed out {timeouts}x, and NO split task was filed (one "
                 f"was requested for this card before, or the store refused): split it by hand, or {retry}: {exc}"
             )
+        reason += detail  # #753: the timed-out tree and the coder's last output
         log.warning(
             "[project_board] %s timed out %dx on fresh builds — parked as too wide (%s)",
             fid,
@@ -5308,6 +5334,82 @@ class DriveMixin(HostDiskMixin):
         # No usable ring-buffer gap (an evicted/empty buffer, an untapped host) — fall
         # back to an age the host itself may have baked into the message.
         return _timeout_idle_s(str(exc))
+
+    async def _record_timeout_worktree(self, store, fid: str, wt, branch) -> None:
+        """#753: record a timed-out dispatch's worktree in the card's work-location ledger,
+        so ``board_list_work_locations`` shows where the coder's partial work lives. Runs
+        before the drive discards the tree or blocks/parks the card. Best-effort: a missing
+        tree records nothing, and any failure (an unreadable HEAD, a store refusal) is
+        logged and never breaks the drive."""
+        if not wt or not os.path.isdir(str(wt)):
+            return
+        try:
+            sha = ""
+            try:
+                rc, out, _err = await worktree._git(str(wt), "rev-parse", "--verify", "HEAD")
+                if rc == 0 and re.fullmatch(r"[0-9a-fA-F]{7,64}", out.strip()):
+                    sha = out.strip()
+            except Exception:  # noqa: BLE001 — the head is optional evidence
+                sha = ""
+            entry = {
+                "id": TIMEOUT_WORKTREE_LOCATION_ID,
+                "path": str(wt),
+                "purpose": (
+                    "worktree of a coder dispatch that timed out (#753) — the coder's partial work at "
+                    "the moment it was killed; the drive saves its commits before removing the tree"
+                ),
+                "branch": str(branch or ""),
+                "sha": sha,
+            }
+            await asyncio.to_thread(store.record_work_location, fid, entry)
+        except Exception:  # noqa: BLE001 — recording must never break the drive
+            log.warning(
+                "[project_board] %s could not record its timed-out worktree %s as a work location",
+                fid,
+                wt,
+                exc_info=True,
+            )
+
+    async def _retire_timeout_worktree(self, store, fid: str, wt) -> None:
+        """#753: mark the card's live ``timeout-worktree`` work location for ``wt`` retired —
+        the ONE place every removal or rebuild of this drive's tree retires it (the terminal
+        ``_discard_tree``, and the fresh-build removal a retry, tier climb or provider-stall
+        retry goes through), so the health sweep never probes a missing or reused path.
+        The entry keeps its path, branch and sha as evidence. Best-effort: a ledger failure
+        is logged and never interrupts tree cleanup."""
+        if not wt:
+            return
+        try:
+            ledger_store = store or self._store()
+            if not hasattr(ledger_store, "list_work_locations"):
+                return
+            ledger = await asyncio.to_thread(ledger_store.list_work_locations, fid)
+            for entry in ledger.get("entries") or []:
+                if (
+                    entry.get("id") == TIMEOUT_WORKTREE_LOCATION_ID
+                    and entry.get("path") == str(wt)
+                    and not entry.get("retired")
+                ):
+                    state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
+                    await asyncio.to_thread(ledger_store.record_work_location, fid, {**state, "retired": True})
+        except Exception:  # noqa: BLE001 — ledger failure must not interrupt tree cleanup
+            log.warning("[project_board] %s could not retire its timed-out worktree %s", fid, wt, exc_info=True)
+
+    def _timeout_block_detail(self, fid: str, wt) -> str:
+        """#753: the lines a timeout's block/park reason gains — the worktree the dispatch ran
+        in and a bounded tail (``coder_seam.TIMEOUT_TAIL_CAP``) of the timed-out gen's last
+        output. Starts with a blank line, so the reason's first line stays as it was.
+        Best-effort: an unreadable buffer yields just the worktree line (or nothing)."""
+        try:
+            tail = coder_seam.timeout_output_tail(fid)
+        except Exception:  # noqa: BLE001 — a monitor read must never break the drive
+            tail = ""
+        lines = []
+        if wt:
+            lines.append(f"timed-out worktree: {wt}")
+        if tail:
+            lines.append(f"coder's last output before the timeout:\n{tail}")
+        return ("\n\n" + "\n".join(lines)) if lines else ""
 
     def _timeout_escalation_context(self, fid: str) -> str:
         """Feedback for an escalated dispatch whose PRIOR attempt TIMED OUT (#146).
