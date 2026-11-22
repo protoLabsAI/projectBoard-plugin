@@ -4353,8 +4353,12 @@ class BeadsBoard:
             self._run(
                 "update", fid, *replace_prefixed_label_args(f.get("labels"), LABEL_EXTERNAL_REVIEW_BOUNCED_PREFIX, want)
             )
-        self.comment(fid, f"{REVIEW_BOUNCE_PREFIX}: {findings}" if findings else REVIEW_BOUNCE_PREFIX)
+        self.comment(fid, f"{REVIEW_BOUNCE_PREFIX}: {findings}" if findings else REVIEW_BOUNCE_PREFIX, strict=True)
         return self.get_feature(fid) if head else f
+
+    def record_fix_feedback_delivery(self, fid: str, receipt: str) -> None:
+        """Strict delivery write: failure leaves the pending brief retryable."""
+        self._run("comments", "add", fid, receipt)
 
     def record_ci_fix_feedback(self, fid: str, ci_failure: str = "") -> dict:
         """Record concrete CI feedback for a bounced coding feature.
@@ -4374,7 +4378,7 @@ class BeadsBoard:
             raise BoardError("CI fix expects a coding feature, got task")
         if not str(f.get("pr_url") or "").strip():
             raise BoardError("CI fix requires an open PR on the bounced feature")
-        self.comment(fid, f"CI fix requested: {text}")
+        self.comment(fid, f"CI fix requested: {text}", strict=True)
         return f
 
     @_task_edge
@@ -5833,15 +5837,18 @@ class BeadsBoard:
         ]
 
     # ── helpers ───────────────────────────────────────────────────────────────
-    def comment(self, fid: str, text: str) -> None:
+    def comment(self, fid: str, text: str, *, strict: bool = False) -> None:
         """Append a best-effort audit comment to a feature's bead.
 
         A `br` failure is swallowed (logged, not raised): the trail is
         best-effort and a comment write must never break the calling edge.
+        Durable orchestration records opt into ``strict`` so write errors propagate.
         """
         try:
             self._run("comments", "add", fid, text)
         except BoardError:
+            if strict:
+                raise
             log.warning("[project_board] could not add comment to %s", fid)
 
     # Compatibility alias for the pre-#266 private name; retained for one
