@@ -1872,11 +1872,30 @@ class DriveMixin(HostDiskMixin):
                 "human" if assignee else "unassigned",
                 assignee or "<none>",
             )
+            if route_to_coder:
+                why = (
+                    "task parked: this execution task needs a coder, but no coder is available under "
+                    "the project's routing policy, so nothing was dispatched. It waits in progress until "
+                    "someone delivers it or a coder is configured."
+                )
+            elif assignee:
+                why = (
+                    f"task parked: assigned to {assignee}, which is not this board's own agent or a coder "
+                    f"or agent the board can dispatch, so nothing was started. It waits in progress for "
+                    f"{assignee} to deliver the result."
+                )
+            else:
+                why = (
+                    "task parked: it has no assignee, so nothing was dispatched. It waits in progress for "
+                    "someone to deliver the result; assign it to an agent to have the board start it."
+                )
+            await self._note_task_park(store, cid, why)
             return "parked"
         # A sister-agent assignee (ACP coder OR A2A agent, #304) → drive it via its
         # native adapter. No worktree, so it owns no files (empty set: present so the
         # done-callback's pop and the sweep's live-drive check both see it, but colliding
         # with nothing in the hot-file guard).
+        self._park_noted.pop(cid, None)  # a dispatch ends any earlier park (#750)
         self._inflight_files[cid] = set()
         task = asyncio.create_task(self._drive_task(claimed, delegate), name=f"pb-task-{cid}")
         self._drives.add(task)
@@ -1915,7 +1934,9 @@ class DriveMixin(HostDiskMixin):
 
     def _is_self_assignee(self, assignee: str) -> bool:
         """True when a task's assignee names THIS board's own agent — the reserved
-        ``self``/``agent`` aliases, or the board's configured ``coder`` name (#311). Such
+        ``self``/``agent`` aliases, the host agent's own name from the loop process's
+        ``AGENT_NAME`` environment variable (#750), or the board's configured ``coder``
+        name (#311). Such
         a task is dispatched through ``HOST.invoke`` (first-party), NOT a sister-agent
         delegate. Case-insensitive; an empty assignee (human/unassigned) is never self,
         and the aliases resolve even when no ``coder`` name is configured."""
@@ -1924,7 +1945,26 @@ class DriveMixin(HostDiskMixin):
             return False
         if a in self._SELF_ASSIGNEE_ALIASES:
             return True
+        # #750: the host agent's own name (``AGENT_NAME`` in the loop's environment) —
+        # read per call, so it matches the process the loop runs in, not a boot snapshot.
+        host_name = str(os.environ.get(self._SELF_AGENT_NAME_ENV) or "").strip().lower()
+        if host_name and a == host_name:
+            return True
         return bool(self.coder_name) and a == self.coder_name.strip().lower()
+
+    async def _note_task_park(self, store, cid: str, text: str) -> None:
+        """Say on the card, in plain words, why a task parked and who must deliver it
+        (#750). One comment per park reason: the same reason again (a self task the sweep
+        requeued while another self run is still going) adds nothing. Best-effort — a
+        failed write is logged and never undoes the park."""
+        if self._park_noted.get(cid) == text:
+            return
+        try:
+            await asyncio.to_thread(store.comment, cid, text)
+        except Exception:  # noqa: BLE001 — the trail is best-effort; the park stands
+            log.warning("[project_board] %s park comment failed", cid, exc_info=True)
+            return
+        self._park_noted[cid] = text
 
     async def _dispatch_self(self, store, candidate: dict, assignee: str) -> str:
         """Dispatch a task assigned to the board's OWN agent through ``HOST.invoke`` (#311)
@@ -1965,6 +2005,19 @@ class DriveMixin(HostDiskMixin):
                 cid,
                 why,
             )
+            if invoke is None:
+                note = (
+                    f"task parked: assigned to the board's own agent ({assignee}), but this host gives the "
+                    f"board no way to wake it, so nothing was started. It waits in progress for {assignee} "
+                    "to deliver the result."
+                )
+            else:
+                note = (
+                    f"task parked: assigned to the board's own agent ({assignee}), which is already working "
+                    "on another board task. It waits until that run ends; the health sweep then returns it "
+                    f"to ready and the board wakes {assignee} for it."
+                )
+            await self._note_task_park(store, cid, note)
             return "parked"
         # #356: claim_task preserves the self dispatch target on the transition to
         # in_progress (see the park branch above) — never `--claim`.
@@ -1977,6 +2030,7 @@ class DriveMixin(HostDiskMixin):
         # guard can never leak. A self-drive owns no worktree/files (empty set, like the
         # sister-agent task path) but IS a real drive counting toward max_concurrent.
         self._self_inflight = True
+        self._park_noted.pop(cid, None)  # a dispatch ends any earlier park (#750)
         self._inflight_files[cid] = set()
         session_id = f"board-self-{cid}"  # stable per card
         task = asyncio.create_task(self._drive_self_task(claimed, invoke, session_id), name=f"pb-self-{cid}")

@@ -216,6 +216,14 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # out of the default board view, NEVER deleted (query back via
         # include_archived). Rides the sweep cadence; no scheduler of its own.
         self.archive_after_days = float(self.cfg.get("archive_after_days", 7))
+        # #750: a task in_progress with no drive and no activity (no comment, delivery or
+        # state change) for longer than this many minutes gets one stall comment from the
+        # health sweep. Flag only — never blocks or requeues. 0 turns it off.
+        self.task_stall_minutes = max(0.0, float(self.cfg.get("task_stall_minutes", 30) or 0))
+        # #750: the park reason last noted on each task card, so a card that parks again
+        # for the SAME reason (a self task requeued by the sweep while another self run is
+        # still going) does not gather a new comment every cycle.
+        self._park_noted: dict[str, str] = {}
         # Count cap after the age pass (#793); 0 keeps age-only archival.
         self.archive_keep_done = _knob_int(self.cfg, "archive_keep_done", store_mod.ARCHIVE_KEEP_DONE_DEFAULT, floor=0)
         # #585: host-reported silence gets a separate, durable same-tier retry budget.
@@ -1109,6 +1117,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
     # A task assigned to the board's OWN agent — the reserved ``self``/``agent`` aliases,
     # or the board's configured ``coder`` name.
     _SELF_ASSIGNEE_ALIASES = ("self", "agent")
+    # #750: the host agent's own name, as the loop process sees it. A lead agent that
+    # assigns a task to itself by name (e.g. ``mythxEngineer``) is the board's own agent.
+    _SELF_AGENT_NAME_ENV = "AGENT_NAME"
 
     # ── gate preflight (fail-closed, PER PROJECT: never start work a broken gate can't accept) ──
     def _ready_projects(self, store) -> list[str]:

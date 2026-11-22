@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **40 of 98 keys are in this state, including `coders` and `projects`** —
+never renders it. **41 of 99 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -559,6 +559,7 @@ blank.
 | `archive_after_days` | `7` | live |
 | `archive_keep_done` | `100` | live |
 | `base_refresh` | `True` | **restart** |
+| `task_stall_minutes` | `30` | **restart · YAML only** |
 | `provider_stall_idle_s` | `600` | **restart · YAML only** |
 | `provider_stall_max` | `2` | **restart · YAML only** |
 | `decompose_after_timeouts` | `2` | **restart** |
@@ -575,6 +576,8 @@ deletes a card; archived cards remain available with `include_archived`. Set thi
 key in Settings → Maintenance; both archive controls apply live on the next health
 sweep. Lower them when Done is too long to read. `archive_after_days` uses whole
 days in Settings and on live reload, with a minimum of 1.
+
+`task_stall_minutes` is how long a parked task — in progress with no drive behind it, waiting on a person, an unassigned slot or a name the board cannot dispatch — may sit with no activity (no comment, delivery or state change) before the health sweep flags it. The flag is one `task-stalled:` comment naming the minutes stalled, the assignee and the number of open cards that depend on it; it is written once per stall and never blocks or requeues the card. `0` turns the flag off.
 
 A fresh-build coder timeout whose idle gap — the silence since its last tool/thought/plan/
 answer event, measured from the live progress monitor — is at least `provider_stall_idle_s`
