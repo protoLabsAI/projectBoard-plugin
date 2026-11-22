@@ -13,3 +13,5 @@
   so two opposing duplicate cancels leave one card live. A guarded cancel stamps
   `dup-of:<id>` and names the card in its audit reason. Creates and cancels without these
   arguments behave as before.
+  Key lookup filters labels locally for compatibility with older beads versions and
+  refuses malformed or truncated listings rather than risking a duplicate create.

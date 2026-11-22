@@ -308,3 +308,51 @@ def test_the_tools_pass_the_new_arguments_only_when_given(monkeypatch):
     assert seen["cancel"] == {}
     _tool("board_cancel_feature").invoke({"feature_id": "bd-1", "duplicate_of": "bd-2"})
     assert seen["cancel"] == {"duplicate_of": "bd-2"}
+
+
+def test_lookup_avoids_combined_br_filters_and_orders_actual_matches(tmp_path, monkeypatch):
+    """0.1.23's combined filters can hide every keyed card; labels are matched locally."""
+    board = _board(tmp_path)
+    label = idempotency_label(_KEY)
+    rows = [
+        {"id": "z", "created_at": "2026-01-01", "labels": [label, "archived"]},
+        {"id": "new", "created_at": "2026-01-02", "labels": [label]},
+        {"id": "a", "created_at": "2026-01-01", "labels": [label]},
+        {"id": "unrelated", "created_at": "2025-01-01"},
+    ]
+
+    def run(*args, **kwargs):
+        assert args[0] == "list"
+        assert "--label" not in args
+        assert "closed" in args and "deferred" in args
+        assert args[-2:] == ("--limit", "0")
+        assert kwargs == {"want_json": True, "with_has_more": True}
+        return rows, False
+
+    monkeypatch.setattr(board, "_run", run)
+    assert board.idempotency_canonical(_KEY) == "a"
+
+
+@pytest.mark.parametrize("rows,has_more", [(None, False), ([{}], False), ([], True)])
+def test_incomplete_lookup_refuses_create(tmp_path, monkeypatch, rows, has_more):
+    board = _board(tmp_path)
+    monkeypatch.setattr(board, "_run", lambda *a, **kw: (rows, has_more))
+    monkeypatch.setattr(board, "_create_feature_chained", lambda *a, **kw: pytest.fail("unsafe create"))
+    with pytest.raises(BoardError, match="idempotency listing"):
+        board.create_feature("Retry", idempotency_key=_KEY)
+
+
+@requires_br
+@pytest.mark.parametrize("tool_name", ["board_create_feature", "board_create_task"])
+def test_label_prefixed_caller_key_survives_archival_and_restart(tmp_path, monkeypatch, tool_name):
+    board = _board(tmp_path)
+    monkeypatch.setattr(store_mod, "get_store", lambda **kw: board)
+    create = _tool(tool_name)
+    key = "idem:caller-chosen-event"
+    first = json.loads(create.invoke({"title": "Original", "idempotency_key": key}))
+    board.cancel_feature(first["id"])
+    board._run("update", first["id"], "--add-label", "archived")
+    board = _board(tmp_path)
+    again = json.loads(create.invoke({"title": "Retry", "idempotency_key": key, "force": True}))
+    assert again["id"] == first["id"] and again["created"] is False
+    assert len(board.list_features(include_archived=True)) == 1

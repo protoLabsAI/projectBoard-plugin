@@ -2500,7 +2500,7 @@ class BeadsBoard:
         # racing the same event both look before either creates otherwise (#717). Taken
         # BEFORE the chain lock, and nothing takes them in the other order.
         with self._idem_lock():
-            canonical = self.idempotency_canonical(idem)
+            canonical = self._idempotency_canonical_label(idem)
             if canonical:
                 f = self.get_feature(canonical) or {"id": canonical, "board_state": "", "title": ""}
                 f["idempotent_existing"] = True
@@ -2537,17 +2537,17 @@ class BeadsBoard:
 
     def idempotency_rows(self, label: str) -> list[dict]:
         """Every card (any state, archived too) carrying the `idem:` ``label``, oldest first
-        (created_at, then id). One `br list --label` read — no per-row `br show`."""
+        (created_at, then id). One unbounded `br list` read — no per-row `br show`."""
         if not label:
             return []
         type_args: list[str] = []
         for itype in PULLABLE_ISSUE_TYPES:
             type_args += ["--type", itype]
-        rows = self._run(
+        # br 0.1.x can return no matches when type and label filters are combined.
+        # Keep the established all-state type query and match the durable label locally.
+        rows, has_more = self._run(
             "list",
             *type_args,
-            "--label",
-            label,
             "--status",
             "open",
             "--status",
@@ -2559,17 +2559,22 @@ class BeadsBoard:
             "--limit",
             "0",
             want_json=True,
+            with_has_more=True,
         )
-        if not isinstance(rows, list):
-            raise BoardError("`br list --label` returned an invalid listing; expected a list of issues")
-        rows = [r for r in rows if isinstance(r, dict) and r.get("id") and label in (r.get("labels") or [label])]
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or not r.get("id") for r in rows):
+            raise BoardError("`br list` returned an invalid idempotency listing; expected a list of issues")
+        if has_more:
+            raise BoardError("`br list` returned a truncated idempotency listing; cannot safely resolve the key")
+        rows = [r for r in rows if label in (r.get("labels") or [])]
         return sorted(rows, key=lambda r: (str(r.get("created_at") or ""), str(r["id"])))
 
-    def idempotency_canonical(self, key_or_label: str) -> str:
-        """The canonical card id for an idempotency key (or its `idem:` label), or "" when no
+    def idempotency_canonical(self, key: str) -> str:
+        """The canonical card id for an idempotency key, or "" when no
         card carries it (#717). Canonical = the card the key first resolved to: the oldest by
         created_at, tie broken by id — so every caller, in any turn, gets the same answer."""
-        label = key_or_label if str(key_or_label).startswith(LABEL_IDEM_PREFIX) else idempotency_label(key_or_label)
+        return self._idempotency_canonical_label(idempotency_label(key))
+
+    def _idempotency_canonical_label(self, label: str) -> str:
         rows = self.idempotency_rows(label)
         return str(rows[0]["id"]) if rows else ""
 
@@ -4873,7 +4878,7 @@ class BeadsBoard:
         mine = {str(l) for l in target.get("labels") or [] if str(l).startswith(LABEL_IDEM_PREFIX)}
         theirs = {str(l) for l in other.get("labels") or [] if str(l).startswith(LABEL_IDEM_PREFIX)}
         for label in sorted(mine & theirs):
-            if self.idempotency_canonical(label) == fid:
+            if self._idempotency_canonical_label(label) == fid:
                 raise BoardError(
                     f"cancel {fid} refused: {fid} is the canonical card for the idempotency key it shares with "
                     f"{dup} (the card that key first resolved to); cancel {dup} with duplicate_of={fid} instead"
