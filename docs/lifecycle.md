@@ -131,14 +131,22 @@ demotion would be a guess rather than a finding:
 |---|---|
 | the diff could not be read, or is empty | nothing to check the quote against |
 | the diff came back truncated | a fragment cannot disprove a quote |
-| the evidence is empty, or has no line long enough to carry signal | ADR 0077's own out is "cite `file:line` and describe the scenario" — no quote is not a mangled quote |
+| the evidence is empty, or has no line long enough to carry signal (a `cross-file` finding with no quote is the exception — see below) | ADR 0077's own out is "cite `file:line` and describe the scenario" — no quote is not a mangled quote |
 | the finding names a file the diff never touches | it legitimately quotes a file `gh pr diff` does not carry |
-| the finding's `category` is `cross-file` | its whole point is a file the PR did *not* change: it names the changed file but quotes the untouched one |
+| the finding's `category` is `cross-file` **and its evidence quotes something** — a line of any length, even `pass` | its whole point is a file the PR did *not* change: it names the changed file but quotes the untouched one, so the quote is never matched against the diff |
 | an evidence line is an elision (`…`, `...`) | ADR 0077 forbids stitching separate lines into one, so eliding between two real hunks is the honest quote — the elision is the finder's annotation, not part of it |
 
-So the only demotion is a quote with real content that a complete diff of a file the PR
-*did* change demonstrably does not contain. Re-indentation and re-wrapping survive
-grounding; a changed literal does not.
+So there are two demotions. The first is a quote with real content that a complete diff
+of a file the PR *did* change demonstrably does not contain. Re-indentation and
+re-wrapping survive grounding; a changed literal does not.
+
+The second is a `cross-file` finding with **no quote at all** (#782): its evidence is
+empty (or only whitespace and elisions), or opens by declaring it has none — "No verbatim
+quote available", "no quote", "not quoted", matched case-insensitively at the start of
+the evidence. The category excuses a quote from matching the diff, not from existing, so
+a speculative scenario cannot terminal-block a card on the category alone. This applies
+only when the finding names a file the diff touches; a finding naming a file absent from
+the diff still blocks as in the table above.
 
 **Every** substantial line must match, not merely one — #3306's mangled quote had two of
 its three lines verbatim, so an "any line matches" rule would have passed it straight

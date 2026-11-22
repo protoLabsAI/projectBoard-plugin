@@ -548,7 +548,30 @@ def evidence_is_grounded(evidence: str, diff: str) -> bool:
 # Such a finding names the changed file but quotes the untouched one, so grounding it
 # against the diff would demote exactly the findings hardest to make and easiest to lose.
 _CROSS_FILE_CATEGORY = "cross-file"
+# The category excuses a quote from matching the diff, not from existing (#782): a finder
+# that opens its evidence by admitting it has no quote is describing a scenario, and a
+# scenario alone must not terminal-block a card. Matched case-insensitively at the START
+# of the evidence, on a word boundary so a real quoted line (`no_quote = True`) is not caught.
 _DECLARED_NO_QUOTE_PREFIXES = ("no verbatim quote available", "no quote", "not quoted")
+_DECLARED_NO_QUOTE_RE = re.compile(
+    r"\s*(?:" + "|".join(re.escape(p) for p in _DECLARED_NO_QUOTE_PREFIXES) + r")(?![\w])",
+    re.IGNORECASE,
+)
+
+
+def _carries_quote(evidence: str) -> bool:
+    """Does ``evidence`` quote anything at all? False when it is empty, is nothing but
+    whitespace and elision markers, or declares up front that it has no quote.
+
+    Deliberately NOT ``_groundable_lines``: that drops lines too short to be worth
+    matching against a diff, but a short line (``pass``, ``x = 1``) quoted from an
+    untouched file is still a real quote and must keep its finding blocking."""
+    if _DECLARED_NO_QUOTE_RE.match(evidence or ""):
+        return False
+    rest = evidence or ""
+    for marker in _ELISION_MARKERS:
+        rest = rest.replace(marker, "")
+    return bool(rest.strip())
 
 
 def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
@@ -556,9 +579,11 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
 
     Two pass-throughs, both for findings that legitimately quote something `gh pr diff`
     never carries: one whose ``file`` is absent from the diff, and one whose ``category``
-    is ``cross-file`` with substantial evidence that does not declare a missing quote.
-    That keeps the guard aimed at the case it was built for — a quote
-    from a CHANGED file that the changed file does not contain.
+    is ``cross-file`` and whose evidence carries a quote of any length (see
+    ``_carries_quote``) — empty evidence, or evidence declaring it has no quote, is
+    ungrounded. That keeps the guard aimed at the cases it was built for — a quote from
+    a CHANGED file that the changed file does not contain, and a cross-file claim with
+    no quote behind it at all.
 
     Attributes are read defensively: the ``Finding`` shape comes from the HOST
     (``graph.review.findings``, imported lazily by ``_parse_findings``), so an older host
@@ -571,12 +596,13 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
         if path and path not in diff:
             grounded.append(f)
         elif category == _CROSS_FILE_CATEGORY:
-            # The quote can come from an untouched file, but the category alone
-            # cannot ground an empty quote or an explicitly speculative scenario.
-            if evidence.lstrip().lower().startswith(_DECLARED_NO_QUOTE_PREFIXES) or not _groundable_lines(evidence):
-                ungrounded.append(f)
-            else:
+            # The quote can come from an untouched file, so it is never matched against
+            # the diff — but the category alone cannot ground an empty quote or an
+            # explicitly speculative scenario.
+            if _carries_quote(evidence):
                 grounded.append(f)
+            else:
+                ungrounded.append(f)
         elif evidence_is_grounded(evidence, diff):
             grounded.append(f)
         else:

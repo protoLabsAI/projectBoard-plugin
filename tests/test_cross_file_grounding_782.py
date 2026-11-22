@@ -34,7 +34,7 @@ def test_bd_cge6j_declared_no_quote_is_ungrounded():
         " \n\t",
         None,
         "...",
-        "}",
+        " \u2026 \n...",
         "NO VERBATIM QUOTE AVAILABLE. Scenario: routing fails",
         "  No Quote: routing fails",
         "Not Quoted: routing fails",
@@ -49,6 +49,26 @@ def test_cross_file_quote_from_untouched_file_stays_grounded():
     quote = "return parked_tasks[peer_task_id]"
     assert quote not in DIFF
     real = finding(quote, category=" Cross-File ")
+    assert partition_by_grounding([real], DIFF) == ([real], [])
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        # Shorter than the diff-matching floor, but still a real quote of the untouched file.
+        "pass",
+        "x = 1",
+        "}",
+        "+    pass",
+        "...\nx = 1\n...",
+        # Starts like a declared phrase but is a quoted line, not a declaration.
+        "no_quote = True",
+        "not quoted_names:",
+    ],
+)
+def test_cross_file_short_or_lookalike_quote_stays_grounded(evidence):
+    real = finding(evidence)
+    assert evidence not in DIFF
     assert partition_by_grounding([real], DIFF) == ([real], [])
 
 
