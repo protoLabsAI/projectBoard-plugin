@@ -18,6 +18,11 @@ from .. import block_pages, external_review, merge_state_hold, review_coverage_h
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import host_friction
 from .drive import _recorded_reset, _text_reset
+from .. import _TERMINAL_STATES
+
+# #750: the stall flag's comment prefix — also how a later sweep sees it already flagged.
+TASK_STALLED_PREFIX = "task-stalled:"
+
 
 _loop = sys.modules[__package__]  # the loop package, for monkeypatch-visible seams
 
@@ -535,6 +540,9 @@ class ReconcileMixin(WorktreeCleanup):
             elif self._resolve_task_delegate(assignee) is not None:
                 if await self._still_orphaned_then(store, fid, store.requeue):
                     log.info("[project_board] %s task reset to ready (sister-agent drive died — re-dispatch)", fid)
+            else:
+                # #750: a parked task is left in_progress on purpose, but not silently forever.
+                await self._flag_task_stall(store, feature)
             return
         # An existing PR may still point at the unrepaired head. Shutdown keeps
         # the integration checkout (including its index and recovery journal), so
@@ -574,6 +582,74 @@ class ReconcileMixin(WorktreeCleanup):
             pass  # tree recreated from the shutdown's save + requeued (logged inside)
         elif await self._still_orphaned_then(store, fid, store.requeue):
             log.info("[project_board] %s reset to ready (no PR — rebuild fresh)", fid)
+
+    async def _flag_task_stall(self, store, feature: dict) -> bool:
+        """Flag a parked task that has sat in_progress with no activity (#750).
+
+        A task on a human, unassigned or unresolvable assignee parks in_progress with no
+        drive and waits for out-of-band delivery. When nothing has happened on it — no
+        comment, delivery or state change — for longer than ``task_stall_minutes``, write
+        ONE comment naming the minutes stalled, the assignee and how many open cards depend
+        on it. Never blocks or requeues the card.
+
+        Once per stall: when the card's newest comment is already a stall flag, nothing new
+        has happened since, so a later sweep writes nothing. Any newer comment (a delivery,
+        a note, a park after a requeue) starts a fresh stall clock. Activity is the newest of
+        the card's ``updated_at`` and its comment timestamps; with no readable timestamp the
+        card is not flagged (an unreadable clock never raises a false alarm). Best-effort:
+        a failed read or write is logged and returns False. Returns whether it flagged."""
+        if self.task_stall_minutes <= 0:
+            return False
+        fid = feature.get("id") or ""
+        if not fid:
+            return False
+        try:
+            records = await asyncio.to_thread(store.feature_comments, fid, records=True)
+        except store_mod.BoardTimeout:
+            raise
+        except Exception:  # noqa: BLE001 — a flag is advisory; never break the sweep
+            log.warning("[project_board] %s stall check: comments unreadable", fid, exc_info=True)
+            return False
+        records = [r for r in records or [] if isinstance(r, dict)]
+        if records and str(records[-1].get("text") or "").startswith(TASK_STALLED_PREFIX):
+            return False  # already flagged, and nothing has happened since
+        stamps = [store_mod._parse_closed_at(feature.get("updated_at"))]
+        stamps += [store_mod._parse_closed_at(r.get("timestamp")) for r in records]
+        stamps = [t for t in stamps if t is not None]
+        if not stamps:
+            return False
+        minutes = int((time.time() - max(stamps)) // 60)
+        if minutes < self.task_stall_minutes:
+            return False
+        try:
+            rows = await asyncio.to_thread(store.list_features)
+        except store_mod.BoardTimeout:
+            raise
+        except Exception:  # noqa: BLE001 — count unknown; still flag, say so
+            log.warning("[project_board] %s stall check: dependents unreadable", fid, exc_info=True)
+            rows = None
+        if rows is None:
+            dependents = "an unknown number of open cards depend on it"
+        else:
+            n = sum(
+                1 for r in rows if fid in (r.get("depends_on") or []) and r.get("board_state") not in _TERMINAL_STATES
+            )
+            dependents = f"{n} open card{'' if n == 1 else 's'} depend{'s' if n == 1 else ''} on it"
+        assignee = str(feature.get("assignee") or "").strip()
+        who = assignee or "nobody (unassigned)"
+        text = (
+            f"{TASK_STALLED_PREFIX} this task has been in progress for {minutes} minutes with no activity "
+            f"and nothing running on it. Assigned to {who}; {dependents}. "
+            f"{assignee or 'Someone'} needs to deliver it, or it should be reassigned. "
+            "The board has not blocked or requeued it."
+        )
+        try:
+            await asyncio.to_thread(store.comment, fid, text)
+        except Exception:  # noqa: BLE001 — the flag is best-effort
+            log.warning("[project_board] %s stall comment failed", fid, exc_info=True)
+            return False
+        log.info("[project_board] %s task flagged stalled (%d min, assignee=%s)", fid, minutes, who)
+        return True
 
     async def _still_orphaned_then(self, store, fid: str, move) -> bool:
         """Apply ``move(fid)`` only if ``fid`` is STILL an orphan: in_progress with no drive

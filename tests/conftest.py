@@ -87,6 +87,15 @@ except ImportError:
 
 
 @pytest.fixture(autouse=True)
+def _no_host_agent_name(monkeypatch):
+    """#750: the loop treats a task assigned to ``AGENT_NAME`` (the host agent's own name)
+    as self work. A suite run from inside an agent's shell inherits that variable, which
+    would turn an ordinary sister-agent or human assignee in a test into self. Each test
+    starts without it; a test that needs it sets it."""
+    monkeypatch.delenv("AGENT_NAME", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_br_version(monkeypatch, tmp_path_factory):
     """The setup preflight samples ``br --version`` (setup_check._br_version) from
     register()/the /status route/the loop gate — every tier this suite exercises

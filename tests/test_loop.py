@@ -3287,6 +3287,7 @@ class _TaskStore:
         self.claimed = []
         self.claim_task_calls = []  # (#356) (fid, assignee) the task path claimed with
         self.calls = []  # (verb, fid, extra…)
+        self.comments = []  # (fid, text) — store.comment writes (#750)
 
     def ready_queue(self, relaxed=False):
         return [f for f in self._features if f["id"] not in self.claimed]
@@ -3335,6 +3336,15 @@ class _TaskStore:
     def requeue(self, fid):
         self.calls.append(("requeue", fid))
         return {"id": fid}
+
+    def comment(self, fid, text, *, strict=False):
+        # #750: kept apart from `calls`, so a park's plain-words note does not disturb the
+        # edge assertions (`store.calls == []`) the task tests make.
+        self.comments.append((fid, text))
+
+    def feature_comments(self, fid, *, records=False, unknown_ok=True):
+        rows = [{"text": t, "position": i} for i, (f, t) in enumerate(self.comments) if f == fid]
+        return rows if records else [r["text"] for r in rows]
 
     def names(self):
         return [c[0] for c in self.calls]
@@ -3722,10 +3732,11 @@ async def test_reconcile_orphan_requeues_a_dead_a2a_task(monkeypatch):
 # ── #311: dispatch a task assigned to the board's OWN agent through HOST.invoke ────
 
 
-def test_is_self_assignee_matches_only_the_own_name_and_reserved_aliases():
+def test_is_self_assignee_matches_only_the_own_name_and_reserved_aliases(monkeypatch):
     """#311: the self-dispatch trigger is NARROW — the board's configured coder name
     (case-insensitively) or the reserved ``self``/``agent`` aliases. A sister-agent name,
-    a human, or an empty assignee is never self, so ACP/A2A dispatch is untouched (r4)."""
+    a human, or an empty assignee is never self, so ACP/A2A dispatch is untouched (r4).
+    #750: the host agent's own name (``AGENT_NAME``) is self too, case-insensitively."""
     loop = BoardLoop({"coder": "proto"})
     assert loop._is_self_assignee("proto")  # the board's own configured name…
     assert loop._is_self_assignee("PROTO")  # …case-insensitively
@@ -3739,6 +3750,173 @@ def test_is_self_assignee_matches_only_the_own_name_and_reserved_aliases():
     bare = BoardLoop({})
     assert bare._is_self_assignee("self") and bare._is_self_assignee("agent")
     assert not bare._is_self_assignee("proto")
+    # #750: the lead agent's own name from the loop's environment, with no coder match.
+    monkeypatch.setenv("AGENT_NAME", "mythxEngineer")
+    for loop_ in (bare, BoardLoop({"coder": "proto"})):
+        assert loop_._is_self_assignee("mythxEngineer")
+        assert loop_._is_self_assignee("MYTHXENGINEER")
+        for other in ("agent-bot", "quinn", "alice", ""):
+            assert not loop_._is_self_assignee(other)
+    monkeypatch.setenv("AGENT_NAME", "")  # a blank name matches nothing — not even ""
+    assert not bare._is_self_assignee("") and not bare._is_self_assignee("mythxEngineer")
+
+
+async def test_a_task_assigned_to_the_host_agent_name_dispatches_as_self(monkeypatch):
+    """#750: a lead agent that assigns a task to itself BY NAME is woken through HOST.invoke
+    like any self task, instead of the task parking in_progress unnoticed."""
+    monkeypatch.setenv("AGENT_NAME", "mythxEngineer")
+    store = _TaskStore([_task("br-61d", assignee="mythxEngineer")])
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    invoke = object()
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda: invoke)
+    seen = {}
+
+    async def _dispatch_self(inv, prompt, session_id, *, timeout=None):
+        seen["invoke"], seen["session_id"] = inv, session_id
+        return "lead agent deliverable"
+
+    monkeypatch.setattr(coder_seam, "dispatch_self", _dispatch_self)
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)  # not a sister agent
+
+    assert await loop._dispatch_task(store, _task("br-61d", assignee="mythxEngineer")) == "self"
+    assert len(loop._drives) == 1  # a self drive was spawned
+    await asyncio.gather(*list(loop._drives), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert seen == {"invoke": invoke, "session_id": "board-self-br-61d"}
+    assert store.claim_task_calls == [("br-61d", "mythxEngineer")]  # the owner is preserved
+    assert ("record_delivery", "br-61d", "lead agent deliverable") in store.calls
+    assert store.comments == []  # dispatched, not parked — nothing to explain
+
+
+async def test_a_parked_human_task_says_why_on_the_card(monkeypatch):
+    """#750: a park writes ONE plain-words comment naming the assignee and the reason, so
+    the card no longer sits in_progress with only a log line behind it."""
+    store = _TaskStore([_task("bd-human", assignee="alice")])
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    assert await loop._dispatch_task(store, _task("bd-human", assignee="alice")) == "parked"
+    assert len(store.comments) == 1
+    fid, text = store.comments[0]
+    assert fid == "bd-human"
+    assert "alice" in text and "task parked" in text and "deliver" in text
+    assert "dispatch" in text  # the reason: nothing the board can dispatch
+
+
+async def test_an_unassigned_task_park_says_it_has_no_assignee(monkeypatch):
+    store = _TaskStore([dict(_task("bd-none"), issue_type="task")])
+    loop = BoardLoop({"coder": "proto"})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    # An unassigned task reads as neither self nor a delegate here (claim_task keeps "").
+    monkeypatch.setattr(loop, "_is_self_assignee", lambda a: False)
+    assert await loop._dispatch_task(store, _task("bd-none")) == "parked"
+    assert [t for _f, t in store.comments] and "no assignee" in store.comments[0][1]
+
+
+async def test_a_self_task_park_with_no_invoke_seam_says_why_on_the_card(monkeypatch):
+    """#750: the self park (no HOST.invoke seam) writes one comment naming the assignee
+    and that the board has no way to wake it."""
+    store = _TaskStore([_task("bd-self", assignee="agent")])
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda: None)
+    loop = BoardLoop({"coder": "proto"})
+    assert await loop._dispatch_task(store, _task("bd-self", assignee="agent")) == "parked"
+    assert len(store.comments) == 1
+    fid, text = store.comments[0]
+    assert fid == "bd-self" and "agent" in text and "no way to wake it" in text
+
+
+async def test_a_self_task_that_parks_again_for_the_same_reason_adds_no_second_comment(monkeypatch):
+    """#750: the sweep requeues a parked self task, so while another self run is going it
+    can park again every cycle — the card gets the reason once, not once per cycle."""
+    store = _TaskStore([_task("bd-self-2", assignee="self")])
+    monkeypatch.setattr(coder_seam, "resolve_self_invoke", lambda *a, **k: lambda *_a, **_k: "x")
+    monkeypatch.setattr(coder_seam, "host_invoke_busy", lambda: True)
+    loop = BoardLoop({"coder": "proto"})
+    assert await loop._dispatch_task(store, _task("bd-self-2", assignee="self")) == "parked"
+    store.claimed.clear()  # the sweep's requeue → ready again
+    assert await loop._dispatch_task(store, _task("bd-self-2", assignee="self")) == "parked"
+    assert len(store.comments) == 1
+    assert "already working on another board task" in store.comments[0][1]
+
+
+class _StallStore(_TaskStore):
+    """A _TaskStore whose listing carries the card and its dependents, for the stall flag."""
+
+    def __init__(self, features):
+        super().__init__(features)
+        self.list_calls = 0
+
+    def list_features(self, state=None):
+        self.list_calls += 1
+        rows = [self.get_feature(f["id"]) for f in self._features]
+        return [r for r in rows if state is None or r.get("board_state") == state]
+
+
+def _stalled_human_task(minutes_ago):
+    from datetime import datetime, timedelta, timezone
+
+    stamp = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+    return dict(_task("br-61d", assignee="alice"), board_state="in_progress", updated_at=stamp)
+
+
+def _dependent(fid, state="ready"):
+    return dict(_task(fid), board_state=state, depends_on=["br-61d"])
+
+
+async def test_the_health_sweep_flags_a_stalled_parked_task_once(monkeypatch):
+    """#750: a parked task in_progress with no drive and no activity past
+    task_stall_minutes gets ONE comment naming the minutes, the assignee and the open
+    dependents — and is neither blocked nor requeued. A second sweep adds nothing."""
+    store = _StallStore(
+        [
+            _stalled_human_task(minutes_ago=75),
+            _dependent("d1"),
+            _dependent("d2"),
+            _dependent("d3", state="done"),  # closed — not an open dependent
+            _task("unrelated"),
+        ]
+    )
+    store.claimed.append("br-61d")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "task_stall_minutes": 30})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+
+    await loop._reconcile_orphan("br-61d")
+    assert len(store.comments) == 1
+    fid, text = store.comments[0]
+    assert fid == "br-61d"
+    assert text.startswith("task-stalled:")
+    assert "75 minutes" in text and "alice" in text and "2 open cards depend on it" in text
+    assert store.names() == []  # not requeued, not blocked
+    assert store.get_feature("br-61d")["board_state"] == "in_progress"
+
+    await loop._reconcile_orphan("br-61d")  # the next sweep: nothing new happened
+    assert len(store.comments) == 1
+
+
+async def test_a_parked_task_with_recent_activity_is_not_flagged(monkeypatch):
+    store = _StallStore([_stalled_human_task(minutes_ago=10)])
+    store.claimed.append("br-61d")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "task_stall_minutes": 30})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("br-61d")
+    assert store.comments == [] and store.list_calls == 0
+
+
+async def test_task_stall_minutes_zero_turns_the_stall_flag_off(monkeypatch):
+    store = _StallStore([_stalled_human_task(minutes_ago=600), _dependent("d1")])
+    store.claimed.append("br-61d")
+    monkeypatch.setattr("project_board.loop.get_store", lambda **_kw: store)
+    loop = BoardLoop({"coder": "proto", "task_stall_minutes": 0})
+    monkeypatch.setattr(loop, "_resolve_delegate", lambda name, expect: None)
+    await loop._reconcile_orphan("br-61d")
+    assert store.comments == []
+    assert store.names() == []
+
+
+def test_task_stall_minutes_defaults_to_thirty():
+    assert BoardLoop({}).task_stall_minutes == 30
 
 
 async def test_spawn_ready_dispatches_a_self_task_via_host_invoke(monkeypatch):
