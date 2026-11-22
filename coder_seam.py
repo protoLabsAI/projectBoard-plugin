@@ -2211,6 +2211,30 @@ def select_oracle(test_paths: list[tuple[str, str]], changed: list[str] | None, 
     return cmds, note
 
 
+def fill_changed_tests(cmd: str, changed: list[str] | None, exists: Callable[[str], bool]) -> str | None:
+    """Fill an oracle's test arguments, or skip it when no existing changed tests are known.
+
+    ``exists`` resolves repo-relative paths in the candidate tree; injecting it keeps
+    selection independent of the filesystem. Commands without the token are unchanged.
+    """
+    if "{changed_tests}" not in cmd:
+        return cmd
+    if changed is None:
+        return None
+    tests = sorted(
+        path
+        for path in changed
+        if (
+            fnmatch.fnmatchcase(os.path.basename(path), "test_*.py")
+            or fnmatch.fnmatchcase(os.path.basename(path), "*_test.py")
+        )
+        and exists(path)
+    )
+    if not tests:
+        return None
+    return cmd.replace("{changed_tests}", " ".join(shlex.quote(path) for path in tests))
+
+
 class _ComposedOracle(str):
     """Shell script retaining each oracle's output and status for classification."""
 
@@ -3001,14 +3025,21 @@ class _WorktreeSolveAdapter:
 
     async def _oracle_for(self, candidate_wt: str) -> tuple[str, str]:
         """The command this candidate is judged by, and a note on how it was picked
-        (#459). With no ``test_paths`` it is ``test_cmd``. Otherwise the candidate's changed
-        files pick the commands (``select_oracle``), and several run in sequence
-        (``compose_oracle``). ``""`` means every changed file hit a skip entry."""
-        if not self.test_paths:
+        (#459). Changed files select mapped commands and fill ``{changed_tests}``
+        arguments (#729). Several commands run in sequence; ``""`` means all skipped."""
+        if not self.test_paths and "{changed_tests}" not in self.test_cmd:
             return self.test_cmd, ""
         changed = await worktree.changed_paths(candidate_wt, self.base)
         cmds, note = select_oracle(self.test_paths, changed, self.test_cmd)
-        return (compose_oracle(cmds) if cmds else ""), note
+        filled = []
+        for cmd in cmds:
+            command = fill_changed_tests(cmd, changed, lambda path: os.path.isfile(os.path.join(candidate_wt, path)))
+            if command is None:
+                why = "changed files unknown" if changed is None else "no changed test files"
+                note += f"; {why} → test run skipped"
+            else:
+                filled.append(command)
+        return (compose_oracle(filled) if filled else ""), note
 
     @property
     def format_stage_enabled(self) -> bool:
@@ -3194,21 +3225,27 @@ class _WorktreeSolveAdapter:
         if note:
             log.info("[project_board] %s oracle for %s: %s", self.fid, os.path.basename(candidate_wt), note)
         if not cmd:
-            # Every changed file hit a `skip` entry in coder_solve_test_paths. That is the
-            # operator's rule, so the candidate passes, but loudly: it was judged by nothing.
-            self._oracle_by_wt[candidate_wt] = "(no oracle: every changed file is mapped to skip)"
+            # Explicit skip entries and empty changed-test selections both pass loudly.
+            reason = (
+                note if "test run skipped" in note else "every changed file is mapped to skip in coder_solve_test_paths"
+            )
+            self._oracle_by_wt[candidate_wt] = (
+                f"(no oracle: {note})"
+                if "test run skipped" in note
+                else "(no oracle: every changed file is mapped to skip)"
+            )
             log.warning(
-                "[project_board] %s: candidate %s PASSED WITHOUT TESTS — every changed file is mapped to skip "
-                "in coder_solve_test_paths (%s)",
+                "[project_board] %s: candidate %s PASSED WITHOUT TESTS — %s (%s)",
                 self.fid,
                 os.path.basename(candidate_wt),
+                reason,
                 note,
             )
             return Verdict(
                 passed=True,
                 total=0,
                 failed=0,
-                output=f"passed without tests: every changed file is mapped to skip in coder_solve_test_paths — {note}",
+                output=f"passed without tests: {reason} — {note}",
             )
         self._oracle_by_wt[candidate_wt] = cmd
         if self.format_stage_enabled:
