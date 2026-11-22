@@ -1379,17 +1379,40 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         twin of ``board_hold_merge``. The loop never auto-merges a held card however green
         it is; a human merges it by hand. Body: ``{reason}`` (required). Valid in any
         non-terminal state; 400 on a done/cancelled card, an unknown id, or a blank reason.
-        Idempotent: re-holding a held card writes no second audit comment."""
-        reason = str((body or {}).get("reason", "")).strip()
-        return await _guard(lambda: store().set_merge_hold(fid, reason))
+        Idempotent: re-holding a held card writes no second audit comment.
+
+        ``until`` (#856, the tool's #676 input) is the hold's checkable release condition:
+        comma-separated ``pr:`` / ``release:`` / ``npm:`` gate specs; a bad spec is a 400 and
+        changes nothing. Omitted or blank on an already-conditional hold, the stored
+        condition is KEPT (a retry or a reason edit never silently strips it)."""
+        body = body or {}
+        reason = str(body.get("reason", "")).strip()
+        until = body.get("until")
+        if isinstance(until, (list, tuple)):
+            until = ", ".join(str(u).strip() for u in until if str(u).strip())
+        until = str(until or "").strip()
+        return await _guard(lambda: store().set_merge_hold(fid, reason, until=until))
 
     @router.delete("/features/{fid}/merge-hold")
-    async def _release_merge_hold(fid: str):
+    async def _release_merge_hold(fid: str, force: bool = False, body: dict | None = Body(default=None)):
         """Lift the operator's per-card auto-merge veto — the inverse of POST
         …/merge-hold (#532). Removes the `merge-hold` label and records an audit comment so
         the auto-merge edge can resume; 400 on an unknown id, idempotent on a card that is
-        not held."""
-        return await _guard(lambda: store().release_merge_hold(fid))
+        not held.
+
+        The REST twin of ``board_release_merge_hold`` (#856): a hold with an ``until``
+        condition is checked live and the release is REFUSED (400, naming each unmet spec)
+        while any is unmet, unless ``force`` is true (body ``{"force": true}`` or
+        ``?force=true``) — the audit comment then records the override. ``token`` (body) is
+        the npm token an ``npm:`` spec on a private package needs; omitted, the board's
+        configured ``npm_token`` is used, as the tool does."""
+        from . import gates as publish_gates
+
+        body = body or {}
+        raw_force = body.get("force", False)
+        forced = bool(force) or raw_force is True or str(raw_force).strip().lower() in ("true", "1", "yes")
+        token = str(body.get("token") or "").strip() or publish_gates.npm_token(cfg)
+        return await _guard(lambda: store().release_merge_hold(fid, force=forced, token=token))
 
     @router.post("/features/{fid}/cancel")
     async def _cancel(fid: str, body: dict = Body(default={})):

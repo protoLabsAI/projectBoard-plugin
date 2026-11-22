@@ -58,6 +58,7 @@ by ``0.64.0-next.1`` — a snapshot publish must not release a consumer card.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -893,9 +894,14 @@ def evaluate(specs, *, token: str = "", force: bool = False, now: float | None =
 def _evaluate_one(spec: GateSpec, *, token: str, force: bool, now: float | None, resolve_card=None) -> dict:
     t = time.monotonic() if now is None else now
     wall = time.time() if now is None else now
+    # A forced npm re-check with a DIFFERENT token than the cached verdict used (#856: an
+    # operator retries a refused release with the private package's token) is never served
+    # the throttled tokenless result. Only a fingerprint is kept, never the token itself.
+    token_key = hashlib.sha256(token.encode()).hexdigest()[:16] if spec.kind == KIND_NPM and token else ""
     with _LOCK:
         entry = _CACHE.get(spec.raw)
-        if not _due(entry, t, force):
+        token_changed = bool(entry) and force and spec.kind == KIND_NPM and entry.get("token_key", "") != token_key
+        if not token_changed and not _due(entry, t, force):
             return dict(entry["result"])
         failures = entry["failures"] if entry else 0
         was_met = bool(entry and entry["result"]["met"])
@@ -934,7 +940,13 @@ def _evaluate_one(spec: GateSpec, *, token: str, force: bool, now: float | None,
         if result["met"] and not was_met:
             log.info("[project_board] publish gate %s is MET: %s", spec.raw, result["detail"])
     with _LOCK:
-        _CACHE[spec.raw] = {"result": result, "sched_at": t, "next_at": t + delay, "failures": failures}
+        _CACHE[spec.raw] = {
+            "result": result,
+            "sched_at": t,
+            "next_at": t + delay,
+            "failures": failures,
+            "token_key": token_key,
+        }
     return dict(result)
 
 
