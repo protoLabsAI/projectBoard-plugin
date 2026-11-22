@@ -784,6 +784,8 @@ class PreflightMixin:
         already held when the failure CHANGES gets the new output as another comment."""
         store = self._store()
         for f in store.list_features(state="ready"):
+            if self._worktree_held(f):
+                continue
             fid = f["id"]
             name = self._project_name(f)
             reason = self._preflight_state.get(name)

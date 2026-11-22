@@ -10321,7 +10321,9 @@ async def test_claim_scan_reaches_the_store_off_the_event_loop_thread(monkeypatc
     finally:
         await finish()
     store.assert_offloaded()
-    assert [op for op, _ in store.ops] == ["list", "ready", "claim"]
+    # Hold checks re-read before selection and immediately before the atomic claim.
+    # assert_offloaded above covers these blocking reads too (#754).
+    assert [op for op, _ in store.ops] == ["list", "ready", "show", "show", "claim"]
 
 
 async def test_recovery_reaches_the_store_off_the_event_loop_thread(monkeypatch):

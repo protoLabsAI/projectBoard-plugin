@@ -16,6 +16,7 @@ import threading
 import time
 
 from . import project_registry, work_locations, work_snapshot
+from .store import LABEL_WORKTREE_HOLD
 
 log = logging.getLogger("protoagent.plugins.project_board")
 
@@ -265,6 +266,8 @@ class Sweep:
                 break
             feature = features[(start + offset) % len(features)]
             self.cursor = start + offset + 1
+            if feature.get("worktree_hold") is True or LABEL_WORKTREE_HOLD in (feature.get("labels") or []):
+                continue  # Manual ownership also excludes read-only git probes (#754).
             # Listings omit comments on ordinary cards; the ledger API includes them.
             ledger = (
                 store.list_work_locations(feature["id"])
