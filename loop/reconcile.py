@@ -380,6 +380,39 @@ class WorktreeCleanup:
 
 
 class ReconcileMixin(WorktreeCleanup):
+    # Manual worktree ownership (#754) is shared by dispatch and recovery.
+    def _worktree_held(self, feature: dict | None) -> bool:
+        """Manual ownership is quiet and lasts until the label is released (#754)."""
+        if not isinstance(feature, dict):
+            return False
+        fid = feature.get("id")
+        held = feature.get("worktree_hold") is True or store_mod.LABEL_WORKTREE_HOLD in (feature.get("labels") or [])
+        seen = self.__dict__.setdefault("_worktree_hold_logged", set())
+        if held:
+            if fid not in seen:
+                seen.add(fid)
+                log.info("[project_board] %s skipped — worktree held for manual work", fid)
+        else:
+            seen.discard(fid)
+        return held
+
+    async def _worktree_hold_current(self, store, feature: dict) -> bool:
+        """Re-read at execution boundaries: queued cards and retry snapshots can be stale.
+
+        An unreadable card cannot authorize touching its tree. Missing records retain
+        the snapshot's hold; normal missing-card handling remains with the caller.
+        """
+        read = getattr(store, "get_feature", None)
+        if not callable(read):
+            return self._worktree_held(feature)
+        try:
+            fresh = await asyncio.to_thread(read, feature["id"])
+        except store_mod.BoardTimeout:
+            raise
+        except Exception:
+            return True
+        return self._worktree_held(fresh if isinstance(fresh, dict) else feature)
+
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
     def _arm_merged_verify_exhaustion(self, store, fid: str) -> bool:
         """Persist the ONE-TIME exhaustion sentinel `budget:merged-verify:<max+1>` — the
@@ -459,6 +492,8 @@ class ReconcileMixin(WorktreeCleanup):
         promote → fixups → gate → open_pr instead of re-solving (#91); otherwise reset
         it to ``ready`` for a clean rebuild (a stale worktree is cleaned when the
         puller re-claims it). Shared by boot recovery and the health sweep."""
+        if await self._worktree_hold_current(self._store(), {"id": fid}):
+            return
         store = self._store()
         feature = await asyncio.to_thread(store.get_feature, fid) or {}
         # #217/#304: a task bead has no PR/worktree, so the PR-adopt / verified-candidate
@@ -574,6 +609,8 @@ class ReconcileMixin(WorktreeCleanup):
         and returns False so the caller rebuilds fresh exactly as before. A wrong resume
         hands a coder someone else's history; a skipped one only costs a rebuild. The
         stranded branch itself is never touched."""
+        if await self._worktree_hold_current(store, {"id": fid}):
+            return False
         try:
             f = await asyncio.to_thread(store.get_feature, fid) or {}
             ref = str(f.get("stranded_ref") or "").strip()
@@ -655,6 +692,8 @@ class ReconcileMixin(WorktreeCleanup):
         unchanged — a wrong salvage ships unverified code; a skipped one only costs a
         rebuild. Pending environment setup failures instead hold the existing build
         for infrastructure recovery without clearing its verified record."""
+        if await self._worktree_hold_current(store, {"id": fid}):
+            return False
         try:
             f = await asyncio.to_thread(store.get_feature, fid) or {}
             sha = str(f.get("verified_sha") or "").strip()
@@ -813,6 +852,8 @@ class ReconcileMixin(WorktreeCleanup):
     async def _salvage(self, fid: str, *, force: bool, tree: str, rec: dict) -> dict:
         store = self._store()
         f = await asyncio.to_thread(store.get_feature, fid)
+        if self._worktree_held(f):
+            return {**rec, "outcome": "held", "detail": "worktree held for manual work"}
         if not f:
             return {**rec, "outcome": "not-found", "detail": f"no feature {fid}"}
         if f.get("issue_type") == LABEL_TASK:
@@ -1151,6 +1192,8 @@ class ReconcileMixin(WorktreeCleanup):
         store = self._store()
         for f in await step("in_progress read", self._list_for_pass(store, "in_progress", "health sweep")):
             fid = f["id"]
+            if self._worktree_held(f):
+                continue
             if fid in self._inflight_files:
                 continue  # a live drive owns it
             try:
@@ -1382,6 +1425,8 @@ class ReconcileMixin(WorktreeCleanup):
             log.warning("[project_board] blocked sweep: could not list blocked features", exc_info=True)
             return
         for f in blocked:
+            if await self._worktree_hold_current(store, f):
+                continue
             fid = f["id"]
             self._sweep_step_enter(f"blocked recovery {fid}")  # a slow sweep names the card (#794)
             if fid in self._inflight_files:
@@ -1422,6 +1467,8 @@ class ReconcileMixin(WorktreeCleanup):
                     # that reserved it since (#427) owns it the same way.
                     async with self._claim_guard():
                         fresh = await asyncio.to_thread(store.get_feature, fid) or {}
+                        if self._worktree_held(fresh):
+                            continue
                         if fid in self._inflight_files or (
                             fresh.get("board_state")
                             and (not fresh.get("blocked") or str(fresh.get("blocked_class") or "").strip() != cls)
@@ -1584,6 +1631,8 @@ class ReconcileMixin(WorktreeCleanup):
                 continue
             try:
                 f = await asyncio.to_thread(store.get_feature, fid)
+                if self._worktree_held(f):
+                    continue
                 if f is None and not worktree.wt_id_is_exact(repo, self.root, wtid):
                     # The id came out of a SLUGGED dir name, and the store has no such card.
                     # That is a parse we cannot trust, not proof of an orphan (#461: every
@@ -1655,6 +1704,8 @@ class ReconcileMixin(WorktreeCleanup):
         except store_mod.BoardTimeout:
             raise
         except Exception:  # noqa: BLE001 — unreadable: leave the drive be
+            return
+        if self._worktree_held(f):
             return
         if f is not None and f.get("board_state") not in ("done", "cancelled"):
             return
@@ -1730,6 +1781,8 @@ class ReconcileMixin(WorktreeCleanup):
 
     def _start_card_work(self, store, f: dict):
         """Start ``f``'s reconcile as a tracked task, or None while its last one still runs."""
+        if self._worktree_held(f):
+            return None
         fid = f["id"]
         tasks = self._card_tasks
         running = tasks.get(fid)
@@ -1849,6 +1902,8 @@ class ReconcileMixin(WorktreeCleanup):
         destructive ``reap_feature_worktree`` — the #653 blocked path uses it so an admin
         merge on a card a drive/review still holds closes the card without tearing the live
         worktree out from under that round (#471); the orphan sweep reaps it later."""
+        if await self._worktree_hold_current(store, f):
+            return
         for f in (f,):  # noqa: B020 — see the docstring
             fid = f["id"]
             pr_url = f.get("pr_url")
@@ -2245,6 +2300,8 @@ class ReconcileMixin(WorktreeCleanup):
         never a block: the work is good, only the merge didn't land. ``view`` is the
         pass's ``pr_review_state`` read, used only to name the checks holding a PR that
         GitHub does not read as CLEAN (#495)."""
+        if await self._worktree_hold_current(store, {"id": fid}):
+            return False
         feature = await asyncio.to_thread(store.get_feature, fid)
         if feature is None:  # card deleted between the reconcile snapshot and this re-read
             log.debug("[project_board] %s vanished before auto-merge — nothing to merge", fid)
@@ -2545,12 +2602,16 @@ class ReconcileMixin(WorktreeCleanup):
         retries). BEHIND (stale, no conflict) → a clean rebase + force-push, NO coder.
         DIRTY (a real conflict) → the rebase aborts, so re-dispatch the coder to re-resolve
         off the fresh base, bounded by rebase_fix_max, then Blocked for a manual rebase."""
+        if await self._worktree_hold_current(store, feature):
+            return False
         fid = feature["id"]
         mss = await worktree.pr_merge_state(pr_url, cwd=repo)
         if mss not in ("BEHIND", "DIRTY"):
             return False  # CLEAN / BLOCKED(checks) / UNKNOWN(computing) / DRAFT → not ours
         base = self._base_branch_for(feature)
         branch = worktree.branch_name(fid, feature.get("title") or "")
+        if await self._worktree_hold_current(store, feature):
+            return True
         outcome, detail = await worktree.rebase_onto_base(repo, branch, base, root=self.root)
         if outcome == "clean":
             log.info("[project_board] %s auto-rebased onto %s (was %s) — force-pushed", fid, base, mss)
@@ -2628,6 +2689,8 @@ class ReconcileMixin(WorktreeCleanup):
         (``_merged_verify_red_is_moot``): a card that merged, closed or left review
         while the gate ran is reported, not blocked. Returns True when it BLOCKED the
         card or found it gone from review (the caller skips the rest of this pass)."""
+        if await self._worktree_hold_current(store, feature):
+            return False
         fid = feature["id"]
         if not self._local_gate_cmd_for(feature):
             return False  # no gate → nothing to verify the merged state WITH
@@ -2718,6 +2781,8 @@ class ReconcileMixin(WorktreeCleanup):
             )
             return False
         branch = worktree.branch_name(fid, feature.get("title") or "")
+        if await self._worktree_hold_current(store, feature):
+            return True
         outcome, detail = await worktree.merged_state_worktree(repo, branch, base_sha, root=self.root)
         if outcome == "error":
             log.warning("[project_board] %s merged-state verify hit infra trouble — next poll retries: %s", fid, detail)
@@ -2872,6 +2937,8 @@ class ReconcileMixin(WorktreeCleanup):
             card = await asyncio.to_thread(store.get_feature, fid) or {}
         except Exception:  # noqa: BLE001 — unreadable card: nothing says it moved
             card = {}
+        if self._worktree_held(card):
+            return True
         board_state = str(card.get("board_state") or "")
         try:
             state = await worktree.pr_state(pr_url, cwd=repo)
@@ -4225,6 +4292,8 @@ class ReconcileMixin(WorktreeCleanup):
 
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
+        if await self._worktree_hold_current(store, {"id": fid}):
+            return
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
         # The head THIS verdict is for (#328) — read BEFORE the panel so a push that lands
         # DURING the review can never stamp the verdict as current for a head the review

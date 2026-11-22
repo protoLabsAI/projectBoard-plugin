@@ -145,6 +145,7 @@ _NON_LIVELOCK_SKIP_REASONS = frozenset(
         "preflight-hold",
         "preflight-pending",
         "reserved",
+        "worktree-hold",
         "unpullable-type",
         WAITING_ON_PUBLISH,
         HOST_DISK_CLASS,
@@ -1236,6 +1237,9 @@ class DriveMixin(HostDiskMixin):
             if len(self._drives) >= self.max_concurrent:
                 break  # remaining candidates are lower priority than what we already selected
             cid = candidate["id"]
+            if await self._worktree_hold_current(store, candidate):
+                skipped.append({"fid": cid, "reason": "worktree-hold"})
+                continue
             if cid in self._inflight_files:
                 # Already held in this process — a live drive, or an operator salvage mid-publish
                 # (#427). A second claim would race it; it resolves on its own, so this is not
@@ -1329,6 +1333,9 @@ class DriveMixin(HostDiskMixin):
                 if locked and "parallel-ok" not in (candidate.get("labels") or []):
                     skipped.append({**evidence, "reason": "hot-file"})
                     continue
+            if await self._worktree_hold_current(store, candidate):
+                skipped.append({"fid": cid, "reason": "worktree-hold"})
+                continue
             claimed = await asyncio.to_thread(store.claim, cid, assignee=self.coder_name)
             if claimed is None:
                 skipped.append({"fid": cid, "reason": "claim-race"})  # raced / no longer ready
@@ -1343,11 +1350,12 @@ class DriveMixin(HostDiskMixin):
             busy |= files
             selected.append(claimed["id"])
             spawned = True
-        if selected or skipped or parked:
+        logged_skips = [s for s in skipped if s["reason"] != "worktree-hold"]
+        if selected or logged_skips or parked:
             log.info(
                 "[project_board] claim_decision %s",
                 json.dumps(
-                    {"parked": parked, "selected": selected, "skipped": skipped, "overlaps": overlaps},
+                    {"parked": parked, "selected": selected, "skipped": logged_skips, "overlaps": overlaps},
                     separators=(",", ":"),
                     sort_keys=True,
                 ),
@@ -1814,6 +1822,8 @@ class DriveMixin(HostDiskMixin):
         as the expected claim owner, separately from the resolved execution destination.
         Routing must not turn an alias into a different owner for the guarded claim."""
         cid = candidate["id"]
+        if await self._worktree_hold_current(store, candidate):
+            return "worktree-hold"
         assignee = str(candidate.get("assignee") or "").strip()
         self_or_none = (not assignee) or self._is_self_assignee(assignee)
         route_to_coder = self_or_none and is_execution_task(candidate) and not store_mod.is_decompose_task(candidate)
@@ -1992,6 +2002,8 @@ class DriveMixin(HostDiskMixin):
         host itself), so the capability-escalation edge collapses to a terminal block."""
         store = self._store()
         fid = feature["id"]
+        if await self._worktree_hold_current(store, feature):
+            return
         prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
             reply = await coder_seam.dispatch_self(invoke, prompt, session_id, timeout=self.coder_timeout or None)
@@ -2028,6 +2040,8 @@ class DriveMixin(HostDiskMixin):
         removed in the ``finally`` below."""
         store = self._store()
         fid = feature["id"]
+        if await self._worktree_hold_current(store, feature):
+            return
         coder_seam.note_card(fid, feature.get("title"))  # what its run is for, on the host's ledger
         cwd, tmp_dir = await self._task_workdir(feature, delegate)
         # Pass ``cwd`` only when a scratch dir was cut, so an A2A task / an unscoped double
@@ -2297,6 +2311,8 @@ class DriveMixin(HostDiskMixin):
         it blocks at once — no redundant tier dance."""
         store = self._store()
         fid = feature["id"]
+        if await self._worktree_hold_current(store, feature):
+            return
         coder_seam.note_card(fid, feature.get("title"))  # what its runs are for, on the host's ledger
         # #90: resolve repo/base/coders from THIS feature's project, not the instance
         # default — so a multi-repo board builds each feature in its own checkout and
@@ -2387,6 +2403,8 @@ class DriveMixin(HostDiskMixin):
                 log.info("[project_board] %s continuing the work a restart interrupted, in %s", fid, wt)
         try:
             while True:
+                if await self._worktree_hold_current(store, feature):
+                    return
                 # Every attempt after the first is a RETRY of a card the drive may no longer
                 # own (#398): a human hold placed mid-round used to be retried under — the
                 # coder re-dispatched three times on the held card, which was then re-blocked
@@ -2549,6 +2567,8 @@ class DriveMixin(HostDiskMixin):
                     #    bounce / goal-fix / gate-fix — all signalled by _ci_feedback) FIXES
                     #    the existing diff with one coder, so it must NOT re-fan-out N.
                     #  • otherwise → one fresh worktree, one dispatch.
+                    if await self._worktree_hold_current(store, feature):
+                        return
                     pending = None
                     recovery_before = None
                     if feature.get("pr_url") and wt is None:
@@ -2633,6 +2653,8 @@ class DriveMixin(HostDiskMixin):
                         if feature.get("pr_url") and (pending or await worktree.recovery_context(wt, branch)):
                             from .prompt import integration_feedback
 
+                            if await self._worktree_hold_current(store, feature):
+                                return
                             context = await worktree.prepare_integration(wt, branch, base)
                             recovery_before = await worktree.recovery_edit_state(wt)
                             self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
