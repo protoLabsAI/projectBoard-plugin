@@ -51,6 +51,7 @@ def card(make_board, monkeypatch):
 
     board = make_board(run)
     monkeypatch.setattr("project_board.store.get_store", lambda **kw: board)
+    monkeypatch.setattr(loop, "get_store", lambda **kw: board)
     live = loop.BoardLoop({})
     live._budget_cache("review-fix")[FID] = 3
     monkeypatch.setattr(loop, "live_loop", lambda: live)

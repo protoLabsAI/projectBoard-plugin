@@ -369,13 +369,22 @@ class PromptMixin:
         # commit/gate/push). Also widen scope: the fix may touch tests/files the
         # original `files_to_modify` didn't list (the #1053 lesson).
         fid = feature.get("id", "")
-        # Drain any externally-queued review-bounce feedback (the /review route stashed
-        # it via queue_review_feedback) into THIS run's _ci_feedback, so an operator/CI
-        # review bounce rides the exact same prompt path as an in-loop CI/review bounce.
-        pending = _PENDING_FEEDBACK.pop(fid, None)
-        if pending:
-            self._ci_feedback[fid] = pending
-        ci = self._ci_feedback.get(fid) or timeout_note
+        # Merge external feedback with the in-loop brief. Read durable history even
+        # when memory is populated: a restart may have dropped only older findings.
+        pending = _PENDING_FEEDBACK.get(fid)
+        board = self._store() if feature.get("pr_url") else None
+        durable = (
+            _undelivered_fix_feedback(board, fid)
+            if board is not None and callable(getattr(board, "feature_comments", None))
+            else []
+        )
+        briefs = [self._ci_feedback.get(fid) or "", pending or ""]
+        # Keep the richer memory preamble when it already carries this finding.
+        for _, text in durable:
+            body = text.split(":", 1)[1].strip()
+            if not any(body in brief for brief in briefs):
+                briefs.append(text)
+        ci = "\n\n".join(dict.fromkeys(brief for brief in briefs if brief)) or timeout_note
         prior = self._ci_prior_diff.get(fid)
         prior_block = (
             f"\n### The diff that failed (your previous attempt — fix it, don't restart from scratch)\n"
@@ -439,7 +448,7 @@ class PromptMixin:
             if reqs
             else ""
         )
-        return (
+        prompt = (
             f"You are implementing ONE feature in this repository. Your working "
             f"directory is an isolated git worktree — **make all the edits here, now**. "
             f"Do not ask questions or just describe a plan; if something is ambiguous, "
@@ -496,6 +505,19 @@ class PromptMixin:
             f"- You are done when the behavior is correct for every caller and shared state "
             f"your change touches, tests cover it, and every acceptance criterion is satisfied."
         )
+        if durable:
+            board.record_fix_feedback_delivery(
+                fid, _FEEDBACK_DELIVERED_PREFIX + json.dumps([key for key, _ in durable])
+            )
+        if pending and not durable:
+            # Preserve the legacy in-process bridge for callers without a bead record.
+            self._ci_feedback[fid] = pending
+        # A failed build/write or newer concurrent queue must remain retryable.
+        if _PENDING_FEEDBACK.get(fid) == pending:
+            _PENDING_FEEDBACK.pop(fid, None)
+        elif pending and _PENDING_FEEDBACK.get(fid, "").startswith(pending + "\n\n"):
+            _PENDING_FEEDBACK[fid] = _PENDING_FEEDBACK[fid][len(pending) + 2 :]
+        return prompt
 
 
 # What a coder is told when boot recovery handed it the work a restart interrupted: the

@@ -195,7 +195,7 @@ def _last_block_reason(feat: dict) -> str:
 # share a process but not an instance). This dict is the seam between them: the
 # router stashes the findings here and the loop drains them into its per-run
 # ``_ci_feedback`` the next time it builds a dispatch prompt — the same lever the
-# in-loop review gate writes directly. Keyed by feature id; last write wins.
+# in-loop review gate writes directly. Keyed by feature id; briefs accumulate until dispatch.
 #
 # A plain module global here was reload-unstable (#256): a plugin reload re-imports
 # this module as a FRESH object while the running loop keeps the old one, so the
@@ -233,7 +233,9 @@ def _queue_feedback(fid: str, text: str, message: str) -> None:
     text = str(text or "").strip()
     if not text:
         return
-    _PENDING_FEEDBACK[fid] = message + "\n\n" + text
+    brief = message + "\n\n" + text
+    previous = _PENDING_FEEDBACK.get(fid, "")
+    _PENDING_FEEDBACK[fid] = previous + "\n\n" + brief if previous else brief
 
 
 def queue_review_feedback(fid: str, findings: str) -> None:
@@ -260,6 +262,43 @@ def queue_ci_feedback(fid: str, ci_failure: str) -> None:
         "CI FAILED on your PR after review opened. Fix the failure below in the "
         "existing branch (the PR updates on push) — do not rewrite unrelated code.",
     )
+
+
+_FEEDBACK_DELIVERED_PREFIX = "fix-round feedback delivered: "
+
+
+def _undelivered_fix_feedback(board, fid: str) -> list[tuple[str, str]]:
+    """Fresh history, with receipts for exact occurrences, not a moving watermark.
+
+    Hash plus occurrence count distinguishes identical repeated bounces without
+    optional comment IDs/timestamps. Concurrent bounces cannot be acknowledged
+    by a receipt for an older snapshot. Read failures propagate.
+    """
+    delivered = set()
+    queued = []
+    occurrences = {}
+    for text in board.feature_comments(fid):
+        if text.startswith(_FEEDBACK_DELIVERED_PREFIX):
+            try:
+                ids = json.loads(text[len(_FEEDBACK_DELIVERED_PREFIX) :])
+                if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
+                    delivered.update(ids)
+            except ValueError:
+                pass  # Malformed receipts do not prove delivery.
+        for prefix in (store_mod.REVIEW_BOUNCE_PREFIX + ":", "CI fix requested:"):
+            if not text.startswith(prefix):
+                continue
+            if text[len(prefix) :].strip():
+                digest = hashlib.sha256(text.encode()).hexdigest()
+                occurrences[digest] = occurrences.get(digest, 0) + 1
+                queued.append((f"{digest}:{occurrences[digest]}", text))
+            break
+    return [(key, text) for key, text in queued if key not in delivered]
+
+
+def has_undelivered_fix_feedback(board, fid: str) -> bool:
+    """Whether the next dispatch owes this card an operator fix-round brief."""
+    return bool(_undelivered_fix_feedback(board, fid) or _PENDING_FEEDBACK.get(fid))
 
 
 def _parse_gate_files(raw: object) -> list[str]:
@@ -2444,6 +2483,9 @@ __all__ = [
     "_PENDING_FEEDBACK",
     "queue_ci_feedback",
     "queue_review_feedback",
+    "has_undelivered_fix_feedback",
+    "_undelivered_fix_feedback",
+    "_FEEDBACK_DELIVERED_PREFIX",
     "_parse_gate_files",
     "_PNPM_INSTALL",
     "_node_package_manager",

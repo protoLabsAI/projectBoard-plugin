@@ -2960,7 +2960,12 @@ def test_record_review_bounce_comments_from_in_review_distinct_from_ci(make_boar
     br = Br()
     b = make_board(br)
     comments = []
-    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append((fid, text)))
+
+    def comment(fid, text, *, strict=False):
+        assert strict is True
+        comments.append((fid, text))
+
+    monkeypatch.setattr(b, "comment", comment)
     monkeypatch.setattr(b, "get_feature", lambda fid: {"id": fid, "board_state": "in_review"})
     b.record_review_bounce("bd-9", "auth check missing a null guard")
     assert comments == [("bd-9", "review requested changes: auth check missing a null guard")]
@@ -2980,7 +2985,12 @@ def test_record_ci_fix_feedback_comments_from_bounced_open_pr(make_board, monkey
     br = Br()
     b = make_board(br)
     comments = []
-    monkeypatch.setattr(b, "comment", lambda fid, text: comments.append((fid, text)))
+
+    def comment(fid, text, *, strict=False):
+        assert strict is True
+        comments.append((fid, text))
+
+    monkeypatch.setattr(b, "comment", comment)
     monkeypatch.setattr(
         b,
         "get_feature",
