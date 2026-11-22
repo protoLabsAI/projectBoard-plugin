@@ -20,7 +20,7 @@ from .prompt import LEDGER_ONLY_OPENING, STRANDED_RESUME_NOTE, is_execution_task
 
 from ._common import *  # noqa: F401,F403 — share the loop kernel namespace
 from .. import block_pages
-from .. import host_friction, work_location_sweep, work_location_capture
+from .. import host_friction, work_location_sweep, work_location_capture, work_locations
 from ..failures import PROVIDER_STALL_CLASS
 from . import host_disk
 from .host_disk import HostDiskMixin
@@ -695,6 +695,23 @@ class DriveMixin(HostDiskMixin):
         if not wt:
             return ""
         removed, record = await worktree.discard_worktree(repo, wt, branch or "", base=base, why="clearing")
+        if removed or not os.path.exists(wt):
+            # Keep the timeout's evidence, but stop probing a deliberately discarded
+            # checkout. A failed save/removal leaves the location live for recovery.
+            try:
+                ledger_store = store or self._store()
+                if hasattr(ledger_store, "list_work_locations"):
+                    ledger = await asyncio.to_thread(ledger_store.list_work_locations, fid)
+                    for entry in ledger["entries"]:
+                        if (
+                            entry.get("id") == TIMEOUT_WORKTREE_LOCATION_ID
+                            and entry.get("path") == str(wt)
+                            and not entry.get("retired")
+                        ):
+                            state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
+                            await asyncio.to_thread(ledger_store.record_work_location, fid, {**state, "retired": True})
+            except Exception:  # noqa: BLE001 — ledger failure must not interrupt tree cleanup
+                log.warning("[project_board] %s could not retire its timed-out worktree %s", fid, wt, exc_info=True)
         if record is None:
             return (
                 "worktree reaped" if removed or not os.path.exists(wt) else "worktree reap failed (directory remains)"

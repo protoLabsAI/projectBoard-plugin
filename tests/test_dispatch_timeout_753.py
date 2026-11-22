@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import shutil
 
-from project_board import coder_seam, failures, worktree
+import pytest
+
+from project_board import coder_seam, failures, worktree, work_locations, work_location_sweep
 from project_board.loop import drive as drive_mod
 
 from test_timeout_decompose_378 import _CARD, _SplitStore, _TIMEOUT, _blocks, _timing_out_board
@@ -31,7 +34,9 @@ class _LedgerStore(_SplitStore):
         self.calls.append(("record_work_location", fid, dict(entry)))
         if self._fail:
             raise RuntimeError("ledger is down")
-        self.locations.setdefault(fid, []).append(dict(entry))
+        entries = self.locations.setdefault(fid, [])
+        entries[:] = [e for e in entries if e["id"] != entry["id"]]
+        entries.append(work_locations.validate(entry))
         return self.list_work_locations(fid)
 
     def list_work_locations(self, fid):
@@ -162,7 +167,7 @@ async def test_the_tail_is_capped(monkeypatch, tmp_path):
     assert reason.count("x") <= coder_seam.TIMEOUT_TAIL_CAP
 
 
-def test_the_tail_comes_from_the_timed_out_gen(monkeypatch):
+def test_the_tail_comes_from_the_timed_out_gen():
     """A max-mode sibling that failed fast must not speak for the candidate that timed out."""
     fid = "bd-tail"
     coder_seam.progress_new_run(fid)
@@ -200,3 +205,35 @@ async def test_a_failed_record_still_escalates(monkeypatch, tmp_path):
     loop, dispatched = _board(monkeypatch, store, {"coders": {"smart": "a", "reasoning": "b"}}, wt)
     await loop._drive(_CARD)
     assert store.escalated and dispatched[:2] == ["a", "b"]
+
+
+@pytest.mark.parametrize("discarded", [True, False])
+async def test_timeout_location_is_retired_only_when_discarded(monkeypatch, tmp_path, discarded):
+    wt, sha = _git_tree(tmp_path)
+    store = _LedgerStore()
+    loop, _ = _board(monkeypatch, store, {"coder": "proto"}, wt)
+
+    async def discard(repo, path, branch, **kwargs):
+        # The live entry must exist before cleanup starts.
+        (entry,) = store.list_work_locations("bd-1")["entries"]
+        assert entry["path"] == wt and not entry.get("retired")
+        if discarded:
+            shutil.rmtree(path)
+        return discarded, None
+
+    monkeypatch.setattr(worktree, "discard_worktree", discard)
+    await loop._drive(_CARD)
+    (entry,) = store.list_work_locations("bd-1")["entries"]
+    assert bool(entry.get("retired")) is discarded
+    assert entry["path"] == wt and entry["sha"] == sha
+    assert entry["branch"] == "feat/bd-1"
+
+    if discarded:
+        monkeypatch.setattr(store, "list_features", lambda: [{"id": "bd-1", "board_state": "blocked"}])
+        monkeypatch.setattr(work_location_sweep, "approved_roots", lambda: [tmp_path])
+        monkeypatch.setattr(
+            work_location_sweep, "probe", lambda *a, **kw: pytest.fail("discarded tree must not be probed")
+        )
+        notices = []
+        work_location_sweep.Sweep().check(store, lambda *a, **kw: notices.append(a))
+        assert notices == []
