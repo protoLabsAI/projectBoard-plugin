@@ -80,7 +80,13 @@ def test_the_helper_prompt_carries_the_rules_that_went_wrong_by_hand():
     # The same card twice.
     assert "Look for an existing card first" in prompt and "EXISTING" in prompt
     # An issue closed while it still had slices; a closing line without the `#`.
-    assert "Only the LAST one closes the issue" in prompt
+    assert "only the last slice carries `source_issue`" in prompt
+    # First live batch (2026-11-22): three helpers split an issue but left the original wide
+    # card in place, unchained and still over the cap; five cards named CHANGELOG.md in a
+    # repo that only accepts changelog.d/ fragments.
+    assert "The card you already made" in prompt and "becomes the LAST slice" in prompt
+    assert "Every slice `depends_on` the one before it" in prompt
+    assert "never the top-level `CHANGELOG.md`" in prompt
     assert "`owner/repo#N`, with the `#`" in prompt
     # The lead orders cards across issues from these lines.
     assert "FILES <id>" in prompt
