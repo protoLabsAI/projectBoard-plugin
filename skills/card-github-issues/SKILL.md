@@ -42,6 +42,10 @@ in the background. You keep the three things that need the whole picture.
 
 More than eight issues: send them in batches of eight, the next batch when one reports back.
 
+If every helper fails at startup with the same error (a model the host cannot run, a tool
+that is not bound), do not card the issues in your own thread instead. Say what failed, once,
+and ask the operator with `request_decision`.
+
 ## 2. When the helpers report back
 
 Each returns a few lines: `CARD <id> | ready_check: … | <title>`, a `FILES <id>: …` line per

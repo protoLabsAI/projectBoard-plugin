@@ -186,7 +186,12 @@ CARD_WRITER_CONFIG = SubagentConfig(
         "other issues, or writes code. Run one per issue, in the background, via the "
         "`card-github-issues` skill."
     ),
-    model=_MODEL,
+    # No pinned model. `_MODEL` is a gateway alias, and a host on a native subscription
+    # (anthropic-oauth, openai-codex) refuses it: on its first live run every helper stopped
+    # at startup. Unpinned, it follows the turn's model, then `routing.aux_model`, then the
+    # host's main model. An operator who wants a stronger writer sets
+    # `subagents.board_card_writer.model` to a model id their host can run.
+    model="",
     tools=CARD_WRITER_TOOLS,
     max_turns=40,
     system_prompt="""You are the board's **card writer**. You are given ONE GitHub issue and
@@ -212,17 +217,25 @@ anything ready, and you do not look at other issues.
      able to build from it.
    - `acceptance_criteria`: testable. Name the trigger and the observable result.
    - `files_to_modify`: comma-separated paths that exist in the repo, with ` (new)` after any
-     file the card creates. Include the test file and the changelog entry if the repo uses one.
+     file the card creates. Include the test file.
+   - The changelog entry: look at how the repo records changes before naming a file. Where
+     it has a fragments directory (`changelog.d/`, `.changeset/`), the card lists a NEW
+     fragment there, named the way its README says, and never the top-level `CHANGELOG.md`:
+     such repos reject a direct edit. List `CHANGELOG.md` only when there is no such directory.
    - `source_issue`: `owner/repo#N`, with the `#`. The board writes the closing line from it.
    - `project`: the one you were given.
    - `difficulty`: small, medium or large.
 5. **Repair what the dry run reports.** The reply's `ready_check` lists what stops Ready.
    Fix it with `board_update_feature`, then `board_check_ready` until it is clean or you have
    tried three times. Do not use `force`.
-6. **Split only when the gate says the card is too broad.** Then create several cards, each
-   under the cap, titled `… (Refs #N, k of n)` in the order they must build, each
-   `depends_on` the one before it. Only the LAST one closes the issue: its title ends
-   `(Fixes #N, last slice)` and it alone carries `source_issue`.
+6. **Split only when the gate says the card is too broad.** The card you already made
+   becomes the LAST slice; do not leave it as it was. Create the earlier slice(s) as new
+   cards titled `… (Refs #N, k of n)`, in the order they must build. Then cut the original
+   down with `board_update_feature`: remove the files and acceptance criteria the earlier
+   slices now cover, get it under the cap, set its `depends_on` to the slice before it, and
+   end its title `(Fixes #N, last slice)`. Every slice `depends_on` the one before it, no two
+   slices list the same file as `(new)`, and only the last slice carries `source_issue`.
+   Finish by running `board_check_ready` on every slice.
 
 ## What you never do
 
