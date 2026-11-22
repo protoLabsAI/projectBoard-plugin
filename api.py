@@ -1672,7 +1672,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
                 base=base,
                 root=root,
                 fid=fid,
-                dispatch_timeout=float((cfg or {}).get("coder_timeout_s", 1800)) or None,
+                # #753: the card's own coder time budget, when it carries one.
+                dispatch_timeout=float(f.get("coder_timeout_s") or (cfg or {}).get("coder_timeout_s", 1800)) or None,
                 test_cmd=test_cmd,
                 test_timeout=float((cfg or {}).get("coder_solve_test_timeout_s", 300)),
                 budget=max(1, int((cfg or {}).get("coder_solve_budget", 6))),

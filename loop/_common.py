@@ -97,6 +97,7 @@ from ..store import (
     _all_items_disposed,
     apply_requirement_dispositions,
     budgets_from_labels,
+    coder_timeout_from_labels,
     escalation_enabled,
     get_store,
     knob_bool,
@@ -2315,6 +2316,11 @@ _BUDGET_KINDS: dict[str, str] = {
     # a loop restart, or an oversized card resets to zero every reload and never reaches the
     # threshold that asks for a decomposition.
     "timeout": "_timeout_attempts",
+    # #753: the raised coder timeout (milliseconds) a card earned with its FIRST timeout —
+    # 1.5x the budget that expired, granted once per card. 0/absent = never raised. Durable
+    # for the same reason as `timeout`: a restart must neither forget the raise nor grant a
+    # second one. Not reset by a review pass or an unblock (only the terminal edges clear it).
+    "timeout-raise-ms": "_timeout_raise_ms",
     "unblock-retry": "_unblock_retries",
     "ledger-only": "_ledger_only_attempts",
 }
@@ -2459,6 +2465,7 @@ __all__ = [
     "_all_items_disposed",
     "apply_requirement_dispositions",
     "budgets_from_labels",
+    "coder_timeout_from_labels",
     "escalation_enabled",
     "get_store",
     "knob_bool",
