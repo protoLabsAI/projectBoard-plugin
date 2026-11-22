@@ -155,6 +155,7 @@ REAL_SEAMS = {
     "worktree.open_pr_heads": _worktree_mod.open_pr_heads,
     "worktree.active_workflow_runs": _worktree_mod.active_workflow_runs,
     "worktree.untagged_release_head": _worktree_mod.untagged_release_head,
+    "worktree.pr_head_branch": _worktree_mod.pr_head_branch,
     "worktree.refresh_base_checkout": _worktree_mod.refresh_base_checkout,
     "worktree.pr_review_state": _worktree_mod.pr_review_state,
     "worktree.pr_unresolved_threads": _worktree_mod.pr_unresolved_threads,
@@ -194,6 +195,14 @@ def _no_publish_gate_network(monkeypatch):
     monkeypatch.setattr(_worktree_mod, "open_pr_heads", _no_prs)
     monkeypatch.setattr(_worktree_mod, "active_workflow_runs", _no_runs)
     monkeypatch.setattr(_worktree_mod, "untagged_release_head", _no_release_gap)
+
+    # #716: a legacy card's branch resolves from its PR head. The unit tier never asks
+    # gh: the read "fails", so the drive names the branch from the title exactly as
+    # before (and records nothing). tests/test_branch_identity_716.py restores the seam.
+    async def _no_pr_head(_pr_url="", *, cwd="."):
+        return ""
+
+    monkeypatch.setattr(_worktree_mod, "pr_head_branch", _no_pr_head)
 
     # #487: the CI reconcile reruns a red PR's failed Actions jobs before a fix round. The
     # unit tier never asks GitHub to rerun anything: by default nothing is rerun, so every

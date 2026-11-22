@@ -831,21 +831,104 @@ def slugify(title: str, max_len: int = 40) -> str:
     return s
 
 
-def branch_name(fid: str, title: str = "") -> str:
+def branch_name(fid: str, title: str = "", *, slug: str | None = None) -> str:
     """The git branch for a feature build: ``feat/<fid>-<slug>`` (#227), or the bare
     ``feat/<fid>`` when the title slugs to nothing. The ``<fid>`` is the machine key at
     the front — every recovery/parsing path keys off it; the ``-<slug>`` is human sugar
-    for reviewers reading a branch list."""
-    slug = slugify(title)
+    for reviewers reading a branch list. A recorded ``slug`` (#716) wins over the title."""
+    slug = slugify(title) if slug is None else slug
     return f"feat/{fid}-{slug}" if slug else f"feat/{fid}"
 
 
-def worktree_dir(fid: str, title: str = "") -> str:
+def worktree_dir(fid: str, title: str = "", *, slug: str | None = None) -> str:
     """The per-feature worktree directory basename — ``feat-<fid>-<slug>`` (#227), or the
     bare ``feat-<fid>`` when the title slugs to nothing. Mirrors ``branch_name`` (``/`` →
     ``-``) so a worktree dir and its branch share the same ``<fid>-<slug>`` tail."""
-    slug = slugify(title)
+    slug = slugify(title) if slug is None else slug
     return f"feat-{fid}-{slug}" if slug else f"feat-{fid}"
+
+
+def is_branch_slug(slug) -> bool:
+    """Is ``slug`` a value ``slugify`` could have produced — ``[a-z0-9-]`` with no leading,
+    trailing or doubled hyphen, at most 40 chars, or ``""``? Exactly the values for which
+    ``slugify(slug) == slug``, so a recorded slug can stand in wherever a title is slugged."""
+    return isinstance(slug, str) and slugify(slug) == slug
+
+
+def slug_from_head(fid: str, head: str) -> str | None:
+    """The slug of a PR head branch named ``feat/<fid>-<slug>`` (or the bare ``feat/<fid>``
+    → ``""``) — ``None`` for a head that is not this card's canonical shape."""
+    head = (head or "").strip()
+    if head == f"feat/{fid}":
+        return ""
+    prefix = f"feat/{fid}-"
+    if head.startswith(prefix) and is_branch_slug(head[len(prefix) :]) and head[len(prefix) :]:
+        return head[len(prefix) :]
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class BranchIdentity:
+    """Which branch (and worktree dir) a card builds on (#716), and where that came from.
+
+    ``slug`` slugs to itself, so it can be passed anywhere a ``title`` is slugged onto the
+    branch/dir tail and names the same branch. ``source`` is ``"recorded"`` (the card's
+    `slug:` label), ``"pr"`` (a legacy card's PR head — record it), ``"title"`` (a card
+    whose branch was never named — record it) or ``"fallback"`` (a legacy card whose PR
+    head could not be read: today's title-derived name, and nothing is recorded)."""
+
+    branch: str
+    worktree_dir: str
+    slug: str
+    source: str
+
+    @property
+    def should_record(self) -> bool:
+        return self.source in ("pr", "title")
+
+
+async def pr_head_branch(pr_url: str, *, cwd: str = ".") -> str:
+    """The PR's head branch name (``headRefName``) — ``""`` when gh fails, times out or is
+    missing. Never raises: the branch resolver falls back to the title on ``""``."""
+    if not pr_url:
+        return ""
+    try:
+        rc, out, _err = await _gh_read(
+            _gh("pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName", cwd=cwd)
+        )
+    except (WorktreeError, OSError):
+        return ""
+    return out.strip() if rc == 0 else ""
+
+
+async def resolve_branch(feature: dict, *, cwd: str = ".") -> BranchIdentity:
+    """THE branch a card builds and fixes on (#716): its recorded slug when it has one,
+    else the name its current title gives — so a rename never moves an existing branch.
+
+    A legacy card (a PR but no recorded slug) takes its slug from the PR's head branch
+    (``feat/<fid>-<slug>``); when that read fails or names some other shape it falls back
+    to the title-derived name with ``source="fallback"``, so the caller records nothing
+    and a later round can still read the PR. Never raises and never blocks a dispatch."""
+    fid = str(feature.get("id") or "")
+    title = str(feature.get("title") or "")
+    recorded = feature.get("branch_slug")
+    if is_branch_slug(recorded):
+        slug, source = recorded, "recorded"
+    elif feature.get("pr_url"):
+        head = await pr_head_branch(str(feature.get("pr_url") or ""), cwd=cwd)
+        from_head = slug_from_head(fid, head)
+        if from_head is not None:
+            slug, source = from_head, "pr"
+        else:
+            log.warning(
+                "[project_board] %s: could not read its PR's head branch (%r) — naming the branch from its title",
+                fid,
+                head,
+            )
+            slug, source = slugify(title), "fallback"
+    else:
+        slug, source = slugify(title), "title"
+    return BranchIdentity(branch_name(fid, slug=slug), worktree_dir(fid, slug=slug), slug, source)
 
 
 async def base_checkout_dirt(repo: str, base: str = "") -> str:

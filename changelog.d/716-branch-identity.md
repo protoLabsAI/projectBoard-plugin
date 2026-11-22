@@ -1,0 +1,1 @@
+- **Renaming a card no longer opens a second PR.** The board now records a card's branch the first time it names it (a `slug:` label) and every later build and fix round reuses it, so a card renamed after its PR opened is fixed on the PR reviewers are already reading. Cards built before this change take the name from their PR's head branch on their next fix round (Refs #716).

@@ -2204,6 +2204,32 @@ class DriveMixin(HostDiskMixin):
             return
         log.info("[project_board] %s %s delivered (%d chars) → in_review", fid, kind, chars)
 
+    async def _branch_title(self, store, feature: dict, repo: str) -> str:
+        """The value to slug onto this card's branch/dir tail (#716) — every
+        ``create_worktree`` / recovery helper the build and fix round call takes it as
+        ``title``. The branch is named ONCE: a card with a recorded slug (or a legacy card
+        whose PR head names it) keeps that branch across a rename, because a slug slugs to
+        itself and so names the same branch/dir. A card with no recorded slug records the
+        one its current title gives; a legacy card whose PR head can't be read keeps
+        today's title-derived name and records nothing (``worktree.resolve_branch``)."""
+        ident = await worktree.resolve_branch(feature, cwd=repo)
+        if ident.should_record:
+            await self._record_branch_slug(store, feature["id"], ident.slug)
+        if ident.source in ("recorded", "pr"):
+            return ident.slug
+        return feature.get("title") or ""
+
+    async def _record_branch_slug(self, store, fid: str, slug: str) -> None:
+        """Record the card's branch slug (#716) — best-effort: a `br` hiccup (or a store
+        without the method) costs only the record, and the next drive records it then."""
+        record = getattr(store, "record_branch_slug", None)
+        if not callable(record):
+            return
+        try:
+            await asyncio.to_thread(record, fid, slug)
+        except Exception:  # noqa: BLE001 — never block a dispatch on the record
+            log.warning("[project_board] %s: could not record its branch slug %r", fid, slug, exc_info=True)
+
     def _record_bg(self, fid: str, label: str, fn, *args, **kwargs) -> None:
         """Run one store write-back on a worker thread WITHOUT awaiting it (#258) —
         the offload for coder_seam's ``record_gens``/``record_verified`` callbacks,
@@ -2286,7 +2312,9 @@ class DriveMixin(HostDiskMixin):
         # since siblings ship during the coding run.
         refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, store, feature)
         title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
-        raw_title = feature.get("title") or ""  # #227: slugged onto the branch/dir tail
+        # #227: slugged onto the branch/dir tail — #716: the card's RECORDED branch tail,
+        # so a rename after the PR opened still resumes the PR's branch.
+        raw_title = await self._branch_title(store, feature, repo)
         tier = (await asyncio.to_thread(store.current_tier, fid)) if escalation_on else ""
         retries = 0  # transient-failure retries at the current tier (reset on a climb)
         # Which sibling of the current rung to use. Seeded from a per-process counter so
@@ -2682,7 +2710,9 @@ class DriveMixin(HostDiskMixin):
                     elif self.max_mode_n > 1 and not self._ci_feedback.get(fid) and not feature.get("pr_url"):
                         coder_seam.progress_new_run(fid)  # fresh build → fresh monitor (#84)
                         wt, branch, result = await self._dispatch_captured(
-                            self._dispatch_max_mode(feature, coder, prompt, repo, base, fid, tier)
+                            self._dispatch_max_mode(
+                                feature, coder, prompt, repo, base, fid, tier, branch_title=raw_title
+                            )
                         )
                         self._inflight[fid] = (repo, wt, branch)
                     else:
@@ -4859,7 +4889,16 @@ class DriveMixin(HostDiskMixin):
         return passing[j] if j is not None else passing[0]
 
     async def _dispatch_max_mode(
-        self, feature: dict, coder, prompt: str, repo: str, base: str, fid: str, tier: str = ""
+        self,
+        feature: dict,
+        coder,
+        prompt: str,
+        repo: str,
+        base: str,
+        fid: str,
+        tier: str = "",
+        *,
+        branch_title: str | None = None,
     ) -> tuple[str, str, str]:
         """Max-Mode (#21): build the feature N ways in parallel and ship the best diff.
 
@@ -4936,7 +4975,13 @@ class DriveMixin(HostDiskMixin):
         log.info("[project_board] %s max-mode: candidate %d/%d wins → promoting", fid, idx, n)
         win_wt, win_branch = cands[idx]
         canon_wt, canon_branch = await worktree.promote_worktree(
-            repo, win_wt, win_branch, fid, self.root, title=feature.get("title") or ""
+            repo,
+            win_wt,
+            win_branch,
+            fid,
+            self.root,
+            # #716: the card's resolved branch tail, so the promoted branch is the recorded one
+            title=(feature.get("title") or "") if branch_title is None else branch_title,
         )
         # Discard the losers (the winner was moved out of its candidate name by promote).
         for i, (wt, branch) in enumerate(cands):

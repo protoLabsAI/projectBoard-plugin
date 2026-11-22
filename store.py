@@ -838,6 +838,16 @@ LABEL_VERIFIED_PREFIX = "verified:"
 # rebuilding fresh. It only ever resumes work INTO a coder — it publishes nothing.
 # Cleared when the card opens a PR, is cancelled, or the record fails recovery's checks.
 LABEL_STRANDED_PREFIX = "stranded:"
+# Branch identity (#716) — `slug:<slug>`, recorded ONCE, the first time the loop names
+# the card's branch, and never replaced. A card's branch is `feat/<id>-<slug>`; deriving
+# the slug from the CURRENT title meant a rename after the PR opened pointed the fix round
+# at a branch that does not exist, so it rebuilt off base and opened a second PR. Only the
+# SLUG rides the label: `worktree.slugify` yields `[a-z0-9-]` capped at 40 chars, so it has
+# no `/` (which beads rejects) and `slug:` + 40 fits beads' 50-char label cap. An empty
+# value (`slug:`) records the bare `feat/<id>` shape of a title that slugged to nothing.
+LABEL_BRANCH_SLUG_PREFIX = "slug:"
+_BRANCH_SLUG_RE = re.compile(r"^(?:[a-z0-9]+(?:-[a-z0-9]+)*)?$")
+_BRANCH_SLUG_MAX = 40
 STRANDED_RESUME_PREFIX = "stranded resume:"
 # In-review VERDICT currency (#131) — `merged-verified:<sha>`, replaced (never
 # accumulated) each time the merge-poll reconciler re-runs the gate against the
@@ -5108,6 +5118,27 @@ class BeadsBoard:
         self.comment(fid, f"verified candidate: branch={branch} sha={sha} worktree={worktree}")
         return self.get_feature(fid)
 
+    def record_branch_slug(self, fid: str, slug: str) -> dict:
+        """Record the card's branch slug (#716) — the `slug:<slug>` label, written once.
+
+        Idempotent, and never overwrites: a card that already carries a `slug:` label keeps
+        it (whatever value is offered) and nothing is written, because the branch it names
+        is the one its PR, worktree and pushed commits live on. A value that is not a valid
+        slug (``[a-z0-9-]``, at most 40 chars) raises ``BoardError`` rather than landing a
+        label no branch could be rebuilt from."""
+        slug = str(slug or "")
+        if len(slug) > _BRANCH_SLUG_MAX or not _BRANCH_SLUG_RE.match(slug):
+            raise BoardError(f"not a branch slug: {slug!r}")
+        f = self._require(fid)
+        if any(str(l).startswith(LABEL_BRANCH_SLUG_PREFIX) for l in f.get("labels") or []):
+            return f
+        args = ["update", fid]
+        args += replace_prefixed_label_args(
+            f.get("labels"), LABEL_BRANCH_SLUG_PREFIX, f"{LABEL_BRANCH_SLUG_PREFIX}{slug}"
+        )
+        self._run(*args)
+        return self.get_feature(fid)
+
     def clear_verified_candidate(self, fid: str) -> dict:
         """Drop the `verified:` salvage record — the crash window it covers has closed
         (the PR opened) or the record failed its recovery checks (worktree/sha drift),
@@ -5898,6 +5929,12 @@ class BeadsBoard:
             (l[len(LABEL_VERIFIED_PREFIX) :] for l in labels if l.startswith(LABEL_VERIFIED_PREFIX)),
             "",
         )
+        # The recorded branch slug (#716): None when the card has none yet (its branch is
+        # still named from the current title), "" for the recorded bare `feat/<id>` shape.
+        branch_slug = next(
+            (str(l)[len(LABEL_BRANCH_SLUG_PREFIX) :] for l in labels if str(l).startswith(LABEL_BRANCH_SLUG_PREFIX)),
+            None,
+        )
         # The shutdown-resume record: the tip of the `stranded/…` branch a shutdown saved
         # this card's mid-dispatch work to, from the single replaced `stranded:<sha>` label
         # — "" when none. Its branch name is read from the comments below.
@@ -6044,6 +6081,9 @@ class BeadsBoard:
             "budgets": budgets_from_labels(labels),
             # Operator-notification markers (#341): the alert kinds already delivered to a
             "verified_sha": verified_sha,
+            # The card's recorded branch slug (#716) — None until the loop first names its
+            # branch; worktree.resolve_branch reads it so a rename never moves the branch.
+            "branch_slug": branch_slug,
             # Where a shutdown saved this card's mid-dispatch work (only `br show` carries
             # the comment, so a `br list` row projects `stranded_ref` as "").
             "stranded_sha": stranded_sha,
