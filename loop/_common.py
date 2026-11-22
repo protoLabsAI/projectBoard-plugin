@@ -47,6 +47,7 @@ import sys
 import threading
 import time
 import types
+from collections.abc import Callable
 
 from .. import (
     _TERMINAL_STATES,
@@ -614,7 +615,51 @@ def _carries_quote(evidence: str) -> bool:
     return bool(rest.strip())
 
 
-def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
+def repo_file_checker(root: str | os.PathLike | None) -> Callable[[str], bool] | None:
+    """An existence check for ``partition_by_grounding`` resolving paths against ``root``
+    — the PR's project checkout, never the host's cwd (#843).
+
+    None (no foreign-file demotion) when ``root`` is unknown or is not a directory on
+    this machine: a checkout we cannot read cannot prove a file absent. The returned
+    check treats an absolute path, or one whose normalized form escapes the root via
+    ``..``, as NOT in the repository."""
+    if not root:
+        return None
+    base = os.path.realpath(os.fspath(root))
+    if not os.path.isdir(base):
+        return None
+
+    def exists(path: str) -> bool:
+        rel = str(path or "").strip()
+        if not rel or os.path.isabs(rel) or rel.startswith(("/", "\\")):
+            return False
+        norm = os.path.normpath(rel)
+        if norm == ".." or norm.startswith(".." + os.sep) or os.path.isabs(norm):
+            return False
+        return os.path.lexists(os.path.join(base, norm))
+
+    return exists
+
+
+def is_foreign_file_finding(f, diff: str, file_exists: Callable[[str], bool] | None) -> bool:
+    """Does ``f`` cite a file outside the PR's repository (#843)? True only when its
+    ``file`` is non-empty, absent from ``diff`` (a file the PR adds is named there, so
+    it is never foreign) and ``file_exists`` says the checkout lacks it. False whenever
+    no check is supplied, so callers without one keep the #819 pass-through."""
+    if file_exists is None:
+        return False
+    path = str(getattr(f, "file", "") or "")
+    if not path or path in diff:
+        return False
+    try:
+        return not file_exists(path)
+    except Exception:  # noqa: BLE001 — an unreadable check must not demote a finding
+        return False
+
+
+def partition_by_grounding(
+    findings: list, diff: str, file_exists: Callable[[str], bool] | None = None
+) -> tuple[list, list]:
     """``(grounded, ungrounded)`` for ``findings`` against ``diff``.
 
     Two pass-throughs, both for findings that legitimately quote something `gh pr diff`
@@ -627,13 +672,20 @@ def partition_by_grounding(findings: list, diff: str) -> tuple[list, list]:
 
     Attributes are read defensively: the ``Finding`` shape comes from the HOST
     (``graph.review.findings``, imported lazily by ``_parse_findings``), so an older host
-    may not carry every field this plugin knows about."""
+    may not carry every field this plugin knows about.
+
+    ``file_exists`` (#843), when given, narrows the first pass-through: a finding whose
+    ``file`` is absent from the diff AND absent from the PR's repository (see
+    ``is_foreign_file_finding``) is ungrounded — the coder cannot fix a file that is not
+    in the repo they are working in. Without it, behavior is unchanged."""
     grounded, ungrounded = [], []
     for f in findings:
         path = str(getattr(f, "file", "") or "")
         category = str(getattr(f, "category", "") or "").strip().lower()
         evidence = str(getattr(f, "evidence", "") or "")
-        if path and path not in diff:
+        if is_foreign_file_finding(f, diff, file_exists):
+            ungrounded.append(f)
+        elif path and path not in diff:
             grounded.append(f)
         elif category == _CROSS_FILE_CATEGORY:
             # The quote can come from an untouched file, so it is never matched against
@@ -2393,6 +2445,8 @@ __all__ = [
     "_GROUNDING_DIFF_MAX_CHARS",
     "evidence_is_grounded",
     "partition_by_grounding",
+    "is_foreign_file_finding",
+    "repo_file_checker",
     "_LEDGER_ONLY_MAX",
     "rung_delegates",
     "rotation_target",
