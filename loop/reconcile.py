@@ -4533,7 +4533,40 @@ class ReconcileMixin(WorktreeCleanup):
                 log.warning("[project_board] %s grounding diff timed out — review remains pending", fid)
                 return
         if blocking and not full_diff.endswith(worktree.DIFF_TRUNCATED_MARKER):
-            blocking, ungrounded = partition_by_grounding(blocking, full_diff)
+            # #843: the reviewer runs on the HOST checkout, so it can cite host files the
+            # PR's repo does not have. Existence resolves against the project checkout the
+            # diff came from (`repo`), never the host cwd; an unknown checkout demotes nothing.
+            file_exists = repo_file_checker(repo)
+            blocking, ungrounded = partition_by_grounding(blocking, full_diff, file_exists)
+            foreign = [f for f in ungrounded if is_foreign_file_finding(f, full_diff, file_exists)]
+            ungrounded = [f for f in ungrounded if not any(f is g for g in foreign)]
+            for f in foreign:
+                # Same demotion as an ungrounded quote (set before `_review_prior` is
+                # serialized), but its own wording: the coder cannot edit a file that is
+                # not in the repository they are working in.
+                f.verdict = "uncertain"
+                log.warning(
+                    "[project_board] %s review finding NOT blocking — its file is not in this "
+                    "repository (%s:%s %s): %s",
+                    fid,
+                    f.file,
+                    f.line,
+                    f.severity,
+                    f.claim,
+                )
+            if foreign:
+                # Hand-rendered for the same reason as the ungrounded comment below: no
+                # `_REVIEW_FINDINGS_TITLE`, so recovery never reads it back as blocking.
+                try:
+                    await asyncio.to_thread(
+                        store.comment,
+                        fid,
+                        f"review gate: {len(foreign)} finding(s) demoted to non-blocking — the cited "
+                        f"file is not in this repository, so no fix round can address it:\n"
+                        + "\n".join(f"- {f.file}:{f.line} [{f.severity}] {f.claim}" for f in foreign),
+                    )
+                except Exception:  # noqa: BLE001 — bookkeeping must not fail the gate
+                    log.warning("[project_board] %s foreign-file-finding comment failed", fid, exc_info=True)
             for f in ungrounded:
                 # ADR 0077's own word for a quote that cannot be grounded. Set BEFORE
                 # `_review_prior` is serialized below so the demotion rides into the next
