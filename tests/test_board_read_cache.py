@@ -116,12 +116,23 @@ def test_real_board_concurrent_creates_and_default_listings(monkeypatch, tmp_pat
         response = listing.result(timeout=10)
         assert first["id"] in _ids(response.json())
         known = {first["id"], second["id"]}
+        # Every later listing is slow as well (the drive loop holds the `br` lock for
+        # longer than STALE_WAIT_S): a listing that begins after a create still has it.
+        release.clear()
         for index in range(3):
             before = set(known)
             create = pool.submit(board.create_feature, f"Concurrent {index}")
-            response = client.get(BASE + "/features")
+            listing = pool.submit(client.get, BASE + "/features")
+            time.sleep(0.05)
+            release.set()
+            response = listing.result(timeout=10)
+            release.clear()
+            assert response.status_code == 200
             assert before <= set(_ids(response.json()))
             known.add(create.result(timeout=10)["id"])
+        release.set()
+        final = client.get(BASE + "/features")
+        assert known <= set(_ids(final.json()))
 
 
 # ── the routes ──────────────────────────────────────────────────────────────────
@@ -251,8 +262,8 @@ def test_an_unusable_board_still_reads_as_json_400(monkeypatch):
 # ── the cache itself ────────────────────────────────────────────────────────────
 
 
-def _cache(load, token=lambda: 0):
-    return read_cache.BoardReadCache(load, token)
+def _cache(load, token=lambda: 0, created=None):
+    return read_cache.BoardReadCache(load, token, created)
 
 
 def test_cache_single_flights_concurrent_cold_reads():
@@ -344,10 +355,58 @@ def test_invalid_store_listing_does_not_replace_nonempty_snapshot(monkeypatch, t
     assert cache._entries[False].rows == [{"id": "existing"}]
 
 
-@pytest.mark.parametrize("rows", [[], [{"id": "old", "board_state": "done"}]])
-def test_snapshot_without_open_work_waits_for_refresh(monkeypatch, rows):
-    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.001)
+_NO_OPEN_WORK = [[], [{"id": "old", "board_state": "done"}]]
+
+
+@pytest.mark.parametrize("rows", _NO_OPEN_WORK)
+def test_snapshot_without_open_work_is_still_served_stale_when_the_refresh_is_slow(monkeypatch, rows):
+    """A board with nothing open keeps the bounded wait: its reader never queues behind
+    the drive loop's `br` lock for an ordinary write."""
+    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.01)
     revision = [0]
+    release = threading.Event()
+
+    def load(_):
+        if revision[0]:
+            assert release.wait(5)
+        return list(rows)
+
+    cache = _cache(load, lambda: revision[0], lambda: 0)
+    assert cache.snapshot().rows == rows
+    revision[0] += 1
+    try:
+        t0 = time.monotonic()
+        snap = cache.snapshot()
+        assert snap.stale and snap.rows == rows
+        assert time.monotonic() - t0 < 2
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("rows", _NO_OPEN_WORK)
+def test_snapshot_without_open_work_is_still_served_stale_when_the_refresh_stalls(rows):
+    """A stalled `br` is not a 503 for a board with nothing open (and never caches [])."""
+    revision = [0]
+
+    def load(_):
+        if revision[0]:
+            raise BoardTimeout("`br list` timed out")
+        return list(rows)
+
+    cache = _cache(load, lambda: revision[0], lambda: 0)
+    assert cache.snapshot().rows == rows
+    revision[0] += 1
+    snap = cache.snapshot()
+    assert snap.stale and snap.rows == rows
+    assert cache._entries[False].rows == rows
+
+
+@pytest.mark.parametrize("rows", _NO_OPEN_WORK + [[{"id": "open", "board_state": "ready"}]])
+def test_snapshot_from_before_a_create_is_not_served_while_the_refresh_is_slow(monkeypatch, rows):
+    """#820: a listing that starts after a create never lacks the created card because
+    the refresh was slow — whatever the previous snapshot held."""
+    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.001)
+    revision, created = [0], [0]
     entered = threading.Event()
     release = threading.Event()
 
@@ -355,21 +414,60 @@ def test_snapshot_without_open_work_waits_for_refresh(monkeypatch, rows):
         if revision[0]:
             entered.set()
             assert release.wait(5)
-            return [{"id": "new", "board_state": "backlog"}]
-        return rows
+            return list(rows) + [{"id": "new", "board_state": "backlog"}]
+        return list(rows)
 
-    cache = _cache(load, lambda: revision[0])
+    cache = _cache(load, lambda: revision[0], lambda: created[0])
     assert cache.snapshot().rows == rows
+    created[0] += 1  # the store notes the create, then the revision
     revision[0] += 1
     with ThreadPoolExecutor(max_workers=1) as pool:
         result = pool.submit(cache.snapshot)
         try:
             assert entered.wait(5)
-            time.sleep(0.03)
+            time.sleep(0.05)
             assert not result.done()
         finally:
             release.set()
-        assert result.result(timeout=5).rows[0]["id"] == "new"
+        snap = result.result(timeout=5)
+    assert snap.rows[-1]["id"] == "new" and not snap.stale
+    # The refreshed snapshot knows the create: later slow refreshes are bounded again.
+    release.clear()
+    revision[0] += 1
+    try:
+        again = cache.snapshot()
+        assert again.stale and again.rows[-1]["id"] == "new"
+    finally:
+        release.set()
+
+
+def test_snapshot_from_before_a_create_is_served_marked_stale_when_the_refresh_stalls():
+    """The listing with the new card cannot be read at all: the previous one is served,
+    and it says it is stale rather than answering 503."""
+    revision, created = [0], [0]
+
+    def load(_):
+        if revision[0]:
+            raise BoardTimeout("`br list` timed out")
+        return [{"id": "old", "board_state": "ready"}]
+
+    cache = _cache(load, lambda: revision[0], lambda: created[0])
+    assert not cache.snapshot().stale
+    created[0] += 1
+    revision[0] += 1
+    snap = cache.snapshot()
+    assert snap.stale and [r["id"] for r in snap.rows] == ["old"]
+
+
+@pytest.mark.skipif(shutil.which(BR) is None, reason="real br CLI required")
+def test_real_board_create_moves_the_create_count(tmp_path):
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    board.list_features()
+    before = work_snapshot.cards_created()
+    board.create_feature("Counted")
+    assert work_snapshot.cards_created() == before + 1
+    board.list_features()
+    assert work_snapshot.cards_created() == before + 1  # a read is not a create
 
 
 def test_successful_empty_read_can_replace_previous_snapshot():

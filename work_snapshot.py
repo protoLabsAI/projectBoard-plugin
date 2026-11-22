@@ -101,6 +101,23 @@ def note_board_write() -> None:
         state.revision += 1
 
 
+def note_card_created() -> None:
+    """Record that a card was (or may have been) created by this process. ``BeadsBoard._run``
+    calls it after every ``br create``, beside :func:`note_board_write`. The read cache
+    never answers a listing with a snapshot taken before the newest one (#820): that
+    snapshot lacks an open card, and to a polling client a board with its only open card
+    missing reads as an empty board."""
+    state = _state()
+    with state.lock:
+        # getattr: a holder installed before a plugin reload predates this counter.
+        state.created = getattr(state, "created", 0) + 1
+
+
+def cards_created() -> int:
+    """How many card creates this process has run. Read it BEFORE the listing it guards."""
+    return getattr(_state(), "created", 0)
+
+
 def mark_stale() -> None:
     """Record that what the snapshot RENDERS changed without a board write: a live config
     reload of a knob the hints read (auto_merge, review_gate, …)."""

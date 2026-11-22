@@ -2162,6 +2162,10 @@ class BeadsBoard:
             raise BoardError(f"could not run beads CLI {BR!r}: {exc}") from exc
         finally:
             if args and args[0] in _PROJECTION_WRITES:
+                if args[0] == "create":
+                    # Before the revision moves: a reader that sees the new revision must
+                    # also see that the listing it has cached lacks a card (#820).
+                    work_snapshot.note_card_created()
                 work_snapshot.note_board_write()
             if args and args[0] not in _BR_READS:
                 wait = _BR_WAIT.get()

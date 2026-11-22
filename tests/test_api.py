@@ -227,6 +227,55 @@ def test_features_timeout_fallback_is_marked_stale(monkeypatch):
     assert response.headers["x-board-snapshot"] == "stale"
 
 
+def test_features_with_no_open_cards_survive_a_stalled_refresh(monkeypatch):
+    """A board with nothing open is answered from its previous snapshot, marked stale,
+    when the store stalls — not with a 503."""
+    from project_board import work_snapshot
+    from project_board.store import BoardTimeout
+
+    store = FakeStore()
+    monkeypatch.setattr(store, "list_features", lambda **kwargs: [])
+    client = _client(monkeypatch, store)
+    assert client.get("/api/plugins/project_board/features").json() == {"features": []}
+
+    def failed(**kwargs):
+        raise BoardTimeout("listing timed out")
+
+    monkeypatch.setattr(store, "list_features", failed)
+    work_snapshot.note_board_write()
+    response = client.get("/api/plugins/project_board/features")
+    assert response.status_code == 200
+    assert response.json() == {"features": []}
+    assert response.headers["x-board-snapshot"] == "stale"
+
+
+def test_features_after_a_create_wait_for_the_listing_that_has_it(monkeypatch):
+    """#820: a slow refresh after a create is never answered with the pre-create (here
+    empty) listing, even though that listing would be marked stale."""
+    import time
+
+    from project_board import read_cache, work_snapshot
+
+    store = FakeStore()
+    rows = store.list_features()
+    monkeypatch.setattr(store, "list_features", lambda **kwargs: [])
+    client = _client(monkeypatch, store)
+    assert client.get("/api/plugins/project_board/features").json() == {"features": []}
+
+    def slow(**kwargs):
+        time.sleep(0.2)
+        return rows
+
+    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.01)
+    monkeypatch.setattr(store, "list_features", slow)
+    work_snapshot.note_card_created()  # what `BeadsBoard._run` does after `br create`
+    work_snapshot.note_board_write()
+    response = client.get("/api/plugins/project_board/features")
+    assert response.status_code == 200
+    assert [f["id"] for f in response.json()["features"]] == [r["id"] for r in rows]
+    assert response.headers["x-board-snapshot"] == "fresh"
+
+
 def test_features_failed_first_listing_is_not_success(monkeypatch):
     store = FakeStore()
     monkeypatch.setattr(store, "list_features", lambda **kwargs: None)

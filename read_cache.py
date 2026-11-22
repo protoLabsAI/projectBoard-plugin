@@ -25,8 +25,18 @@ Now the routes read a :class:`BoardReadCache`:
   and the refresh does not land within :data:`STALE_WAIT_S`, the reader gets the previous
   snapshot marked stale (the route says so in ``X-Board-Snapshot``) and the refresh keeps
   running for the next reader. Only the very first read of a board, with nothing cached
-  yet, waits for its listing. An obsolete snapshot with no open work also waits: it
-  must not tell a polling client that the board is empty during a create.
+  yet, waits for its listing.
+- **A card this process created is never missing from a listing (#820).** A snapshot
+  taken before the newest in-process create (``work_snapshot.cards_created``: the loop,
+  a tool, a route) is not served while its refresh is merely slow: the reader waits for
+  the listing that has the card, because a default listing without a board's only open
+  card reads as "the board is empty" to a polling client. If that refresh stalls
+  (``BoardTimeout``) the reader still gets the previous snapshot, marked stale. A create
+  by another process (a hand-run ``br``) is not counted: it is visible within
+  :data:`STALE_WAIT_S` or the listing is marked stale.
+- **A failed or malformed read never replaces a snapshot.** Only a listing that returned
+  a list is cached; a failure is raised to the readers waiting on it and the previous
+  snapshot stays in place.
 - **An API write is never answered with pre-write data.** A write route bumps the epoch
   after it returns (the router's route class does this for every non-GET route), and a
   snapshot taken before the newest API write is never served as stale: the next read waits
@@ -89,6 +99,7 @@ class _Entry:
     epoch: int
     taken_at: float
     lock_wait_s: float = 0.0  # what the listing itself queued for the `br` lock
+    created: Hashable = None  # the create count read before the listing started (#820)
 
 
 @dataclass
@@ -105,12 +116,20 @@ class BoardReadCache:
 
     ``load`` is the store listing (it blocks on ``br``). ``token`` returns the board's
     current change token (it must be cheap: a counter and a few ``stat`` calls). Both run
-    on threads, never on the event loop.
+    on threads, never on the event loop. ``created`` (optional) counts the card creates
+    this process has run: a snapshot from before the newest one is not served while its
+    refresh is only slow (#820).
     """
 
-    def __init__(self, load: Callable[[bool], list], token: Callable[[], Hashable]):
+    def __init__(
+        self,
+        load: Callable[[bool], list],
+        token: Callable[[], Hashable],
+        created: Callable[[], Hashable] | None = None,
+    ):
         self._load = load
         self._token = token
+        self._created = created or (lambda: None)
         self._lock = threading.Lock()
         self._entries: dict[bool, _Entry] = {}
         self._runs: dict[bool, _Run] = {}  # the listing in flight, per kind
@@ -122,6 +141,9 @@ class BoardReadCache:
         """The listing to answer a read from. Blocking (call it off the event loop), but
         bounded by :data:`STALE_WAIT_S` whenever a usable snapshot already exists."""
         key = bool(include_archived)
+        # The create count is read BEFORE the token: a create moves it first, so a reader
+        # can pair an old token with a new count (it then waits), never the reverse.
+        created = self._created()
         token = (self._token(), self._epoch_now())
         with self._lock:
             entry = self._entries.get(key)
@@ -130,33 +152,33 @@ class BoardReadCache:
             run = self._join_or_start(key, token)
             # A snapshot from before the newest API write is never served: the caller (or
             # whoever it is showing the board to) just changed it.
-            # An obsolete snapshot with no open work can falsely tell a polling client
-            # that the board is empty while a create is waiting for its refresh.
-            has_open = entry is not None and any(
-                not isinstance(row, dict) or row.get("board_state") not in {"done", "cancelled"} for row in entry.rows
-            )
-            fallback = entry if has_open and entry.epoch == self._epoch else None
+            previous = entry if entry is not None and entry.epoch == self._epoch else None
+            # A snapshot from before the newest create lacks an open card (#820). It is not
+            # served because the refresh is slow, only when the refresh stalls outright.
+            wait_s = STALE_WAIT_S if previous is not None and previous.created == created else None
         blocked = time.monotonic()
 
-        def _fresh(entry: _Entry) -> Snapshot:
+        def _served(entry: _Entry) -> Snapshot:
             waited = min(time.monotonic() - blocked, entry.lock_wait_s)
+            # The board moved again while this listing ran: it is the newest there is, and
+            # it says it is already out of date.
             stale = entry.token != (self._token(), self._epoch_now())
             return Snapshot(entry.rows, stale=stale, taken_at=entry.taken_at, token=entry.token, waited_s=waited)
 
-        if fallback is None:
-            return _fresh(run.future.result())  # first read, or read-after-write: wait for it
+        if previous is None:
+            return _served(run.future.result())  # first read, or read-after-write: wait for it
         try:
-            entry = run.future.result(timeout=STALE_WAIT_S)
+            entry = run.future.result(timeout=wait_s)
         except FutureTimeout:
-            return Snapshot(fallback.rows, stale=True, taken_at=fallback.taken_at, token=fallback.token)
+            return Snapshot(previous.rows, stale=True, taken_at=previous.taken_at, token=previous.token)
         except Exception as exc:  # noqa: BLE001 — a stalled `br` must not fail a read that has data
             from .store import BoardTimeout
 
             if not isinstance(exc, BoardTimeout):
                 raise
             log.warning("[project_board] board refresh stalled; serving the previous snapshot: %s", exc)
-            return Snapshot(fallback.rows, stale=True, taken_at=fallback.taken_at, token=fallback.token)
-        return _fresh(entry)
+            return Snapshot(previous.rows, stale=True, taken_at=previous.taken_at, token=previous.token)
+        return _served(entry)
 
     # ── writes ────────────────────────────────────────────────────────────────
     def note_write(self) -> None:
@@ -196,6 +218,7 @@ class BoardReadCache:
     def _refresh(self, key: bool, run: _Run) -> None:
         entry = exc = None
         try:
+            created = self._created()  # before the token, as in `snapshot`
             token = (self._token(), self._epoch_now())
             with self._lock:
                 run.token = token
@@ -211,7 +234,14 @@ class BoardReadCache:
                 from .store import BoardError
 
                 raise BoardError("board listing returned an invalid payload; expected a list")
-            entry = _Entry(rows=list(rows), token=token, epoch=token[1], taken_at=started, lock_wait_s=wait.seconds)
+            entry = _Entry(
+                rows=list(rows),
+                token=token,
+                epoch=token[1],
+                taken_at=started,
+                lock_wait_s=wait.seconds,
+                created=created,
+            )
         except BaseException as e:  # noqa: BLE001 — handed to every waiter
             exc = e
         with self._lock:
@@ -380,7 +410,9 @@ def own_cache(board, key: str) -> BoardReadCache:
                 return (work_snapshot.board_revision(), listing_rev(key), routing)
 
             cache = _own[board] = BoardReadCache(
-                lambda include_archived: board.list_features(include_archived=include_archived), _token
+                lambda include_archived: board.list_features(include_archived=include_archived),
+                _token,
+                work_snapshot.cards_created,
             )
         return cache
 
