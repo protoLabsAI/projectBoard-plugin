@@ -705,6 +705,91 @@ def _report_store_wait(t) -> None:
         t.coroutine = _async
 
 
+# board_feature_progress (#769) caps every free-text field it lifts off the monitor buffer:
+# the agent wants "what is it doing now", not the drawer's whole feed.
+_PROGRESS_TEXT_MAX = 240
+
+
+def _cap_text(value, limit: int = _PROGRESS_TEXT_MAX) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _tool_line(row) -> str:
+    """One tool-call row (``current_tool`` / a ``recent_tools`` entry) as a short line:
+    ``"<name> [<status>] <first location>"``."""
+    if not isinstance(row, dict):
+        return ""
+    name = str(row.get("name") or row.get("kind") or "tool")
+    status = str(row.get("status") or "")
+    locs = row.get("locations") or []
+    loc = str(locs[0]) if isinstance(locs, list) and locs else ""
+    return _cap_text(" ".join(p for p in (name, f"[{status}]" if status else "", loc) if p))
+
+
+def _last_line(text) -> str:
+    lines = [ln.strip() for ln in str(text or "").splitlines() if ln.strip()]
+    return _cap_text(lines[-1]) if lines else ""
+
+
+def _progress_summary(gens: list) -> dict:
+    """The agent-facing digest of a ``coder_seam.progress_snapshot`` gens list: the latest
+    gen's stage and last activity, text capped. Reads only what the snapshot carries."""
+    import time
+
+    g = gens[-1] if isinstance(gens[-1], dict) else {}
+    cur = g.get("current_tool") if isinstance(g.get("current_tool"), dict) else None
+    recent = g.get("recent_tools") or []
+    latest = _tool_line(recent[-1]) if recent else ""
+    latest_source = "tool" if latest else ""
+    if not latest:
+        latest = _last_line(g.get("thought_tail")) or _last_line(g.get("answer_tail"))
+        latest_source = "narration" if latest else ""
+    out = {
+        "live": True,
+        "gens": len(gens),
+        "gen": g.get("gen"),
+        "tier": g.get("tier") or "",
+        "elapsed_s": g.get("elapsed_s"),
+        "done": bool(g.get("done")),
+        "current_tool": (
+            {
+                "name": _cap_text(cur.get("name"), 120),
+                "kind": str(cur.get("kind") or ""),
+                "status": str(cur.get("status") or ""),
+                "detail": _cap_text(cur.get("detail") or cur.get("input_preview")),
+            }
+            if cur
+            else None
+        ),
+        "latest_activity": latest,
+        "latest_activity_source": latest_source,
+    }
+    idle = g.get("idle_s")
+    if isinstance(idle, (int, float)):
+        out["idle_s"] = idle
+        # The buffer keeps a monotonic last-event clock and the snapshot exposes the gap
+        # (`idle_s`); now minus that gap is the wall-clock time of the last stream event.
+        out["last_activity_at"] = round(time.time() - float(idle), 1)
+    if g.get("stop_reason"):
+        out["stop_reason"] = _cap_text(g.get("stop_reason"), 120)
+    verify = g.get("verify")
+    if isinstance(verify, dict):
+        out["verify"] = {
+            **({"passed": bool(verify["passed"])} if "passed" in verify else {}),
+            **({"test_cmd": _cap_text(verify["test_cmd"], 160)} if verify.get("test_cmd") else {}),
+        }
+    usage = g.get("usage")
+    if isinstance(usage, dict):
+        out["usage"] = {k: v for k, v in usage.items() if isinstance(v, (int, float, str)) and not isinstance(v, bool)}
+    return out
+
+
+def _assignee_field(f: dict) -> dict:
+    owner = str(f.get("assignee") or "").strip()
+    return {"assignee": owner} if owner else {}
+
+
 def _board_tools(cfg: dict, registry=None):
     from .failures import PREFLIGHT_HOLD_CLASS
     from .projects import default_project as resolve_default_project
@@ -1118,6 +1203,36 @@ def _board_tools(cfg: dict, registry=None):
                 ),
             }
         )
+
+    @tool
+    def board_feature_progress(feature_id: str) -> str:
+        """Read a building card's LIVE coder progress as JSON (#769): `live`, the card's
+        `state` and `assignee`, and for the latest coder gen its `gen`, `tier`, `elapsed_s`,
+        `done`, `current_tool`, `latest_activity` (last tool call or narration line),
+        `idle_s` and `last_activity_at` (epoch seconds of the stream's last event). Use it
+        to decide whether a long-running coder is still working or has stalled. Reads this
+        process's in-memory monitor buffer: no network, no operator bearer, changes
+        nothing. A card with no drive in memory answers `live: false` with a message."""
+        try:
+            f = get_store(**store_kw).get_feature(feature_id)
+        except BoardError as exc:
+            return f"Error: {exc}"
+        if f is None:
+            return f"Error: unknown feature {feature_id!r}"
+        fid = str(f.get("id") or feature_id)
+        state = f.get("board_state") or f.get("state") or ""
+        try:
+            from . import coder_seam
+
+            gens = list((coder_seam.progress_snapshot(fid) or {}).get("gens") or [])
+        except Exception as exc:  # the monitor is best-effort; a read failure is "not live"
+            log.debug("board_feature_progress: progress snapshot for %s failed: %s", fid, exc)
+            gens = []
+        if not gens:
+            return json.dumps(
+                {"id": fid, "state": state, "live": False, "message": "no live drive for this card in this process"}
+            )
+        return json.dumps({"id": fid, "state": state, **_progress_summary(gens), **_assignee_field(f)})
 
     @tool
     def board_record_work_location(feature_id: str, entry: dict) -> str:
@@ -1991,6 +2106,7 @@ def _board_tools(cfg: dict, registry=None):
         board_update_feature,
         board_remove_dependency,
         board_get_feature,
+        board_feature_progress,
         board_comments,
         board_record_work_location,
         board_list_work_locations,
