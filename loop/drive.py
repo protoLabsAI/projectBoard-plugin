@@ -249,12 +249,18 @@ def _held_summary(feats) -> dict:
             # The sweep's own test, per card — never promised for a card it will not touch:
             # one whose auto-retries are spent is escalated, and one blocked in backlog is
             # never moved at all (store.blocked_before_ready).
+            from .reconcile import _review_rate_limit_wait  # lazy: reconcile imports this module
+
             healing = [
                 fid
                 for fid in ids
                 if cls in _SELF_HEALING_BLOCKS
                 and not store_mod.blocked_before_ready(rows[fid])
-                and (rows[fid].get("budgets") or {}).get("unblock-retry", 0) < _UNBLOCK_RETRY_MAX
+                and (
+                    (rows[fid].get("budgets") or {}).get("unblock-retry", 0) < _UNBLOCK_RETRY_MAX
+                    # #776: a review-gate rate-limit wait is retried whatever the budget reads.
+                    or _review_rate_limit_wait(rows[fid], str(rows[fid].get("blocked_reason") or ""))
+                )
             ]
             if cls == PREFLIGHT_HOLD_CLASS:
                 step = PREFLIGHT_HOLD_STEP

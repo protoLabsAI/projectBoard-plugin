@@ -77,7 +77,9 @@ _RULES: tuple[tuple[str, Policy], ...] = (
         # with a new string. `usage credits` covers the Fable phrasing recorded in the board
         # config ("out of usage credits · resets Aug 13"), which had the same gap.
         r"rate.?limit|\b429\b|quota|overloaded|too many requests|capacity"
-        r"|usage ?limit|usagelimitexceeded|usage credits",
+        # `usage_limit_reached` (#776) is the snake_case error type of the same spent
+        # allowance; the underscore keeps `usage ?limit` from catching it.
+        r"|usage ?limit|usagelimitexceeded|usage credits|usage_limit_reached",
         Policy("rate_limit", True, 60.0, 5),
     ),
     (
