@@ -76,6 +76,16 @@ async def _gh_read(what: str, read, *args, **kwargs):
         ) from exc
 
 
+def _legacy_head_slug(feature: dict, facts: dict) -> str | None:
+    """The slug a LEGACY card (no recorded ``branch_slug``, #716) adopts from the PR's head
+    when that head is this card's canonical shape ``feat/<fid>[-<slug>]`` — ``None`` for a
+    card that already recorded its slug, or a head of any other shape. Such a card may have
+    been renamed after its branch was cut, so its title no longer names the branch."""
+    if worktree.is_branch_slug(feature.get("branch_slug")):
+        return None
+    return worktree.slug_from_head(str(feature.get("id") or ""), str(facts.get("head") or ""))
+
+
 async def _github_refusal(feature: dict, facts: dict, pr_url: str, *, repo: str, base: str) -> str:
     """The GitHub half of the attach checks: is ``facts`` (``worktree.pr_identity``) the PR
     the board would find for ``feature`` itself? Returns ``""`` when it is. The state and
@@ -102,8 +112,8 @@ async def _github_refusal(feature: dict, facts: dict, pr_url: str, *, repo: str,
         return f"{facts['url']} was closed without merging — reopen it before attaching it"
     if state != "OPEN":
         return f"{facts['url']} is in state {state!r}, not OPEN"
-    branch = worktree.branch_name(fid, feature.get("title") or "")
-    if facts.get("head") != branch:
+    branch = worktree.branch_name(fid, worktree.branch_title_for(feature))
+    if facts.get("head") != branch and _legacy_head_slug(feature, facts) is None:
         return (
             f"{facts['url']} is on branch {facts.get('head')!r}, not {fid}'s canonical branch — push the work "
             f"to branch {branch!r}, open the PR from it, and attach that PR. Every later board edge (fix rounds, "
@@ -198,6 +208,20 @@ async def attach_external_pr(
             review_pending=review_gate,
             replaces=replaces,
         )
+    adopted = _legacy_head_slug(feature, facts)
+    if adopted is not None:
+        # Best-effort: every later round resolves the branch from this record, and a legacy
+        # card's resolve_branch can still read it off the PR head if the write failed.
+        try:
+            await asyncio.to_thread(store.record_branch_slug, fid, adopted)
+        except Exception as exc:  # noqa: BLE001 — never undo or block the attach
+            log.warning(
+                "[project_board] %s: attached %s but could not record its branch slug %r (%s)",
+                fid,
+                facts["url"],
+                adopted,
+                exc,
+            )
     log.info(
         "[project_board] %s attached external PR %s (was %s) → in_review%s%s",
         fid,
