@@ -799,6 +799,12 @@ happens next. Every sweep, the loop walks the blocked lane:
   comment, alongside “rate-limited until <time>”. Waiting spends no retry. Missing,
   malformed, or unavailable reset data (including older hosts without usage support)
   keeps the existing sweep retry behavior.
+  A block the **review gate** set on an in-review card (its reviewer was rate-limited,
+  or the review could not run) is cleared back to **review**, not requeued: the card
+  keeps `review-pending` and its PR, and the next reconcile reviews it again. No coder
+  is dispatched. A review-gate rate-limit wait spends no auto-retry and is not bounded
+  by the 2-retry cap: the card returns to review after every recorded reset, for as long
+  as the provider keeps limiting the reviewer (#776).
   `oracle-timeout` (#459) is deliberately not one of them. The acceptance command can't
   finish in its budget, and waiting doesn't make it faster.
 - **Everything else, and any card that has spent its retries**, escalates: the operator is

@@ -180,6 +180,29 @@ def _review_gate_block(feature: dict, reason: str) -> bool:
     )
 
 
+def _review_rate_limit_wait(feature: dict, reason: str) -> bool:
+    """True when a blocked card is a review-gate RATE-LIMIT wait with a reset on record:
+    class ``rate-limit``, set by the gate's rate-limit branch (`_review_gate_block` with
+    that lead), and a parseable ``resets-at:``.
+
+    The blocked sweep returns such a card to review after the reset WITHOUT spending an
+    ``unblock-retry`` and whatever that budget already reads (#776 review). The budget
+    bounds a coder that keeps failing; this card has nothing to redo, only a provider
+    window to sit out, and every clear already waited for a recorded reset, so the clears
+    cannot outrun the limit. A limit that outlasts two windows must not leave the card
+    for a hand unblock. A block with no recorded reset is not one of these: it keeps the
+    budgeted path."""
+    lead = str(reason or "").strip()
+    if lead.startswith("blocked:"):
+        lead = lead[len("blocked:") :].lstrip()
+    return bool(
+        str(feature.get("blocked_class") or "").strip() == "rate-limit"
+        and lead.startswith(_REVIEW_GATE_RATE_LIMITED)
+        and _review_gate_block(feature, reason)
+        and _recorded_reset(str(reason or "")) is not None
+    )
+
+
 def _gate_failure_block(gate_out: str) -> str:
     """The red gate's output for a PR body or comment — fenced with more backticks than any
     run in the output itself, so a test log that prints a code fence cannot break out of it."""
@@ -1323,6 +1346,9 @@ class ReconcileMixin(WorktreeCleanup):
         * the block classifies as self-healing (`rate-limit` / `transient` /
           `merge-conflict`) and the card has retries left → clear it, requeue it, spend
           one `unblock-retry`; the next tick re-dispatches it.
+          A block the REVIEW GATE set on an in-review card is cleared back to review
+          instead of requeued, and its rate-limit wait spends no retry and is not
+          bounded by the budget (#776).
         * anything else — `auth`, `terminal`, an unclassified block, or a card that has
           spent its retries → the OPERATOR is told, once, naming the card and the actual
           reason. It stays blocked; a human decides.
@@ -1374,7 +1400,10 @@ class ReconcileMixin(WorktreeCleanup):
                 # terminal still carries the class its wording guessed, `transient` for
                 # "waiting on the network team". It goes to a human instead.
                 by_hand = store_mod.blocked_before_ready(f)
-                if cls in _SELF_HEALING_BLOCKS and spent < _UNBLOCK_RETRY_MAX and not by_hand:
+                # #776: a review-gate rate-limit wait is not bounded by the retry budget —
+                # it returns to review after every recorded reset (`_review_rate_limit_wait`).
+                review_wait = _review_rate_limit_wait(f, reason)
+                if cls in _SELF_HEALING_BLOCKS and (spent < _UNBLOCK_RETRY_MAX or review_wait) and not by_hand:
                     # Re-read under the claim lock before moving the card (#402). The list is
                     # from the start of the pass, and an attach (or an operator unblock) may
                     # have moved the card since. Requeueing it then undid that move. A salvage
@@ -1391,6 +1420,10 @@ class ReconcileMixin(WorktreeCleanup):
                                 fresh.get("board_state") or "gone",
                             )
                             continue
+                        # Decided again on the fresh row: the block may have been replaced.
+                        review_wait = _review_rate_limit_wait(fresh, str(fresh.get("blocked_reason", reason) or ""))
+                        if not review_wait and spent >= _UNBLOCK_RETRY_MAX:
+                            continue  # no longer a review wait, retries spent: the next pass escalates it
                         if cls == "rate-limit":
                             reset = _recorded_reset(str(fresh.get("blocked_reason", reason) or ""))
                             if reset is not None and time.time() < reset:
@@ -1430,7 +1463,8 @@ class ReconcileMixin(WorktreeCleanup):
                                     store=store,
                                 )
                                 continue
-                        await self._budget_set(store, fid, "unblock-retry", spent + 1)
+                        if not review_wait:
+                            await self._budget_set(store, fid, "unblock-retry", spent + 1)
                         await asyncio.to_thread(store.clear_blocked, fid)
                         if _review_gate_block(fresh, str(fresh.get("blocked_reason") or reason)):
                             # #776: the REVIEW GATE set this block (a rate-limited or failing
@@ -1440,9 +1474,10 @@ class ReconcileMixin(WorktreeCleanup):
                             # re-arms the gate. A requeue would move it to ready and dispatch
                             # a coder with no findings to act on.
                             log.info(
-                                "[project_board] blocked sweep: %s returned to review, not requeued (%s): %s",
+                                "[project_board] blocked sweep: %s returned to review, not requeued (%s%s): %s",
                                 fid,
                                 cls,
+                                ", no retry spent" if review_wait else "",
                                 reason[:120],
                             )
                             continue

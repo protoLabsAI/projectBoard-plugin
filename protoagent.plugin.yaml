@@ -86,7 +86,10 @@ config:
                             # model-capability ceiling)
   review_run_max: 3         # consecutive UNRUNNABLE gate attempts (no runner / dead
                             # workflow / failed panel steps — a partial panel is NOT a
-                            # review, ADR 0078 D3) before Blocking for the operator
+                            # review, ADR 0078 D3) before Blocking for the operator.
+                            # A provider rate limit (429, spent usage/session limit) is
+                            # not counted: the card blocks at once as rate-limit and
+                            # returns to review after the reset (#776)
   review_gate_timeout_s: 1800  # HARD cap on one review-gate model call (the workflow run,
                             # or the a2a reviewer fallback), the board's own — a hung stream
                             # can outlive the host client's request_timeout (protoAgent#3699).

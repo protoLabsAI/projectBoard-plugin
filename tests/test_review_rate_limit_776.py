@@ -14,11 +14,13 @@ import pytest
 from project_board import worktree
 from project_board.failures import classify
 from project_board.loop import BoardLoop
-from project_board.loop.drive import _recorded_reset
+from project_board.loop._common import _UNBLOCK_RETRY_MAX
+from project_board.loop.drive import _held_summary, _recorded_reset
 from project_board.loop.reconcile import (
     _REVIEW_RATE_LIMIT_BACKOFF_S,
     _REVIEW_STEP_ERROR_CAP,
     _failed_step_excerpts,
+    _review_rate_limit_wait,
 )
 from test_loop import _GateStore, _inject_fake_findings
 
@@ -209,7 +211,8 @@ async def test_sweep_waits_for_the_reset_then_returns_the_card_to_review(monkeyp
     assert store.state == "in_review"
     assert "review-pending" in store.labels and "review-clean" not in store.labels
     assert ("requeue", "bd-1") not in store.calls
-    assert "budget:unblock-retry:1" in store.labels
+    # The wait spent none of the card's auto-retries.
+    assert not any(l.startswith("budget:unblock-retry:") for l in store.labels)
 
     # The next reconcile re-arms the gate; only a review that RAN moves it off pending.
     await loop._reconcile_prs()
@@ -247,6 +250,84 @@ async def test_non_rate_limit_failure_still_retries_then_blocks_terminal(monkeyp
     monkeypatch.setattr("project_board.loop.reconcile.time.time", lambda: NOW + 86400)
     await loop._recover_blocked(store)
     assert store.state == "blocked" and store.cleared == []
+
+
+async def test_a_limit_that_outlasts_many_windows_never_strands_the_card(monkeypatch):
+    """The provider keeps limiting the reviewer through five fallback windows, on a card
+    whose two auto-retries are ALREADY spent. Every reset still returns the card to
+    review with no retry spent, and the review that finally runs clears it."""
+    loop, store, calls = _env(monkeypatch, [_failed(RATE_LIMITED)] * 5 + [{"output": CLEAN}])
+    store.labels.append(f"budget:unblock-retry:{_UNBLOCK_RETRY_MAX}")
+    await loop._review_gate(store, "bd-1", PR, "/repo")
+    now = NOW
+    for window in range(1, 6):
+        assert store.state == "blocked" and store.blocked_class == "rate-limit"
+        assert _recorded_reset(store.blocked_reason) == now + _REVIEW_RATE_LIMIT_BACKOFF_S
+        await loop._recover_blocked(store)  # the reset has not passed: it waits
+        assert store.state == "blocked" and len(store.cleared) == window - 1
+        now += _REVIEW_RATE_LIMIT_BACKOFF_S + 1
+        monkeypatch.setattr("project_board.loop.reconcile.time.time", lambda now=now: now)
+        await loop._recover_blocked(store)
+        assert store.state == "in_review" and len(store.cleared) == window
+        assert "review-pending" in store.labels
+        await loop._reconcile_prs()
+        assert len(calls) == window + 1
+    assert store.state == "in_review" and "review-clean" in store.labels
+    assert ("requeue", "bd-1") not in store.calls
+    assert f"budget:unblock-retry:{_UNBLOCK_RETRY_MAX}" in store.labels  # untouched
+    assert loop._review_run_failures.get("bd-1", 0) == 0
+
+
+def test_only_a_gate_rate_limit_block_with_a_recorded_reset_is_an_unbudgeted_wait():
+    row = {"labels": ["in-review", "review-pending", "blocked"], "pr_url": PR, "blocked_class": "rate-limit"}
+    wait = f"review gate rate-limited — x — retried by itself after the reset: {PR}; resets-at:{_iso(NOW)}"
+    assert _review_rate_limit_wait(row, wait)
+    assert _review_rate_limit_wait(row, "blocked: " + wait)
+    # No recorded reset, a coder's block, another class, or a card not in review: budgeted.
+    assert not _review_rate_limit_wait(row, wait.split(";")[0])
+    assert not _review_rate_limit_wait(row, f"rate_limit: 429; resets-at:{_iso(NOW)}")
+    assert not _review_rate_limit_wait(
+        row, f"review gate could not complete after 3 attempt(s) — rate limit; resets-at:{_iso(NOW)}"
+    )
+    assert not _review_rate_limit_wait({**row, "blocked_class": "transient"}, wait)
+    assert not _review_rate_limit_wait({**row, "labels": ["blocked"]}, wait)
+    assert not _review_rate_limit_wait({**row, "pr_url": ""}, wait)
+
+
+async def test_other_self_healing_blocks_keep_the_retry_budget(monkeypatch):
+    """The unbudgeted path is the review wait alone. A review-gate block of another
+    self-healing class still spends a retry, and stops at the cap."""
+    loop, store, _ = _env(monkeypatch, [_failed(RATE_LIMITED)])
+    store.labels.append("review-pending")
+    reason = f"review gate could not complete after 3 attempt(s) — connection reset — needs operator attention: {PR}"
+    store.flag_blocked("bd-1", reason, "transient")
+    await loop._recover_blocked(store)
+    assert store.cleared == ["bd-1"] and store.state == "in_review"
+    assert "budget:unblock-retry:1" in store.labels
+    # A coder's rate-limit block with its retries spent is escalated, not cleared.
+    loop, store, _ = _env(monkeypatch, [_failed(RATE_LIMITED)])
+    await loop._budget_set(store, "bd-1", "unblock-retry", _UNBLOCK_RETRY_MAX)
+    store.labels = [l for l in store.labels if l != "in-review"]
+    store.flag_blocked("bd-1", f"rate_limit: 429; resets-at:{_iso(NOW - 1)}", "rate_limit")
+    await loop._recover_blocked(store)
+    assert store.state == "blocked" and store.cleared == []
+
+
+def test_held_summary_promises_the_retry_for_a_review_wait_with_spent_retries():
+    reason = f"review gate rate-limited — x — retried by itself after the reset: {PR}; resets-at:{_iso(NOW)}"
+    row = {
+        "id": "bd-1",
+        "board_state": "blocked",
+        "blocked": True,
+        "blocked_class": "rate-limit",
+        "blocked_reason": reason,
+        "labels": ["in-review", "review-pending", "blocked"],
+        "pr_url": PR,
+        "budgets": {"unblock-retry": _UNBLOCK_RETRY_MAX},
+    }
+    assert _held_summary([row])["blocked:rate-limit"]["next"].startswith("none — the health sweep retries")
+    coder = {**row, "labels": ["blocked"], "blocked_reason": "rate_limit: 429"}
+    assert "a human decides" in _held_summary([coder])["blocked:rate-limit"]["next"]
 
 
 async def test_coder_rate_limit_block_is_still_requeued(monkeypatch):
