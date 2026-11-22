@@ -352,6 +352,78 @@ def test_select_oracle_first_match_wins_and_several_run_in_map_order():
     assert coder_seam.select_oracle(no_catchall, None, "DEFAULT")[0] == ["DEFAULT"]  # git couldn't say
 
 
+def test_fill_changed_tests_filters_sorts_and_quotes():
+    changed = ["tests/test_new.py", "worktree.py", "tests/test_b.py", "tests/test_a.py"]
+    assert coder_seam.fill_changed_tests("pytest -q {changed_tests}", changed, lambda p: True) == (
+        "pytest -q tests/test_a.py tests/test_b.py tests/test_new.py"
+    )
+    changed += ["tests/test_deleted.py", "tests/space name_test.py", "test_directory.py/helper.py"]
+    assert (
+        coder_seam.fill_changed_tests("pytest -q {changed_tests}", changed, lambda p: p != "tests/test_deleted.py")
+        == "pytest -q 'tests/space name_test.py' tests/test_a.py tests/test_b.py tests/test_new.py"
+    )
+    assert coder_seam.fill_changed_tests("pytest -q", None, lambda p: pytest.fail("unexpected stat")) == "pytest -q"
+
+
+@pytest.mark.parametrize("changed", [["worktree.py"], [], None, ["tests/test_deleted.py"]])
+async def test_changed_tests_empty_or_unknown_skips_with_note(tmp_path, monkeypatch, changed):
+    assert coder_seam.fill_changed_tests("pytest -q {changed_tests}", changed, lambda p: False) is None
+
+    async def _changed(tree, base):
+        return changed
+
+    monkeypatch.setattr(worktree, "changed_paths", _changed)
+    ad = _adapter(tmp_path, test_cmd="pytest -q {changed_tests}", test_timeout=10)
+    cmd, note = await ad._oracle_for(str(tmp_path))
+    assert cmd == ""
+    reason = "changed files unknown" if changed is None else "no changed test files"
+    assert f"{reason} → test run skipped" in note
+    verdict = await ad._run_acceptance_tests(str(tmp_path))
+    assert verdict.passed and verdict.total == 0
+    assert reason in verdict.output
+
+
+async def test_fixed_oracle_without_map_does_not_list_changes(tmp_path, monkeypatch):
+    async def _unexpected(*args):
+        pytest.fail("fixed oracle must not call git")
+
+    monkeypatch.setattr(worktree, "changed_paths", _unexpected)
+    assert await _adapter(tmp_path, test_cmd="pytest -q", test_timeout=10)._oracle_for(str(tmp_path)) == (
+        "pytest -q",
+        "",
+    )
+
+
+async def test_changed_tests_oracle_reads_committed_dirty_and_untracked_tests(tmp_path):
+    repo = _repo(tmp_path / "candidate")
+    _commit(repo, "tests/test_b.py", "before\n")
+    _commit(repo, "tests/test_deleted.py")
+    _git("-C", str(repo), "update-ref", "refs/remotes/origin/main", "HEAD")
+    _commit(repo, "tests/test_a.py")
+    (repo / "tests/test_b.py").write_text("after\n")
+    (repo / "tests/test_new.py").write_text("new\n")
+    (repo / "tests/test_deleted.py").unlink()
+    (repo / "worktree.py").write_text("source\n")
+    cmd, _ = await _adapter(tmp_path, test_cmd="pytest -q {changed_tests}", test_timeout=10)._oracle_for(str(repo))
+    assert cmd == "pytest -q tests/test_a.py tests/test_b.py tests/test_new.py"
+
+
+async def test_mapped_changed_tests_skip_preserves_lint(tmp_path, monkeypatch):
+    async def _changed(tree, base):
+        return ["worktree.py", "docs/readme.md"]
+
+    monkeypatch.setattr(worktree, "changed_paths", _changed)
+    ad = _adapter(
+        tmp_path,
+        test_cmd="fallback",
+        test_timeout=10,
+        test_paths=[("*.py", "pytest -q {changed_tests}"), ("docs/**", "ruff check .")],
+    )
+    cmd, note = await ad._oracle_for(str(tmp_path))
+    assert cmd == "ruff check ."
+    assert "no changed test files → test run skipped" in note
+
+
 @posix_only
 async def test_compose_oracle_runs_every_command_and_fails_if_any_does(tmp_path):
     cmd = coder_seam.compose_oracle(["cd sub 2>/dev/null; echo one; exit 1", "pwd; echo two"])
