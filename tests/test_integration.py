@@ -218,7 +218,6 @@ def test_merge_hold_set_and_release_round_trip_through_real_br(board):
     assert LABEL_MERGE_HOLD not in (board.get_feature(fid)["labels"] or [])
 
 
-
 @requires_br
 def test_worktree_hold_set_and_release_round_trip_through_real_br(board):
     """#754: the `worktree-hold` label and its audit comments land and clear through the
@@ -240,6 +239,7 @@ def test_worktree_hold_set_and_release_round_trip_through_real_br(board):
     with pytest.raises(BoardError):
         board.set_worktree_hold(fid, "too late")
     assert LABEL_WORKTREE_HOLD not in (board.get_feature(fid)["labels"] or [])
+
 
 # ── `--json` output shape: one test per want_json=True call site in store.py (#138) ──
 
