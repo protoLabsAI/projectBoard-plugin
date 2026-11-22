@@ -867,6 +867,19 @@ def slug_from_head(fid: str, head: str) -> str | None:
     return None
 
 
+def branch_title_for(feature: dict) -> str:
+    """The title to slug onto ``feature``'s branch/dir tail, with no ``gh`` call (#716):
+    its recorded ``branch_slug`` when that is a valid slug (a slug slugs to itself, so
+    ``branch_name(fid, branch_title_for(f))`` names the recorded branch), else its current
+    title. The sync sibling of ``resolve_branch`` for paths that run often or have no
+    checkout to read a PR from; a legacy card (no recorded slug) gets today's title-derived
+    name, so a caller that can see the PR head should also accept ``slug_from_head``."""
+    recorded = feature.get("branch_slug")
+    if is_branch_slug(recorded):
+        return recorded
+    return str(feature.get("title") or "")
+
+
 @dataclasses.dataclass(frozen=True)
 class BranchIdentity:
     """Which branch (and worktree dir) a card builds on (#716), and where that came from.
