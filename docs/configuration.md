@@ -14,7 +14,7 @@ list — so an undocumented knob cannot be added quietly.
 
 **`· YAML only`** marks a key the Settings UI cannot edit: it is absent from
 `protoagent.plugin.yaml`'s schema, so `POST /api/settings` refuses it and the console
-never renders it. **40 of 97 keys are in this state, including `coders` and `projects`** —
+never renders it. **40 of 98 keys are in this state, including `coders` and `projects`** —
 the two you must set for a multi-repo board. Edit
 `~/.protoagent/<instance>/config/langgraph-config.yaml` directly, then restart.
 
@@ -413,6 +413,7 @@ The gates between a green build and main.
 | `ci_rerun_max` | `1` | reload |
 | `review_fix_max` | `2` | reload |
 | `review_gate_timeout_s` | `1800` | reload |
+| `review_model` | `"anthropic-oauth:claude-sonnet-5"` | reload |
 | `draft_until_review` | `True` | reload |
 | `reviewer_of_record_label` | `"reviewer-of-record:board"` | reload |
 | `external_review` | `—` | reload **· YAML only** |

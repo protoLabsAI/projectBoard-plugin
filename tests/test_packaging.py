@@ -370,6 +370,8 @@ def test_manifest_settings_are_truthful_about_live_vs_restart_apply():
         "health_sweep_interval_s",
         # #462: the review-call cap, the per-card reconcile bound and the stall signal.
         "review_gate_timeout_s",
+        # #712: the review gate's pinned model is a posture with a safe default (Sonnet), file-only.
+        "review_model",
         # #691: draft-until-gate is a posture with a safe default, not a dial to turn.
         "draft_until_review",
         # pr-reviewer#318: the reviewer-of-record label is a posture with a safe default too.
