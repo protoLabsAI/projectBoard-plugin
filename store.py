@@ -980,6 +980,15 @@ NOTES_WAITS_PREFIX = "waits-for:"
 # length) the label validator refuses, and it is single-valued metadata exactly like the
 # `source-issue:` line, so it rides the same notes field.
 NOTES_ORIGIN_PREFIX = "origin-session:"
+# A merge-hold's checkable release condition (#676): one `merge-hold-until: <spec>` line
+# per gate spec (the `waits_for` grammar, gates.py), plus ONE `merge-hold-reason: "<json>"`
+# line holding the operator's reason so a re-hold can record old → new. Written only for
+# a hold that carries an `until`; a plain hold stores nothing here (its reason lives in the
+# `merge-hold set:` audit comment, as before). Release clears both. The lines are only
+# MEANINGFUL while the `merge-hold` label is on the card — a stale line under no label is
+# ignored and dropped on the next hold/release write.
+NOTES_MERGE_HOLD_UNTIL_PREFIX = "merge-hold-until:"
+NOTES_MERGE_HOLD_REASON_PREFIX = "merge-hold-reason:"
 REQ_CLOSED_STATUSES = ("done", "declined")
 # A markdown bullet (-/*/+ or `1.`/`1)`) opens a new requirement item; anything else
 # is a continuation of the current one (or, with no bullets at all, plain prose = ONE item).
@@ -1791,7 +1800,16 @@ def validate_priority(raw) -> int:
     return priority
 
 
-def _render_notes(files, source_issue: str = "", requirements=(), waits_for=(), origin_session: str = "") -> str:
+def _render_notes(
+    files,
+    source_issue: str = "",
+    requirements=(),
+    waits_for=(),
+    origin_session: str = "",
+    *,
+    merge_hold_until=(),
+    merge_hold_reason: str = "",
+) -> str:
     """Serialize the bead `notes` field: one files_to_modify path per line, one
     `req: {…json…}` requirement-item line per ledger entry (#113), plus a trailing
     `source-issue: owner/repo#N` and `origin-session: <chat>` metadata line when set
@@ -1809,6 +1827,12 @@ def _render_notes(files, source_issue: str = "", requirements=(), waits_for=(), 
         lines.append(f"{NOTES_SOURCE_PREFIX} {source_issue}")
     if str(origin_session or "").strip():
         lines.append(f"{NOTES_ORIGIN_PREFIX} {str(origin_session).strip()}")
+    until = [str(spec).strip() for spec in merge_hold_until or () if str(spec).strip()]
+    for spec in until:
+        lines.append(f"{NOTES_MERGE_HOLD_UNTIL_PREFIX} {spec}")
+    if until and str(merge_hold_reason or "").strip():
+        # JSON-quoted: a reason may carry newlines, and the notes field is line-structured.
+        lines.append(f"{NOTES_MERGE_HOLD_REASON_PREFIX} {json.dumps(str(merge_hold_reason).strip())}")
     return "\n".join(lines)
 
 
@@ -1833,6 +1857,8 @@ def _split_notes(notes) -> tuple[list[str], str, list[dict]]:
             continue  # a publish gate, read by _waits_from_notes — never a file path
         if s.startswith(NOTES_ORIGIN_PREFIX):
             continue  # the originating chat, read by _origin_from_notes — never a file path
+        if s.startswith((NOTES_MERGE_HOLD_UNTIL_PREFIX, NOTES_MERGE_HOLD_REASON_PREFIX)):
+            continue  # a merge-hold condition, read by _merge_hold_from_notes — never a file path
         if s.startswith(NOTES_REQ_PREFIX):
             try:
                 item = json.loads(s[len(NOTES_REQ_PREFIX) :].strip())
@@ -1855,6 +1881,44 @@ def _waits_from_notes(notes) -> list[str]:
             if spec and spec not in out:
                 out.append(spec)
     return out
+
+
+def _merge_hold_from_notes(notes) -> tuple[list[str], str]:
+    """The stored merge-hold condition (#676): ``(until_specs, reason)`` from the bead
+    ``notes`` field — specs in order (de-duplicated), the FIRST reason line wins."""
+    until: list[str] = []
+    reason = ""
+    for line in str(notes or "").splitlines():
+        s = line.strip()
+        if s.startswith(NOTES_MERGE_HOLD_UNTIL_PREFIX):
+            spec = s[len(NOTES_MERGE_HOLD_UNTIL_PREFIX) :].strip()
+            if spec and spec not in until:
+                until.append(spec)
+        elif s.startswith(NOTES_MERGE_HOLD_REASON_PREFIX) and not reason:
+            raw = s[len(NOTES_MERGE_HOLD_REASON_PREFIX) :].strip()
+            try:
+                val = json.loads(raw)
+            except ValueError:
+                val = raw
+            reason = str(val if isinstance(val, str) else raw).strip()
+    return until, reason
+
+
+def _unmet_gate_text(result: dict) -> str:
+    """``<spec> (<detail>)`` for one unmet gate result — the error when the check failed."""
+    spec = str(result.get("spec") or "")
+    why = str(result.get("error") or result.get("detail") or "").strip()
+    return f"{spec} ({why})" if why and why != spec else spec
+
+
+def _merge_hold_notes_kw(f: dict) -> dict:
+    """The stored merge-hold condition of projection ``f`` as ``_render_notes`` kwargs —
+    every notes rewriter carries it forward (`br update --notes` replaces the WHOLE field,
+    so an unrelated edit must never silently drop a hold's release condition, #676)."""
+    return {
+        "merge_hold_until": list(f.get("merge_hold_until_specs") or ()),
+        "merge_hold_reason": str(f.get("merge_hold_reason") or ""),
+    }
 
 
 def _origin_from_notes(notes) -> str:
@@ -1884,7 +1948,14 @@ def _refuse_structured_paths(files) -> None:
     wrote (#457 review). Refuse it by name."""
     for f in files or ():
         s = str(f).strip()
-        for prefix in (NOTES_WAITS_PREFIX, NOTES_SOURCE_PREFIX, NOTES_REQ_PREFIX, NOTES_ORIGIN_PREFIX):
+        for prefix in (
+            NOTES_WAITS_PREFIX,
+            NOTES_SOURCE_PREFIX,
+            NOTES_REQ_PREFIX,
+            NOTES_ORIGIN_PREFIX,
+            NOTES_MERGE_HOLD_UNTIL_PREFIX,
+            NOTES_MERGE_HOLD_REASON_PREFIX,
+        ):
             if s.startswith(prefix):
                 raise BoardError(
                     f"files_to_modify entry {s!r} starts with {prefix!r}, which the board reserves for card "
@@ -3198,7 +3269,8 @@ class BeadsBoard:
             ledger = new_ledger if new_ledger is not None else (f.get("requirements") or [])
             # `br update --notes` replaces the WHOLE field, so carry the originating chat
             # (ADR 0131 P2b-3) forward — a files/source/ledger edit must never drop it.
-            args += [f"--notes={_render_notes(files, src, ledger, waits, f.get('origin_session') or '')}"]
+            notes = _render_notes(files, src, ledger, waits, f.get("origin_session") or "", **_merge_hold_notes_kw(f))
+            args += [f"--notes={notes}"]
         if difficulty is not None:
             # difficulty rides as a single `diff:` label — replace any stale one (the
             # same single-label-replaced pattern record_gens_spent uses for `gens:`).
@@ -3954,6 +4026,7 @@ class BeadsBoard:
                         items,
                         f.get("waits_for") or (),
                         f.get("origin_session") or "",
+                        **_merge_hold_notes_kw(f),
                     ),
                 )
 
@@ -5216,7 +5289,7 @@ class BeadsBoard:
         return self.get_feature(fid)
 
     # ── merge-hold: the operator's per-card auto-merge veto (#532) ─────────────
-    def set_merge_hold(self, fid: str, reason: str, *, actor: str = "") -> dict:
+    def set_merge_hold(self, fid: str, reason: str, *, actor: str = "", until="") -> dict:
         """Place the operator's per-card merge veto (``LABEL_MERGE_HOLD``) so the
         auto-merge edge holds this card for a HUMAN even when every gate is green — a
         console layout change, a risky migration the operator wants to QA by hand.
@@ -5228,6 +5301,17 @@ class BeadsBoard:
         is required — a veto with no stated reason is unauditable. IDEMPOTENT: a card
         already held returns ok with NO second audit comment.
 
+        ``until`` (#676) is the hold's checkable release condition: comma-separated
+        `waits_for` gate specs (``pr:``, ``release:``, ``npm:`` — gates.py's grammar),
+        stored canonically as ``merge-hold-until:`` notes lines. A spec that does not parse
+        refuses the call with the parse error and changes nothing. ``release_merge_hold``
+        then refuses to lift the hold while any of them is unmet. Re-holding a held card
+        that has (or is given) an ``until`` REPLACES its reason and ``until`` with one
+        ``merge-hold updated:`` audit comment recording old → new; identical values stay a
+        no-op. A plain re-hold (no ``until`` before or after) is the no-op it always was.
+        The update runs the fresh hold's work-location gate too (``_work_location_hold_reason``):
+        a new reason citing an unrecorded SHA/branch is refused before any write.
+
         The merge edge itself is untouched: ``merge_posture`` / the loop's
         ``_auto_merge_blockers`` already read the label back as ``merge-hold (operator
         veto)`` — this is only the setter that was missing (nobody but a human running
@@ -5236,26 +5320,79 @@ class BeadsBoard:
         reason = str(reason or "").strip()
         if not reason:
             raise BoardError(f"{fid}: a merge-hold needs a reason — say why this card must be merged by hand")
+        # Parse BEFORE any read or write: a bad spec is refused by name, the card untouched.
+        try:
+            specs = publish_gates.normalize_specs(until)
+        except publish_gates.GateSpecError as exc:
+            raise BoardError(f"{fid}: merge-hold until: {exc}") from None
         f = self._require(fid)  # unknown id → BoardError; nothing changed
         state = f.get("board_state")
         if state in _TERMINAL_STATES:
             raise BoardError(
                 f"{fid} is {state} — merge-hold vetoes the auto-merge edge, which a {state} card is already past"
             )
-        if LABEL_MERGE_HOLD in (f.get("labels") or []):
-            return f  # already held — idempotent, no duplicate comment
-        reason = self._work_location_hold_reason(fid, reason, f)
         who = str(actor or self.actor or "operator").strip() or "operator"
+        stored_specs = list(f.get("merge_hold_until_specs") or [])
+        if LABEL_MERGE_HOLD in (f.get("labels") or []):
+            old_reason = str(f.get("merge_hold_reason") or "")
+            if not specs and not stored_specs:
+                return f  # a plain re-hold — idempotent, no duplicate comment (#532)
+            if specs == stored_specs and reason == old_reason:
+                return f  # identical condition — idempotent, no comment
+            # The same git-evidence gate as a fresh hold: a reason citing a SHA/branch with no
+            # recorded work location is refused BEFORE any write, and the audit snapshots
+            # the resolved work-location context exactly as `merge-hold set:` does.
+            reason_text = self._work_location_hold_reason(fid, reason, f)
+            changes = []
+            if reason != old_reason:
+                changes.append(f"reason {old_reason or '(not recorded)'!r} → {reason!r}")
+            if specs != stored_specs:
+                changes.append(f"until {', '.join(stored_specs) or '(none)'} → {', '.join(specs) or '(none)'}")
+            # The audit FIRST (allowed to raise): never a changed condition with no record.
+            context = reason_text[len(reason) :] if reason_text.startswith(reason) else ""
+            self._run("comments", "add", fid, "merge-hold updated: " + "; ".join(changes) + context, actor=who)
+            self._run("update", fid, f"--notes={self._merge_hold_notes(f, specs, reason)}", actor=who)
+            return self.get_feature(fid)
+        reason_text = self._work_location_hold_reason(fid, reason, f)
+        args = ["update", fid, "--add-label", LABEL_MERGE_HOLD]
+        if specs or stored_specs or f.get("merge_hold_reason"):
+            # Write the condition (or clear a stale one left under no label) in the SAME
+            # update as the label, so a hold never goes live with someone else's `until`.
+            args.append(f"--notes={self._merge_hold_notes(f, specs, reason)}")
+        comment = f"merge-hold set: {reason_text}"
+        if specs:
+            comment += f" (until {', '.join(specs)})"
         # The REASON first (as flag_blocked does), and allowed to raise: a failed write
         # leaves the card UN-held with the caller told, never held with no audit trail.
-        self._run("comments", "add", fid, f"merge-hold set: {reason}", actor=who)
-        self._run("update", fid, "--add-label", LABEL_MERGE_HOLD, actor=who)
+        self._run("comments", "add", fid, comment, actor=who)
+        self._run(*args, actor=who)
         return self.get_feature(fid)
 
-    def release_merge_hold(self, fid: str, *, actor: str = "") -> dict:
+    @staticmethod
+    def _merge_hold_notes(f: dict, specs, reason: str) -> str:
+        """The bead ``notes`` of projection ``f`` with its merge-hold condition replaced
+        by ``specs`` / ``reason`` (#676) — every other structured line carried forward."""
+        return _render_notes(
+            f.get("files_to_modify"),
+            str(f.get("source_issue") or ""),
+            f.get("requirements") or (),
+            f.get("waits_for") or (),
+            f.get("origin_session") or "",
+            merge_hold_until=list(specs or ()),
+            merge_hold_reason=reason if specs else "",
+        )
+
+    def release_merge_hold(self, fid: str, *, actor: str = "", force: bool = False, token: str = "") -> dict:
         """Lift the operator's merge veto (``LABEL_MERGE_HOLD``) — the inverse of
         ``set_merge_hold`` (#532). Removes the label and records a ``merge-hold released``
         audit comment, so the auto-merge edge can resume for this card.
+
+        A hold with an ``until`` condition (#676) is checked first: every spec is
+        evaluated live (``gates.evaluate(force=True)``; a check that errors counts as
+        unmet). Any unmet spec refuses the release with a BoardError naming each one, and
+        the hold stays. ``force=True`` releases anyway, and the audit comment marks the
+        override and lists the unmet specs. Releasing clears the stored condition.
+        ``token`` is the npm token for an ``npm:`` spec on a private package.
 
         Refuses an unknown id (``_require``). IDEMPOTENT: a card that is NOT held returns
         ok with no comment. ``actor`` names who lifted it, defaulting to the store actor."""
@@ -5263,10 +5400,41 @@ class BeadsBoard:
         if LABEL_MERGE_HOLD not in (f.get("labels") or []):
             return f  # not held — idempotent, no comment
         who = str(actor or self.actor or "operator").strip() or "operator"
+        specs = list(f.get("merge_hold_until_specs") or [])
+        unmet: list[dict] = []
+        if specs:
+
+            def _resolve(cid):
+                try:
+                    return self.get_feature(cid)
+                except Exception:  # noqa: BLE001 — an unreadable card is "not found", never a crash
+                    return None
+
+            results = publish_gates.evaluate(specs, token=token, force=True, resolve_card=_resolve)
+            unmet = [r for r in results if not r.get("met")]
+            if unmet and not force:
+                raise BoardError(
+                    f"{fid}: merge-hold is held until {', '.join(specs)} — still unmet: "
+                    + "; ".join(_unmet_gate_text(r) for r in unmet)
+                    + ". The hold stays; release it once the condition is met, or pass force=true to override."
+                )
+        args = ["update", fid, "--remove-label", LABEL_MERGE_HOLD]
+        if specs or f.get("merge_hold_reason"):
+            args.append(f"--notes={self._merge_hold_notes(f, (), '')}")
         # Drop the label FIRST: if the audit comment then fails the card is correctly
         # released (never a "released" note sitting over a label that is still present).
-        self._run("update", fid, "--remove-label", LABEL_MERGE_HOLD, actor=who)
-        self._run("comments", "add", fid, "merge-hold released", actor=who)
+        self._run(*args, actor=who)
+        if unmet:
+            note = (
+                "merge-hold released (override: force=true; unmet: "
+                + "; ".join(_unmet_gate_text(r) for r in unmet)
+                + ")"
+            )
+        elif specs:
+            note = f"merge-hold released (until met: {', '.join(specs)})"
+        else:
+            note = "merge-hold released"
+        self._run("comments", "add", fid, note, actor=who)
         return self.get_feature(fid)
 
     def set_worktree_hold(self, fid: str, reason: str, *, actor: str = "") -> dict:
@@ -5628,6 +5796,7 @@ class BeadsBoard:
                 items,
                 f.get("waits_for") or (),
                 f.get("origin_session") or "",
+                **_merge_hold_notes_kw(f),
             ),
         )
         return self.get_feature(fid)
@@ -6306,6 +6475,7 @@ class BeadsBoard:
         # file list. source_issue is "" when unset (the loop's PR opener then falls
         # back to scanning the feature text for an issue URL).
         files_to_modify, source_issue, requirements = _split_notes(bead.get("notes"))
+        mh_until, mh_reason = _merge_hold_from_notes(bead.get("notes"))
         # `dag_blocked`: marked `ready` but a `blocks` dependency is still open, so
         # the puller won't claim it. Only `br show` carries dependencies (`br list`
         # doesn't); list_features patches this by cross-referencing the puller.
@@ -6348,6 +6518,13 @@ class BeadsBoard:
             # here so the merge edge (merge_posture), the tool payload and the API all see
             # the same bool. The loop never sets or clears it — set_merge_hold does.
             "merge_hold": LABEL_MERGE_HOLD in labels,
+            # A merge-hold's checkable release condition (#676): every `until` gate spec
+            # with its CACHED verdict (gates.specs_status — no network), [] for a hold with
+            # no `until` or a card not held. `merge_hold_until_specs` / `merge_hold_reason`
+            # are the raw stored values (carried forward by every notes rewrite).
+            "merge_hold_until": publish_gates.specs_status(mh_until) if LABEL_MERGE_HOLD in labels else [],
+            "merge_hold_until_specs": mh_until,
+            "merge_hold_reason": mh_reason,
             "worktree_hold": LABEL_WORKTREE_HOLD in labels,
             "cancelled": LABEL_CANCELLED in labels,
             # archived is VISIBILITY, not a state: the feature stays done/cancelled;
@@ -6437,6 +6614,9 @@ NEXT_ACTION_REVIEW_IN_PROGRESS = "review in progress"
 NEXT_ACTION_CHANGES_REQUESTED = "changes requested"
 NEXT_ACTION_AWAITING_VERDICT = "awaiting review verdict (no review-clean)"
 NEXT_ACTION_MERGE_HOLD = "merge-hold (operator veto)"
+# A merge-hold whose `until` condition (#676) is not yet met, by its cached verdicts.
+NEXT_ACTION_MERGE_HOLD_UNTIL = "merge-hold until {specs} (unmet)"
+
 NEXT_ACTION_BLOCKED = "blocked"
 # The PR is a draft (#207): GitHub reports CLEAN for a draft whose checks pass, `gh pr
 # merge` refuses it, and the loop never spends a merge attempt on one — the fix is one
@@ -6574,6 +6754,17 @@ def knob_bool(cfg: dict, key: str, default: bool, *, strict: bool = True) -> boo
     return bool(raw)
 
 
+def merge_hold_next_action(feature: dict) -> str:
+    """The next_action for a held card: ``merge-hold until <spec> (unmet)`` while any of
+    its ``until`` specs reads unmet by its CACHED verdict (no network), else
+    ``merge-hold (operator veto)`` (no ``until``, or every spec met)."""
+    unmet = [str(r.get("spec") or "") for r in feature.get("merge_hold_until") or () if not r.get("met")]
+    unmet = [u for u in unmet if u]
+    if unmet:
+        return NEXT_ACTION_MERGE_HOLD_UNTIL.format(specs=", ".join(unmet))
+    return NEXT_ACTION_MERGE_HOLD
+
+
 def merge_posture(
     feature: dict,
     *,
@@ -6605,7 +6796,8 @@ def merge_posture(
       in the way + the loop will NOT merge — a human must, #208), ``auto-merge
       pending`` (the loop merges once GitHub reports CLEAN), ``review in progress``,
       ``changes requested``, ``awaiting review verdict (no review-clean)``,
-      ``merge-hold (operator veto)``, ``blocked``, ``draft (run `gh pr ready`)`` (a
+      ``merge-hold (operator veto)`` (``merge-hold until <spec> (unmet)`` while the hold's
+      ``until`` condition reads unmet, #676), ``blocked``, ``draft (run `gh pr ready`)`` (a
       known draft — ahead of the merge-posture cases, behind the review ones: the
       review gate still runs on a draft, the merge never does).
     * ``awaiting_merge`` — True only for the first case.
@@ -6661,7 +6853,7 @@ def merge_posture(
     if feature.get("blocked"):
         out["next_action"] = NEXT_ACTION_BLOCKED
     elif LABEL_MERGE_HOLD in labels:
-        out["next_action"] = NEXT_ACTION_MERGE_HOLD
+        out["next_action"] = merge_hold_next_action(feature)
     elif LABEL_REVIEW_PENDING in labels:
         out["next_action"] = NEXT_ACTION_REVIEW_IN_PROGRESS
     elif LABEL_CHANGES_REQUESTED in labels:

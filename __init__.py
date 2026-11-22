@@ -1244,6 +1244,9 @@ def _board_tools(cfg: dict, registry=None):
                 # carries `merge-hold`, so a reader can see the hold without re-decoding
                 # `labels`. board_hold_merge sets it, board_release_merge_hold lifts it.
                 "merge_hold": f.get("merge_hold", False),
+                # The hold's checkable release condition (#676): each `until` gate spec with
+                # its CACHED verdict ({spec, met, detail, error, checked_at}); [] when none.
+                "merge_hold_until": f.get("merge_hold_until", []),
                 "worktree_hold": f.get("worktree_hold", False),
                 "difficulty": f["difficulty"],
                 # The card's own coder time budget in seconds (#753); null → the board-wide one.
@@ -1751,28 +1754,48 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
-    def board_hold_merge(feature_id: str, reason: str) -> str:
+    def board_hold_merge(feature_id: str, reason: str, until: str = "") -> str:
         """Place the operator's auto-merge veto (`merge-hold` label) on a card: the loop never
         auto-merges it, so a human merges by hand (e.g. a change to QA first). The card still
         builds, verifies and is reviewed. `reason` is required (why it must be merged by hand).
-        Valid in any non-terminal state; idempotent. Lift it with board_release_merge_hold."""
+        `until` (optional) is the hold's checkable release condition, in the same grammar as
+        `waits_for`: comma-separated `pr:<owner>/<repo>#<n>`, `release:<owner>/<repo>@<range>`,
+        `npm:<pkg>@<range>` specs. A bad spec returns an `Error:` and changes nothing.
+        board_get_feature shows each spec's cached verdict in `merge_hold_until`, and
+        board_release_merge_hold refuses while any is unmet. Re-holding a held card with a new
+        reason or `until` replaces both (one audit comment records old → new); identical
+        values, or a plain re-hold with no `until` either side, are a no-op. Valid in any
+        non-terminal state. Never auto-released. Lift it with board_release_merge_hold."""
         try:
             reason = _strip_wrapping_quotes(reason).strip()
             if not reason:
                 return "Error: a merge-hold needs a reason — say why this card must be merged by hand"
-            f = get_store(**store_kw).set_merge_hold(feature_id, reason)
-            return json.dumps({"id": f["id"], "state": f["board_state"], "merge_hold": f.get("merge_hold", False)})
+            until = _strip_wrapping_quotes(until or "").strip()
+            f = get_store(**store_kw).set_merge_hold(feature_id, reason, until=until)
+            out = {"id": f["id"], "state": f["board_state"], "merge_hold": f.get("merge_hold", False)}
+            if f.get("merge_hold_until"):
+                out["merge_hold_until"] = f["merge_hold_until"]  # only a conditional hold carries it
+            return json.dumps(out)
         except BoardError as exc:
             return f"Error: {exc}"
 
     @tool
-    def board_release_merge_hold(feature_id: str) -> str:
+    def board_release_merge_hold(feature_id: str, force: bool = False) -> str:
         """Lift the operator's per-card auto-merge veto (the `merge-hold` label) — the
         inverse of board_hold_merge (#532). Removes the label and records an audit comment,
-        so the auto-merge edge can resume for this card. An unknown id returns an `Error:`;
-        idempotent on a card that is not held (a no-op with no comment)."""
+        so the auto-merge edge can resume for this card. A hold with an `until` condition is
+        checked live first: while any spec is unmet (a check that errors counts as unmet) the
+        release returns an `Error:` naming each unmet spec and the card stays held — do not
+        judge the condition yourself from the reason text. `force=true` releases anyway and
+        the audit comment records the override with the unmet specs; use it only on the
+        operator's say-so. An unknown id returns an `Error:`; idempotent on a card that is
+        not held (a no-op with no comment)."""
         try:
-            f = get_store(**store_kw).release_merge_hold(feature_id)
+            from . import gates as publish_gates
+
+            f = get_store(**store_kw).release_merge_hold(
+                feature_id, force=bool(force), token=publish_gates.npm_token(cfg)
+            )
             return json.dumps({"id": f["id"], "state": f["board_state"], "merge_hold": f.get("merge_hold", False)})
         except BoardError as exc:
             return f"Error: {exc}"

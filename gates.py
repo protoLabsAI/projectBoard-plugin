@@ -942,8 +942,14 @@ def card_status(feature: dict) -> list[dict]:
     """Every gate on ``feature`` with its CACHED verdict (no network) — an unchecked gate
     reads unmet with detail ``… (not checked yet)``, an unparseable one unmet with its
     error. Never raises: this runs inside every listing."""
+    return specs_status(feature.get("waits_for") or ())
+
+
+def specs_status(specs) -> list[dict]:
+    """``card_status`` for an arbitrary list of spec texts (a merge-hold's ``until``,
+    #676): each with its CACHED verdict, no network, never raises."""
     out = []
-    for raw in feature.get("waits_for") or ():
+    for raw in specs or ():
         try:
             hit = cached(raw)
             if hit is None:
