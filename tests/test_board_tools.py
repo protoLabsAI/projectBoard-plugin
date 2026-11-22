@@ -67,6 +67,8 @@ def test_lifecycle_tools_are_registered():
         "board_requeue_ci_fix",
         "board_block_feature",
         "board_unblock_feature",
+        "board_hold_worktree",
+        "board_release_worktree_hold",
     } <= names
 
 
@@ -479,6 +481,8 @@ _MINIMAL_ARGS = {
     "board_unblock_feature": {"feature_id": "bd-1"},
     "board_hold_merge": {"feature_id": "bd-1", "reason": "r"},
     "board_release_merge_hold": {"feature_id": "bd-1"},
+    "board_hold_worktree": {"feature_id": "bd-1", "reason": "r"},
+    "board_release_worktree_hold": {"feature_id": "bd-1"},
     "board_reset_merged_verify_budget": {"feature_id": "bd-1"},
     "board_list": {},
     "board_retro": {},
@@ -1034,3 +1038,56 @@ def test_board_feature_progress_unknown_id_and_unusable_store(make_board, monkey
     monkeypatch.setattr("project_board.store.get_store", lambda **_kw: _UnusableStore())
     out = _get_tool("board_feature_progress").invoke({"feature_id": "bd-1"})
     assert out.startswith("Error:") and "beads workspace" in out
+
+
+@pytest.fixture
+def worktree_hold_board(make_board, monkeypatch):
+    from project_board.tests.test_worktree_hold_store_754 import FakeBr
+
+    fake = FakeBr(status="in_progress", labels=["in-review", "merge-hold"])
+    board = make_board(fake)
+    monkeypatch.setattr("project_board.store.get_store", lambda **_kw: board)
+    return fake
+
+
+def test_worktree_hold_tools_round_trip(worktree_hold_board):
+    fake = worktree_hold_board
+    assert json.loads(_get_tool("board_get_feature").invoke({"feature_id": "bd-1"}))["worktree_hold"] is False
+    out = _get_tool("board_hold_worktree").invoke({"feature_id": "bd-1", "reason": '"squashing by hand"'})
+    assert json.loads(out) == {"id": "bd-1", "state": "in_review", "worktree_hold": True}
+    detail = json.loads(_get_tool("board_get_feature").invoke({"feature_id": "bd-1"}))
+    assert detail["worktree_hold"] is True
+    assert detail["merge_hold"] is True
+    assert fake.bead["comments"] == ["worktree-hold set: squashing by hand"]
+    for _ in range(2):
+        out = _get_tool("board_release_worktree_hold").invoke({"feature_id": "bd-1"})
+        assert json.loads(out) == {"id": "bd-1", "state": "in_review", "worktree_hold": False}
+    detail = json.loads(_get_tool("board_get_feature").invoke({"feature_id": "bd-1"}))
+    assert detail["worktree_hold"] is False
+    assert detail["merge_hold"] is True
+    assert fake.bead["comments"] == ["worktree-hold set: squashing by hand", "worktree-hold released"]
+
+
+@pytest.mark.parametrize(
+    "tool, fid, reason, status, error",
+    [
+        ("board_hold_worktree", "bd-1", "", "in_progress", "needs a reason"),
+        ("board_hold_worktree", "bd-1", '"  "', "in_progress", "needs a reason"),
+        ("board_hold_worktree", "bd-1", "manual reset", "closed", "terminal card"),
+        ("board_hold_worktree", "missing", "manual reset", "in_progress", "unknown"),
+        ("board_release_worktree_hold", "missing", None, "in_progress", "unknown"),
+    ],
+)
+def test_worktree_hold_tool_errors_change_nothing(worktree_hold_board, tool, fid, reason, status, error):
+    from copy import deepcopy
+
+    fake = worktree_hold_board
+    fake.bead["status"] = status
+    before = deepcopy(fake.bead)
+    args = {"feature_id": fid}
+    if reason is not None:
+        args["reason"] = reason
+    out = _get_tool(tool).invoke(args)
+    assert out.startswith("Error:") and error in out
+    assert fake.bead == before
+    assert fake.writes == []
