@@ -11,6 +11,7 @@ so tests that monkeypatch ``project_board.loop.<name>`` still take effect.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 from .. import block_pages, external_review, merge_state_hold, review_coverage_hold, work_locations
@@ -4607,11 +4608,22 @@ class ReconcileMixin(WorktreeCleanup):
                 card = self._review_card.get(fid, "")
                 if card:
                     inputs["card"] = card
-                result = await _within(
-                    runner(self.review_workflow, inputs),
-                    self.review_gate_timeout,
-                    on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
-                )
+                model_scope = nullcontext()
+                if self.review_model:
+                    try:
+                        from graph.subagent_model import turn_model_scope
+
+                        model_scope = turn_model_scope(self.review_model)
+                    except (ImportError, AttributeError):
+                        pass  # Older/non-protoAgent hosts still run the review.
+                # Bind before runner creation and _within's task creation: child tasks
+                # inherit this override, above aux_model but below explicit subagent pins.
+                with model_scope:
+                    result = await _within(
+                        runner(self.review_workflow, inputs),
+                        self.review_gate_timeout,
+                        on_abandon=lambda t: self._review_zombies.__setitem__(fid, t),
+                    )
                 failed = list((result or {}).get("failed") or [])
                 if failed:
                     # A partial panel is NOT a review (ADR 0078 D3): a starved/errored

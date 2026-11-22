@@ -107,6 +107,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
             self.cfg.get("reviewer_of_record_label", "reviewer-of-record:board") or ""
         ).strip()
         self.review_workflow = str(self.cfg.get("review_workflow", "code-review")).strip() or "code-review"
+        self.review_model = str(self.cfg.get("review_model", "anthropic-oauth:claude-sonnet-5") or "").strip()
         self.review_fix_max = max(0, int(self.cfg.get("review_fix_max", 2)))
         # Cap on consecutive UNRUNNABLE gate attempts (runner missing / workflow dying /
         # panel steps failing) before escalating to the operator via flag_blocked —
