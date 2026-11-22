@@ -4163,7 +4163,25 @@ class ReconcileMixin(WorktreeCleanup):
             # A gate that cannot judge must not hold the PR out of external review (#691).
             await self._release_board_draft(store, fid, pr_url, repo)
             return
-        blocking = [f for f in findings if f.verdict != "refuted" and f.severity in ("blocker", "major")]
+        # ADR 0077: the verifier's uncertainty cannot block, even when its quote is
+        # grounded. Unset/unknown verdicts still fail safe; only explicit verdicts opt out.
+        blocking = [
+            f for f in findings if f.verdict not in ("refuted", "uncertain") and f.severity in ("blocker", "major")
+        ]
+        uncertain = [f for f in findings if f.verdict == "uncertain" and f.severity in ("blocker", "major")]
+        if uncertain:
+            # Do not use `_render_findings`: its blocking title is read by recovery
+            # as required fixes. Keep these visible without promoting them on restart.
+            try:
+                await asyncio.to_thread(
+                    store.comment,
+                    fid,
+                    f"review gate: {len(uncertain)} finding(s) non-blocking — verifier verdict is uncertain "
+                    f"(ADR 0077):\n"
+                    + "\n".join(f"- {f.file}:{f.line} [{f.severity}; uncertain] {f.claim}" for f in uncertain),
+                )
+            except Exception:  # noqa: BLE001 — bookkeeping must not fail the gate
+                log.warning("[project_board] %s uncertain-finding comment failed", fid, exc_info=True)
         # #381: enforce the grounding ADR 0077 already promises. A blocking finding must
         # quote the diff VERBATIM; one whose quote the diff demonstrably does not contain
         # cannot be fixed by editing code that already says the right thing, so it bounces

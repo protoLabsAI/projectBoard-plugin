@@ -1,0 +1,1 @@
+Review findings graded `uncertain` by the verifier no longer bounce or terminal-block a card, even when their evidence is grounded. Major and blocker findings remain visible as non-blocking card comments and in review history; confirmed, unset, and unknown verdicts retain their existing blocking behavior.
