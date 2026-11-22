@@ -4287,11 +4287,13 @@ class BeadsBoard:
             except BoardError:
                 log.warning("[project_board] %s: could not strip stale terminal labels", fid, exc_info=True)
 
-    def _close_then_strip_stale(self, fid: str, stale: list[str], *close_args: str) -> None:
+    def _close_then_strip_stale(self, fid: str, stale: list[str], *close_args: str) -> bool:
         """Retain live labels until close lands, so refreshes never see a review bounce.
 
         On timeout (#404), re-read before cleanup: open or unknown cards keep their
         labels and raise; confirmed closed cards can safely shed them.
+        Return False only for a confirmed already-closed refusal, so callers do not
+        duplicate audit comments for a close another pass already performed.
         """
         try:
             self._run("close", fid, *close_args)
@@ -4305,7 +4307,18 @@ class BeadsBoard:
                 ) from None
             if (now or {}).get("bead_status") != "closed":
                 raise
+        except BoardError as exc:
+            try:
+                now = self.get_feature(fid)
+            except BoardError:
+                now = None
+            if (now or {}).get("bead_status") != "closed" or "already closed" not in str(exc).lower():
+                raise
+            log.info("[project_board] %s: close already landed; card confirmed closed", fid)
+            self._strip_terminal_stale(fid, stale)
+            return False
         self._strip_terminal_stale(fid, stale)
+        return True
 
     # ── the ONE Done edge for coding features (invariant #2) ──────────────────
     @after_transition
@@ -4345,8 +4358,8 @@ class BeadsBoard:
                         fid,
                         blocker_id,
                     )
-            self._close_then_strip_stale(fid, stale, "-r", f"merged: {pr_url}")
-            if blocked_note:
+            closed_here = self._close_then_strip_stale(fid, stale, "-r", f"merged: {pr_url}")
+            if blocked_note and closed_here:
                 # Best-effort (comment() swallows br errors) and only here, past a close
                 # that landed — so the note is posted exactly once, on the pass that closes.
                 self.comment(fid, blocked_note)
