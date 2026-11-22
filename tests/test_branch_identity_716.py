@@ -9,6 +9,7 @@ and the original was orphaned.
 
 from __future__ import annotations
 
+import pathlib
 import shutil
 import subprocess
 
@@ -17,6 +18,7 @@ from conftest import REAL_SEAMS
 
 from project_board import store as store_mod
 from project_board import worktree
+from project_board.loop.attach import attach_external_pr
 from project_board.loop.drive import DriveMixin
 from project_board.store import LABEL_BRANCH_SLUG_PREFIX, BeadsBoard, BoardError
 
@@ -235,3 +237,122 @@ def test_slug_from_head_shapes():
     assert worktree.slug_from_head("bd-x", "feat/bd-y-old") is None
     assert worktree.slug_from_head("bd-x", "feat/bd-x-Bad_Slug") is None
     assert worktree.slug_from_head("bd-x", "") is None
+
+
+# ── #716 (2/3): attaching a PR checks the card's recorded branch, not its new title ──
+
+_AC = "- WHEN x THE SYSTEM SHALL y"
+_PR = "https://github.com/o/r/pull/9"
+
+
+def _ready_card(board, title: str) -> dict:
+    """A coding card that passed the real Ready gate (attach refuses anything else)."""
+    (pathlib.Path(board.repo) / "mod.py").write_text("x = 1\n")
+    fid = board.create_feature(title, spec="s", acceptance_criteria=_AC, files_to_modify=["mod.py"])["id"]
+    return board.mark_ready(fid)
+
+
+@pytest.fixture
+def fake_pr(monkeypatch):
+    """Fake only the `gh` reads the attach makes: the PR's identity and the repo slug."""
+    pr = {"url": _PR, "state": "OPEN", "head": "", "base": "main", "cross_repo": False}
+
+    async def _identity(url, *, cwd="."):
+        return dict(pr)
+
+    async def _slug(*, cwd="."):
+        return "o/r"
+
+    monkeypatch.setattr(worktree, "pr_identity", _identity)
+    monkeypatch.setattr(worktree, "repo_slug", _slug)
+    return pr
+
+
+async def _attach(board, fid):
+    return await attach_external_pr(board, board.get_feature(fid), _PR, repo=board.repo, base="main")
+
+
+async def test_attach_after_rename_checks_the_recorded_branch(board, fake_pr):
+    fid = _ready_card(board, "Old title")["id"]
+    board.record_branch_slug(fid, "old-title")
+    board.update_feature(fid, title="New title")
+    fake_pr["head"] = f"feat/{fid}-old-title"
+
+    result = await _attach(board, fid)
+
+    assert result["state"] == "in_review" and result["pr_url"] == _PR
+    f = board.get_feature(fid)
+    assert f["branch_slug"] == "old-title"
+    assert worktree.branch_name(fid, worktree.branch_title_for(f)) == f"feat/{fid}-old-title"
+
+
+async def test_attach_after_rename_refuses_the_new_title_branch_once_recorded(board, fake_pr):
+    fid = _ready_card(board, "Old title")["id"]
+    board.record_branch_slug(fid, "old-title")
+    board.update_feature(fid, title="New title")
+    fake_pr["head"] = f"feat/{fid}-new-title"
+
+    with pytest.raises(BoardError) as exc:
+        await _attach(board, fid)
+    assert f"push the work to branch 'feat/{fid}-old-title'" in str(exc.value)
+
+
+async def test_legacy_card_attach_adopts_and_records_the_pr_head_slug(board, fake_pr):
+    fid = _ready_card(board, "Old title")["id"]
+    board.update_feature(fid, title="New title")
+    assert board.get_feature(fid)["branch_slug"] is None
+    fake_pr["head"] = f"feat/{fid}-old-title"
+
+    result = await _attach(board, fid)
+
+    assert result["state"] == "in_review"
+    assert board.get_feature(fid)["branch_slug"] == "old-title"
+
+
+async def test_legacy_card_attach_survives_a_failed_slug_record(board, fake_pr, monkeypatch):
+    fid = _ready_card(board, "Old title")["id"]
+    fake_pr["head"] = f"feat/{fid}-older-title"
+
+    def _boom(*_a, **_k):
+        raise BoardError("br is busy")
+
+    monkeypatch.setattr(board, "record_branch_slug", _boom)
+    result = await _attach(board, fid)
+    assert result["state"] == "in_review"
+    assert board.get_feature(fid)["branch_slug"] is None
+
+
+async def test_legacy_card_attach_still_refuses_a_non_canonical_head(board, fake_pr):
+    fid = _ready_card(board, "Old title")["id"]
+    fake_pr["head"] = "someone/else"
+
+    with pytest.raises(BoardError) as exc:
+        await _attach(board, fid)
+    msg = str(exc.value)
+    assert "is on branch 'someone/else', not" in msg and "canonical branch" in msg
+    assert f"push the work to branch 'feat/{fid}-old-title'" in msg
+    f = board.get_feature(fid)
+    assert f["branch_slug"] is None and f["board_state"] != "in_review"
+
+
+async def test_legacy_card_refuses_another_cards_branch(board, fake_pr):
+    fid = _ready_card(board, "Old title")["id"]
+    fake_pr["head"] = f"feat/{fid}x-old-title"
+    with pytest.raises(BoardError):
+        await _attach(board, fid)
+    assert board.get_feature(fid)["branch_slug"] is None
+
+
+def test_branch_title_for_prefers_a_valid_recorded_slug_without_gh(monkeypatch):
+    async def _no_gh(*_a, **_k):  # pragma: no cover — the helper must never reach gh
+        raise AssertionError("branch_title_for called gh")
+
+    monkeypatch.setattr(worktree, "_gh", _no_gh)
+    monkeypatch.setattr(worktree, "pr_head_branch", _no_gh)
+    card = {"id": "bd-x", "title": "New title", "pr_url": _PR}
+    assert worktree.branch_title_for({**card, "branch_slug": "old-title"}) == "old-title"
+    assert worktree.branch_title_for({**card, "branch_slug": ""}) == ""
+    assert worktree.branch_title_for({**card, "branch_slug": None}) == "New title"
+    assert worktree.branch_title_for({**card, "branch_slug": "Bad/Slug"}) == "New title"
+    assert worktree.branch_title_for({"id": "bd-x"}) == ""
+    assert worktree.branch_name("bd-x", worktree.branch_title_for({**card, "branch_slug": ""})) == "feat/bd-x"
