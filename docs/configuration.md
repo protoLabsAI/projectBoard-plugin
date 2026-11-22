@@ -367,6 +367,27 @@ projects:
   moving `src/core.py` to `docs/` still runs the `src/**` command.
 - A mapping keeps its order in YAML. A list of `[glob, command]` pairs also works.
 
+**Changed test files (#729).** `coder_solve_test_cmd` and commands in
+`coder_solve_test_paths` may contain `{changed_tests}`. For example:
+
+```yaml
+coder_solve_test_cmd: "uv run --no-project --python 3.12 --with-requirements requirements-dev.txt --with pytest-xdist python -m pytest -q -n 2 -p no:randomly {changed_tests}"
+```
+
+The board replaces the token with sorted, shell-quoted repo-relative changed paths
+whose basename matches `test_*.py` or `*_test.py` and which still exist as files in
+the candidate tree. This includes committed changes, uncommitted edits, and untracked
+files; deleted tests are excluded. Run the command from the candidate root so these
+paths resolve correctly.
+
+When no changed test files remain, that entire command is skipped with the oracle
+note `no changed test files → test run skipped`; if git cannot list changes, the note
+is `changed files unknown → test run skipped`. It never runs pytest with an empty
+test list. Other selected commands, such as lint, still run. If all commands skip,
+the candidate passes without tests, with the existing warning and verdict note.
+Commands without the token retain their existing behavior. The example limits pytest
+to two workers; concurrent candidates still need to fit the operator's worker budget.
+
 **The format stage (#719)**: repair a candidate whose only problem is formatting, instead
 of building new ones. Set both commands, per project or board-wide:
 
