@@ -205,6 +205,11 @@ _HELD_REASONS = (
 )
 
 
+# #757: how many extra passes a drive spends delivering fix-round findings a finished pass
+# did not carry before it stops and asks for triage instead of handing the PR to review.
+_FIX_FEEDBACK_REDISPATCH_MAX = 2
+
+
 def _held_summary(feats) -> dict:
     """``{reason: {count, ids, next}}`` for every open card that is held rather than
     claimable (#406) — the stranded shapes, dependency waits, and blocked cards by class
@@ -2340,6 +2345,21 @@ class DriveMixin(HostDiskMixin):
         requirement_followup_pending = False
         goal_followup_pending = False
         attempt = 0
+        # #757: re-dispatches spent because a finished pass had not carried the card's
+        # queued fix-round findings (bounded — each one writes a delivery receipt).
+        feedback_redispatches = 0
+        # #757: every fix-round brief a prompt build in THIS drive delivered. History
+        # marks it delivered once built, so each later rebuild here (a resumed retained
+        # integration replacing the first prompt, a provider retry) carries it forward.
+        carried_feedback = ""
+        self.__dict__.setdefault("_delivered_fix_briefs", {}).pop(fid, None)
+
+        def _carry_delivered() -> None:
+            nonlocal carried_feedback
+            delivered = self._delivered_fix_briefs.pop(fid, "")
+            if delivered and delivered not in carried_feedback:
+                carried_feedback = "\n\n".join(b for b in (carried_feedback, delivered) if b)
+
         # "A prior attempt timed out" (#146) for the NEXT dispatch after a timeout climb.
         # Drive-local on purpose (#425 review): it rode `_ci_feedback`, which persists
         # across drives and marks a carried-forward FIX — so one all-timeout fan-out
@@ -2404,8 +2424,13 @@ class DriveMixin(HostDiskMixin):
                         missing_review_findings = await self._budget_get(store, fid, "review-fix", feature) > 0
                 lessons = await self._fetch_kg_lessons(feature)
                 prompt = self._build_prompt(
-                    feature, lessons=lessons, timeout_note=timeout_note, resume_note=resume_note
+                    feature,
+                    lessons=lessons,
+                    timeout_note=timeout_note,
+                    resume_note=resume_note,
+                    carried_feedback=carried_feedback,
                 )
+                _carry_delivered()
                 prompt += work_location_capture.reporting_instructions()
                 # Which PROVIDER at this rung. `siblings` are interchangeable delegates for
                 # the same capability tier (#362); `sib` advances only on a provider failure
@@ -2551,7 +2576,10 @@ class DriveMixin(HostDiskMixin):
                             # told its work is on disk. (The stranded branch still holds it.)
                             resume_note = ""
                             stranded_resume = False
-                            prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                            prompt = self._build_prompt(
+                                feature, lessons=lessons, timeout_note=timeout_note, carried_feedback=carried_feedback
+                            )
+                            _carry_delivered()
                             prompt += work_location_capture.reporting_instructions()
                         # A FRESH build first clears the ground, and the two halves are one
                         # rule (#405). This drive's own earlier attempt is its to throw away:
@@ -2608,7 +2636,10 @@ class DriveMixin(HostDiskMixin):
                             context = await worktree.prepare_integration(wt, branch, base)
                             recovery_before = await worktree.recovery_edit_state(wt)
                             self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
-                            prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                            prompt = self._build_prompt(
+                                feature, lessons=lessons, timeout_note=timeout_note, carried_feedback=carried_feedback
+                            )
+                            _carry_delivered()
                             prompt += work_location_capture.reporting_instructions()
                         # Tap this re-dispatch into the live monitor (#84) — same gen 1,
                         # continuing the current build (no progress_new_run, so the drawer
@@ -2740,7 +2771,13 @@ class DriveMixin(HostDiskMixin):
                             context = await worktree.recovery_context(wt, branch)
                             if context:
                                 self._ci_feedback[fid] = integration_feedback(self._ci_feedback.get(fid, ""), context)
-                                prompt = self._build_prompt(feature, lessons=lessons, timeout_note=timeout_note)
+                                prompt = self._build_prompt(
+                                    feature,
+                                    lessons=lessons,
+                                    timeout_note=timeout_note,
+                                    carried_feedback=carried_feedback,
+                                )
+                                _carry_delivered()
                                 prompt += work_location_capture.reporting_instructions()
                         await self._prepare_tree(wt, feature)  # its own deps, before the coder
                         if feature.get("pr_url") and context:
@@ -3936,6 +3973,34 @@ class DriveMixin(HostDiskMixin):
                 # Built + PR opened. The fleet PR-review pipeline reviews it on open;
                 # only dispatch an explicit review when configured to (review_dispatch).
                 log.info("[project_board] %s coder done (%d chars) → %s", fid, len(result or ""), pr_url)
+                # #757: a pass whose prompt never carried the card's queued fix-round
+                # findings (a resumed integration repair, or findings queued mid-pass) must
+                # not hand the PR to review looking finished. Run the fix round on the same
+                # tree, branch and PR first; the rebuilt prompt delivers the findings.
+                if feature.get("pr_url") and await asyncio.to_thread(self._fix_feedback_undelivered, store, fid):
+                    feedback_redispatches += 1
+                    if feedback_redispatches > _FIX_FEEDBACK_REDISPATCH_MAX:
+                        await self._block_or_stand_aside(
+                            store,
+                            fid,
+                            "queued fix-round findings could not be delivered to the coder "
+                            f"after {_FIX_FEEDBACK_REDISPATCH_MAX} re-dispatch(es) — needs triage: {pr_url}",
+                            repo=repo,
+                            wt=wt,
+                            branch=branch,
+                            pr_url=pr_url,
+                            category="terminal",
+                        )
+                        self._inflight.pop(fid, None)
+                        return
+                    log.info(
+                        "[project_board] %s fix-round feedback still pending after this pass — "
+                        "re-dispatching on the same PR before review (%s)",
+                        fid,
+                        pr_url,
+                    )
+                    keep_wt = True
+                    continue
                 try:
                     await asyncio.to_thread(store.open_review, fid, pr_url=pr_url)
                 except BoardError as exc:
@@ -4227,6 +4292,22 @@ class DriveMixin(HostDiskMixin):
             host_friction.record(summary, detail, severity=severity, key=f"{summary}|{fid}")
         except Exception:  # noqa: BLE001 — a side channel must never change the drive's outcome
             log.debug("[project_board] %s drive-failure friction record failed", fid, exc_info=True)
+
+    @staticmethod
+    def _fix_feedback_undelivered(store, fid: str) -> bool:
+        """#757: whether ``fid`` still owes its coder a queued fix-round brief.
+
+        Slice 1's helper over the durable bounce history plus the in-process queue. A
+        store without comment history (a host-free fake) reads only the queue; a failed
+        history read keeps today's hand-off rather than stalling a finished PR.
+        """
+        if not callable(getattr(store, "feature_comments", None)):
+            return bool(_PENDING_FEEDBACK.get(fid))
+        try:
+            return has_undelivered_fix_feedback(store, fid)
+        except Exception:  # noqa: BLE001 — unreadable history: hand off as today, loudly
+            log.warning("[project_board] %s: could not read fix-round feedback history", fid, exc_info=True)
+            return bool(_PENDING_FEEDBACK.get(fid))
 
     async def _block_or_stand_aside(
         self,

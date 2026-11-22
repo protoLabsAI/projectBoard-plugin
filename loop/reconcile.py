@@ -503,7 +503,18 @@ class ReconcileMixin(WorktreeCleanup):
             self._repo_for(feature), self.root, fid, feature.get("title") or ""
         ):
             if await self._still_orphaned_then(store, fid, store.requeue):
-                log.info("[project_board] %s reset to ready (retained PR integration — resume repair)", fid)
+                # #757: say when a requeued fix round is waiting behind the repair — the
+                # drive delivers it before the PR can return to review.
+                pending_note = (
+                    "; fix-round feedback pending — the fix round runs after the repair"
+                    if await asyncio.to_thread(self._fix_feedback_undelivered, store, fid)
+                    else ""
+                )
+                log.info(
+                    "[project_board] %s reset to ready (retained PR integration — resume repair%s)",
+                    fid,
+                    pending_note,
+                )
             return
         branch = worktree.branch_name(fid, feature.get("title") or "")
         with worktree.capture_gh_timeouts() as timeouts:
