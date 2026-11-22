@@ -4,7 +4,9 @@
   by `br create` itself as an `idem:<hash>` label, so it is durable across restarts. Under
   a board-wide lock the store looks for a card already carrying the key (in any state,
   cancelled and done included) and returns it instead of creating another; the tool reply
-  says `created: false` and names the existing card. `force=true` skips only the heuristic
+  says `created: false` and names the existing card. Concurrent requests with the same
+  key resolve to that card even when their titles differ; retrying after a restart resolves
+  to the same durable card. `force=true` skips only the heuristic
   dedup, never the key check. The canonical card for a key is the oldest one (created_at,
   then id). `board_cancel_feature` / `cancel_feature` take an optional `duplicate_of`. With
   it, the cancel is refused when the target is the canonical card for a key it shares with
