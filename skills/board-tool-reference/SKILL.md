@@ -156,9 +156,14 @@ been dispatched; otherwise refused with the reason. A ready card must also have 
    — calling create twice (e.g. reconsidering mid-turn) stacks a duplicate the loop churns on;
 2. `depends_on` names a card already `in_review` with an open PR — work built on in-flight
    work is a fix round on THAT card's PR: `board_requeue_feature(fid, findings=...)`;
-3. `source_issue` is set and an open PR in that issue's repo already references the issue
-   number — review or contribute to that PR instead of sending a second coder.
+3. `source_issue` is set and an open PR in that issue's repo already closes the issue
+   with a closing keyword (`close/closes/closed`, `fix/fixes/fixed`, or
+   `resolve/resolves/resolved`, case-insensitive, optional colon) followed by `#N`,
+   `owner/repo#N` for that repo, or the full issue URL. Plain mentions such as
+   `see #N` and `Refs #N` do not count. The refusal names the PR number and URL.
 
+On `board_create_feature`, `allow_shared_source_issue=true` skips only the PR check
+(without querying GitHub); same-title and `depends_on` checks still run.
 `force=true` bypasses all three. A store read or GitHub API failure never blocks creation
 (better a possible duplicate than a stuck board).
 
