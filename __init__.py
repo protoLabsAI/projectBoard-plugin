@@ -1625,6 +1625,11 @@ def _board_tools(cfg: dict, registry=None):
         credit_br_wait(snap.waited_s)  # the listing's queueing, on its own thread, was this call's wait
         rows = snap.rows
         if state:
+            # Same rows as ``list_features(state=…)``: it narrows the `br list` rows by this
+            # projection of status + labels and adds none back (the cancelled-dependency
+            # rows are ``live_cards``'s, not the listing's), and the ready scan and the sort
+            # do not depend on which other rows are present. Pinned against the real store
+            # in test_dependency_filters_match_direct_listing.
             rows = [f for f in rows if f.get("board_state") == state]
         note = ""
         if snap.stale:

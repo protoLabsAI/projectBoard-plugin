@@ -269,6 +269,14 @@ def test_dependency_filters_match_direct_listing(board, monkeypatch, shared):
                 assert board_list.invoke(query) == previous.invoke(query), query
         cancelled = _by_id(board_list.invoke(dict(state="cancelled", include_archived=archived)))
         assert ("snap-00000" in cancelled) is archived
+        # The store itself, with no tool in between: ``list_features(state=…)`` is the full
+        # listing narrowed by ``board_state`` and nothing else. It appends no dependency
+        # row from another state, so narrowing the snapshot afterwards loses and gains none.
+        full = store.list_features(include_archived=archived)
+        for state in ("backlog", "ready", "in_progress", "in_review", "done", "blocked", "cancelled"):
+            assert store.list_features(state=state, include_archived=archived) == [
+                f for f in full if f["board_state"] == state
+            ], (state, archived)
     assert store.get_feature("snap-00100")["depends_on"]
 
 
