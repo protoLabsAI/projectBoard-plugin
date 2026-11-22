@@ -1129,7 +1129,7 @@ def _board_tools(cfg: dict, registry=None):
     @tool
     def board_get_feature(feature_id: str) -> str:
         """Read one card's full detail as JSON: spec, acceptance_criteria, state, labels, pr_url,
-        merge_hold, files_to_modify, project, `requirements` (the ledger from the acceptance
+        merge_hold, worktree_hold, files_to_modify, project, `requirements` (the ledger from the acceptance
         criteria; a PR is refused while any item is open), `depends_on` (every edge) vs
         `open_depends_on` (still blocking), `waits_for` with cached `gates` verdicts,
         `next_action`, and `blocked_reason`/`blocked_class` when blocked. A `preflight-hold` card
@@ -1158,6 +1158,7 @@ def _board_tools(cfg: dict, registry=None):
                 # carries `merge-hold`, so a reader can see the hold without re-decoding
                 # `labels`. board_hold_merge sets it, board_release_merge_hold lifts it.
                 "merge_hold": f.get("merge_hold", False),
+                "worktree_hold": f.get("worktree_hold", False),
                 "difficulty": f["difficulty"],
                 "files_to_modify": f.get("files_to_modify", []),
                 "foundation": f.get("foundation", False),
@@ -1685,6 +1686,34 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
+    def board_hold_worktree(feature_id: str, reason: str) -> str:
+        """Hold a board card's worktree before rewriting its branch by hand (reset, squash,
+        manual rebase). While held, the loop runs no git in the card's worktree and dispatches
+        no round on it. A reason is required; valid in any non-terminal state and idempotent.
+        Release it with board_release_worktree_hold once you have pushed."""
+        try:
+            reason = _strip_wrapping_quotes(reason).strip()
+            f = get_store(**store_kw).set_worktree_hold(feature_id, reason)
+            return json.dumps(
+                {"id": f["id"], "state": f["board_state"], "worktree_hold": f.get("worktree_hold", False)}
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
+    def board_release_worktree_hold(feature_id: str) -> str:
+        """Release a card's worktree hold after pushing your manual branch rewrite, so the
+        loop can resume git operations and dispatch rounds. Inverse of board_hold_worktree;
+        idempotent when not held. An unknown card returns an Error."""
+        try:
+            f = get_store(**store_kw).release_worktree_hold(feature_id)
+            return json.dumps(
+                {"id": f["id"], "state": f["board_state"], "worktree_hold": f.get("worktree_hold", False)}
+            )
+        except BoardError as exc:
+            return f"Error: {exc}"
+
+    @tool
     def board_reset_merged_verify_budget(feature_id: str) -> str:
         """Reset one in_review card's merged-state re-verify budget: the fix when its `next_action`
         reads `auto-merge held: merged-verify budget exhausted`. Clears the persisted budget label
@@ -2128,6 +2157,8 @@ def _board_tools(cfg: dict, registry=None):
         board_concurrency_set,
         board_hold_merge,
         board_release_merge_hold,
+        board_hold_worktree,
+        board_release_worktree_hold,
         board_reset_merged_verify_budget,
         board_list,
         board_retro,
