@@ -44,7 +44,7 @@ def card(entries=None, **kw):
     }
 
 
-def test_restart_tools_and_existing_detail_route(make_board, monkeypatch):
+def test_restart_tools_and_existing_detail_route(make_board, monkeypatch, tmp_path):
     # Persist a comment, discard all process state, rebuild the store projection.
     comment = work_locations.PREFIX + json.dumps(work_locations.record(entry(), "coder"))
     bead = {
@@ -61,7 +61,9 @@ def test_restart_tools_and_existing_detail_route(make_board, monkeypatch):
             rows[0].pop("comments")
         return (rows, False) if kw.get("with_has_more") else rows
 
-    board = make_board(read)
+    # A real folder: board_list reads the shared snapshot (#805), which runs no `br`, so it
+    # checks the board's repo folder itself (#803) instead of leaving that to `_run`.
+    board = make_board(read, repo=str(tmp_path))
     ws.reset()
     monkeypatch.setattr(store, "get_store", lambda **kw: board)
     tools = {t.name: t for t in pb._board_tools({})}

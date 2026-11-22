@@ -643,6 +643,18 @@ def _with_store_wait(result, seconds: float):
     return f"{text}\n\n{notice}{tail}" if text else f"{notice}{tail}"
 
 
+def _note_tool_write(wait) -> None:
+    """Tell the shared read cache that the tool call counted by ``wait`` wrote to the board
+    store (#805), so the next board_list waits for a listing taken after that write and is
+    never answered with an older one. Runs when the call ends, failed or not: a failed
+    write may still have landed. A call that only read costs nothing here."""
+    if not wait.wrote:
+        return
+    from . import read_cache
+
+    read_cache.note_shared_write()
+
+
 def _report_store_wait(t) -> None:
     """Make board tool ``t`` say when it waited for the busy board store (#805).
 
@@ -662,7 +674,10 @@ def _report_store_wait(t) -> None:
         @functools.wraps(func)
         def _sync(*args, **kwargs):
             with track_br_wait() as wait:
-                result = func(*args, **kwargs)
+                try:
+                    result = func(*args, **kwargs)
+                finally:
+                    _note_tool_write(wait)
             return _with_store_wait(result, wait.seconds)
 
         t.func = _sync
@@ -672,7 +687,10 @@ def _report_store_wait(t) -> None:
         @functools.wraps(coroutine)
         async def _async(*args, **kwargs):
             with track_br_wait() as wait:
-                result = await coroutine(*args, **kwargs)
+                try:
+                    result = await coroutine(*args, **kwargs)
+                finally:
+                    _note_tool_write(wait)
             return _with_store_wait(result, wait.seconds)
 
         t.coroutine = _async
@@ -685,6 +703,7 @@ def _board_tools(cfg: dict, registry=None):
     from .store import (
         AGENT_HOLD_CLASS,
         MANUAL_BLOCK_CLASS,
+        BeadsBoard,
         BoardError,
         annotate_next_action,
         escalation_enabled,
@@ -1574,6 +1593,52 @@ def _board_tools(cfg: dict, registry=None):
         except BoardError as exc:
             return f"Error: {exc}"
 
+    def _listing_from_snapshot(store, state: str, include_archived: bool) -> tuple[list[dict], str]:
+        """board_list's rows from the shared read snapshot (read_cache, #805): the listing
+        GET /features and /cards already serve from, so a call on an unchanged board runs
+        no `br` and never queues for the `br` lock behind the loop or the sweep.
+
+        Returns the rows ``store.list_features(state=…, include_archived=…)`` would, as
+        shallow copies (the annotations below stamp top-level keys; the cached rows are
+        shared), and a line for the reply, empty unless the listing is a stale one.
+
+        Freshness: a board tool call that wrote ends by bumping the cache's write epoch
+        (``_note_tool_write``), and a listing older than the newest epoch is never served,
+        so this waits for one taken after the agent's own write. Against a write by the
+        loop or another process it waits up to ``read_cache.STALE_WAIT_S`` for the refresh
+        and then answers from the previous listing, saying so."""
+        from . import read_cache
+        from .store import credit_br_wait
+
+        # Cached reads bypass `br`, including its missing-workspace error. Check on
+        # every call, even when the default board's database lives outside its repo.
+        missing = store.missing_repo_error()
+        if missing is not None:
+            raise missing
+
+        key = read_cache.db_file(store.db, store.repo)
+        cache = read_cache.published(key)
+        if cache is None:
+            # No data router (the API is best-effort): this board's own cache, same rules.
+            cache = read_cache.own_cache(store, key)
+        snap = cache.snapshot(include_archived)
+        credit_br_wait(snap.waited_s)  # the listing's queueing, on its own thread, was this call's wait
+        rows = snap.rows
+        if state:
+            # Same rows as ``list_features(state=…)``: it narrows the `br list` rows by this
+            # projection of status + labels and adds none back (the cancelled-dependency
+            # rows are ``live_cards``'s, not the listing's), and the ready scan and the sort
+            # do not depend on which other rows are present. Pinned against the real store
+            # in test_dependency_filters_match_direct_listing.
+            rows = [f for f in rows if f.get("board_state") == state]
+        note = ""
+        if snap.stale:
+            note = (
+                f"\n\nThe board store is busy: this listing is from {snap.age_s():.0f} s ago "
+                "and may miss a change the loop just made. Call board_list again for a fresh one."
+            )
+        return [dict(f) for f in rows], note
+
     @tool
     def board_list(
         state: str = "",
@@ -1600,9 +1665,14 @@ def _board_tools(cfg: dict, registry=None):
         # br missing) must reach the model as an `Error: …` tool RESULT it can adapt
         # to — an escaped BoardError kills the whole turn and discards every tool
         # call already made in it (observed: 21 completed calls thrown away).
+        stale_note = ""
         try:
             store = get_store(**_store_kw_for(project))
-            feats = store.list_features(state=state or None, include_archived=include_archived)
+            if isinstance(store, BeadsBoard):
+                feats, stale_note = _listing_from_snapshot(store, state, include_archived)
+            else:
+                # Not a `br` board, so there is no change token to cache on: list directly.
+                feats = store.list_features(state=state or None, include_archived=include_archived)
             # Project filter (#90): keep only the features stamped for `project`. Applied
             # BEFORE the CI join so a filtered listing never spends a `gh` call on a row it
             # would drop.
@@ -1649,7 +1719,7 @@ def _board_tools(cfg: dict, registry=None):
                 if f.get("ci_summary"):
                     row["ci_summary"] = f["ci_summary"]
             rows.append(row)
-        return json.dumps(rows)
+        return json.dumps(rows) + stale_note
 
     @tool
     def board_retro() -> str:

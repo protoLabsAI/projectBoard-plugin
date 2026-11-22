@@ -34,6 +34,7 @@ from . import setup_check
 from .board_cards import summary_row
 from .projects import default_project as resolve_default_project
 from .projects import resolve_projects, store_db_path
+from .read_cache import store_rev  # the store's change stamp lives beside the cache that reads it
 from .store import (
     AGENT_HOLD_CLASS,
     MANUAL_BLOCK_CLASS,
@@ -561,27 +562,6 @@ def build_router(cfg: dict):
     return router
 
 
-def store_rev(db: str) -> str:
-    """A cheap change stamp for the beads store at ``db``: the size + mtime of the
-    database, its WAL and the ``.beads`` JSONL exports. Every ``br`` write lands in one of
-    them, so the stamp moves on any write by any process — and reading it is a few
-    ``stat`` calls. A missing file contributes ``-``; an unreadable directory is skipped."""
-    parts: list[str] = []
-    paths = [db, db + "-wal"]
-    beads_dir = os.path.dirname(db)
-    try:
-        paths += sorted(os.path.join(beads_dir, n) for n in os.listdir(beads_dir) if n.endswith(".jsonl"))
-    except OSError:
-        pass
-    for path in paths:
-        try:
-            st = os.stat(path)
-            parts.append(f"{st.st_size}.{st.st_mtime_ns}")
-        except OSError:
-            parts.append("-")
-    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
-
-
 def _json_default(o):
     """``json.dumps`` fallback for the rare non-JSON value in a row (a set, a datetime):
     the FastAPI encoder's answer, so the body matches what ``JSONResponse`` would send."""
@@ -615,8 +595,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
     from fastapi.routing import APIRoute
 
     from . import work_snapshot
+    from . import read_cache as read_cache_mod
     from .read_cache import BoardReadCache
-    from .store import default_db_path
     from .loop.reconcile import WorktreeCleanup
 
     class _WriteNotingRoute(APIRoute):
@@ -715,10 +695,7 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
             read_cache.note_write()
 
     def _db_file() -> str:
-        db = store_kw.get("db") or default_db_path()
-        if not os.path.isabs(db):  # br runs in the repo, so a relative db_path is the repo's
-            db = os.path.join(str(store_kw.get("repo") or "."), db)
-        return db
+        return read_cache_mod.db_file(store_kw.get("db"), store_kw.get("repo"))
 
     def _read_token():
         # In-process writes (loop, tools, routes) bump the board revision; any writer,
@@ -728,13 +705,18 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         routing = json.dumps(
             [getattr(board, "projects", None), getattr(board, "default_project", None)], sort_keys=True, default=str
         )
-        return (work_snapshot.board_revision(), store_rev(_db_file()), routing)
+        # The file stamp gates a content stamp: `br` 0.1.x moves the files' mtimes on a
+        # READ, which must not make the listing it just took out of date (#805).
+        db = _db_file()
+        return (work_snapshot.board_revision(), read_cache_mod.listing_rev(db, store_rev(db)), routing)
 
     # The ONE board listing the read routes serve from (/features, /cards…): cached,
     # single-flight, invalidated by writes, never queued behind the drive loop's `br` lock.
     read_cache = BoardReadCache(
         lambda include_archived: store().list_features(include_archived=include_archived), _read_token
     )
+    # The board_list tool reads this same cache (#805): it finds it under the board's file.
+    read_cache_mod.publish(_db_file(), read_cache)
 
     def _snapshot_headers(snap) -> dict:
         return {
