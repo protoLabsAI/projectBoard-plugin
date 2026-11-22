@@ -186,6 +186,55 @@ def _client(monkeypatch, store, *, cfg=None):
     return TestClient(app)
 
 
+@pytest.mark.parametrize("view", ["", "?view=summary"])
+def test_features_shape_and_stale_completed_refresh(monkeypatch, view):
+    from project_board import work_snapshot
+
+    class ChangedDuringRead(FakeStore):
+        def list_features(self, **kwargs):
+            rows = super().list_features(**kwargs)
+            work_snapshot.note_board_write()
+            return rows
+
+    client = _client(monkeypatch, ChangedDuringRead())
+    response = client.get("/api/plugins/project_board/features" + view)
+    assert response.status_code == 200
+    assert response.json()["features"][0]["id"] == "bd-1"
+    assert response.headers["x-board-snapshot"] == "stale"
+    # No conditional request means a body, even if its ETag has not changed.
+    repeated = client.get("/api/plugins/project_board/features" + view)
+    assert repeated.status_code == 200
+    assert "features" in repeated.json()
+
+
+def test_features_timeout_fallback_is_marked_stale(monkeypatch):
+    from project_board import work_snapshot
+    from project_board.store import BoardTimeout
+
+    store = FakeStore()
+    client = _client(monkeypatch, store)
+    original = client.get("/api/plugins/project_board/features")
+    assert original.headers["x-board-snapshot"] == "fresh"
+
+    def failed(**kwargs):
+        raise BoardTimeout("listing timed out")
+
+    monkeypatch.setattr(store, "list_features", failed)
+    work_snapshot.note_board_write()
+    response = client.get("/api/plugins/project_board/features")
+    assert response.status_code == 200
+    assert response.json()["features"] == original.json()["features"]
+    assert response.headers["x-board-snapshot"] == "stale"
+
+
+def test_features_failed_first_listing_is_not_success(monkeypatch):
+    store = FakeStore()
+    monkeypatch.setattr(store, "list_features", lambda **kwargs: None)
+    response = _client(monkeypatch, store).get("/api/plugins/project_board/features")
+    assert response.status_code == 400
+    assert "listing" in response.json()["detail"]
+
+
 def _stub_reap(monkeypatch):
     """No-op the terminal-edge worktree reap (it shells out to git) and return the list
     it records ``(repo, root, fid)`` into, so a test can assert it fired with the router's

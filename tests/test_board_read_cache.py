@@ -7,15 +7,17 @@ batches), each call queued on the process ``br`` lock behind the drive loop. The
 fix (read_cache.py): one snapshot, single-flight refresh, write invalidation, and a bounded
 wait when the store is busy.
 
-The store is faked — no ``br``. A fake ``list_features`` that blocks on an Event stands in
-for the drive loop holding the ``br`` lock.
+Most tests use a fake ``list_features`` that blocks on an Event to stand in for the
+drive loop holding the ``br`` lock. The concurrent-create regression uses a real board.
 """
 
 from __future__ import annotations
 
 import asyncio
+import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -23,7 +25,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from project_board import api, read_cache, work_snapshot
-from project_board.store import BoardError, BoardTimeout
+from project_board.store import BR, BeadsBoard, BoardError, BoardTimeout
 
 
 class SlowStore:
@@ -83,6 +85,43 @@ def _ids(body):
 
 def _titles(body):
     return {f["id"]: f["title"] for f in body["features"]}
+
+
+@pytest.mark.skipif(shutil.which(BR) is None, reason="real br CLI required")
+def test_real_board_concurrent_creates_and_default_listings(monkeypatch, tmp_path):
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    client = TestClient(_app(monkeypatch, board))
+    assert client.get(BASE + "/features").json()["features"] == []
+    original = board.list_features
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed(*args, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.01)
+    monkeypatch.setattr(board, "list_features", delayed)
+    first = board.create_feature("Before the listing")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        listing = pool.submit(client.get, BASE + "/features")
+        try:
+            assert entered.wait(5)
+            # A create overlaps the listing refresh on the real board.
+            second = pool.submit(board.create_feature, "During the listing").result(timeout=10)
+            time.sleep(0.05)
+        finally:
+            release.set()
+        response = listing.result(timeout=10)
+        assert first["id"] in _ids(response.json())
+        known = {first["id"], second["id"]}
+        for index in range(3):
+            before = set(known)
+            create = pool.submit(board.create_feature, f"Concurrent {index}")
+            response = client.get(BASE + "/features")
+            assert before <= set(_ids(response.json()))
+            known.add(create.result(timeout=10)["id"])
 
 
 # ── the routes ──────────────────────────────────────────────────────────────────
@@ -281,11 +320,67 @@ def test_cache_serves_the_previous_snapshot_when_the_refresh_stalls(monkeypatch)
     mode["raise"] = BoardTimeout("`br list` timed out")
     snap = cache.snapshot()
     assert snap.stale and snap.rows == [0]
+    assert cache._entries[False].rows == [0]
     mode["raise"] = BoardError("`br list` failed: no such table")
     with pytest.raises(BoardError, match="no such table"):
         cache.snapshot()  # a real failure is reported, not hidden behind old data
+    assert cache._entries[False].rows == [0]
     mode["raise"] = None
     assert cache.snapshot().rows == [1]
+
+
+@pytest.mark.parametrize("payload", [None, {}])
+def test_invalid_store_listing_does_not_replace_nonempty_snapshot(monkeypatch, tmp_path, payload):
+    board = BeadsBoard(repo=str(tmp_path), actor="test")
+    revision = [0]
+    cache = _cache(lambda _: board.list_features(), lambda: revision[0])
+    monkeypatch.setattr(board, "list_features", lambda: [{"id": "existing"}])
+    assert cache.snapshot().rows == [{"id": "existing"}]
+    monkeypatch.setattr(board, "list_features", BeadsBoard.list_features.__get__(board))
+    monkeypatch.setattr(board, "_run", lambda *a, **kw: (payload, None))
+    revision[0] += 1
+    with pytest.raises(BoardError, match="listing"):
+        cache.snapshot()
+    assert cache._entries[False].rows == [{"id": "existing"}]
+
+
+@pytest.mark.parametrize("rows", [[], [{"id": "old", "board_state": "done"}]])
+def test_snapshot_without_open_work_waits_for_refresh(monkeypatch, rows):
+    monkeypatch.setattr(read_cache, "STALE_WAIT_S", 0.001)
+    revision = [0]
+    entered = threading.Event()
+    release = threading.Event()
+
+    def load(_):
+        if revision[0]:
+            entered.set()
+            assert release.wait(5)
+            return [{"id": "new", "board_state": "backlog"}]
+        return rows
+
+    cache = _cache(load, lambda: revision[0])
+    assert cache.snapshot().rows == rows
+    revision[0] += 1
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(cache.snapshot)
+        try:
+            assert entered.wait(5)
+            time.sleep(0.03)
+            assert not result.done()
+        finally:
+            release.set()
+        assert result.result(timeout=5).rows[0]["id"] == "new"
+
+
+def test_successful_empty_read_can_replace_previous_snapshot():
+    rows = [{"id": "old"}]
+    revision = [0]
+    cache = _cache(lambda _: list(rows), lambda: revision[0])
+    assert cache.snapshot().rows == rows
+    rows.clear()
+    revision[0] += 1
+    snap = cache.snapshot()
+    assert snap.rows == [] and not snap.stale
 
 
 def test_cache_note_write_forbids_the_pre_write_snapshot(monkeypatch):

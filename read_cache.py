@@ -25,7 +25,8 @@ Now the routes read a :class:`BoardReadCache`:
   and the refresh does not land within :data:`STALE_WAIT_S`, the reader gets the previous
   snapshot marked stale (the route says so in ``X-Board-Snapshot``) and the refresh keeps
   running for the next reader. Only the very first read of a board, with nothing cached
-  yet, waits for its listing.
+  yet, waits for its listing. An obsolete snapshot with no open work also waits: it
+  must not tell a polling client that the board is empty during a create.
 - **An API write is never answered with pre-write data.** A write route bumps the epoch
   after it returns (the router's route class does this for every non-GET route), and a
   snapshot taken before the newest API write is never served as stale: the next read waits
@@ -129,12 +130,18 @@ class BoardReadCache:
             run = self._join_or_start(key, token)
             # A snapshot from before the newest API write is never served: the caller (or
             # whoever it is showing the board to) just changed it.
-            fallback = entry if entry is not None and entry.epoch == self._epoch else None
+            # An obsolete snapshot with no open work can falsely tell a polling client
+            # that the board is empty while a create is waiting for its refresh.
+            has_open = entry is not None and any(
+                not isinstance(row, dict) or row.get("board_state") not in {"done", "cancelled"} for row in entry.rows
+            )
+            fallback = entry if has_open and entry.epoch == self._epoch else None
         blocked = time.monotonic()
 
         def _fresh(entry: _Entry) -> Snapshot:
             waited = min(time.monotonic() - blocked, entry.lock_wait_s)
-            return Snapshot(entry.rows, stale=False, taken_at=entry.taken_at, token=entry.token, waited_s=waited)
+            stale = entry.token != (self._token(), self._epoch_now())
+            return Snapshot(entry.rows, stale=stale, taken_at=entry.taken_at, token=entry.token, waited_s=waited)
 
         if fallback is None:
             return _fresh(run.future.result())  # first read, or read-after-write: wait for it
@@ -200,9 +207,11 @@ class BoardReadCache:
 
             with track_br_wait() as wait:
                 rows = self._load(key)
-            entry = _Entry(
-                rows=list(rows or []), token=token, epoch=token[1], taken_at=started, lock_wait_s=wait.seconds
-            )
+            if not isinstance(rows, list):
+                from .store import BoardError
+
+                raise BoardError("board listing returned an invalid payload; expected a list")
+            entry = _Entry(rows=list(rows), token=token, epoch=token[1], taken_at=started, lock_wait_s=wait.seconds)
         except BaseException as e:  # noqa: BLE001 — handed to every waiter
             exc = e
         with self._lock:
