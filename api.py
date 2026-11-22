@@ -196,14 +196,34 @@ def review_bounce(board, fid: str, findings: str, *, escalate: bool = False, esc
     then requeue onto the SAME open PR. ``escalate`` climbs the model ladder when one is
     configured; with the ladder already at its top the card is Blocked instead of looping.
 
+    Without escalation, a review-gate-blocked PR can also take an operator's decision:
+    clear its block and review-fix budget before recording the bounce, without re-arming
+    the gate ahead of the coder (#701).
+
     Refused (``BoardError``) while the loop is still working the card (#398): the review
     gate runs inside the drive, so a bounce landing then would requeue the card out from
     under it. Blocking: call it off the event loop."""
-    from .loop import queue_review_feedback, requeue_refusal
+    from .loop import live_loop, queue_review_feedback, requeue_refusal
+    from .loop._common import _is_review_gate_block
+    from .store import LABEL_IN_REVIEW
 
     refusal = requeue_refusal(fid)
     if refusal:
         raise BoardError(refusal)
+    if not escalate:
+        feature = board.get_feature(fid) or {}
+        if (
+            _is_review_gate_block(feature)
+            and LABEL_IN_REVIEW in (feature.get("labels") or [])
+            and str(feature.get("pr_url") or "").strip()
+        ):
+            board.clear_blocked(fid)
+            board.clear_budgets(fid, ["review-fix"])
+            # The live cache wins over persisted labels; invalidate both halves, as
+            # unblock_side_effects does, but leave the gate untouched until the fix.
+            loop = live_loop()
+            if loop is not None:
+                loop._budget_cache("review-fix").pop(fid, None)
     board.record_review_bounce(fid, findings)
     queue_review_feedback(fid, findings)
     if escalate and escalate_on:
@@ -505,7 +525,7 @@ def build_router(cfg: dict):
         on the bead (≠ ci-fail), feeds them into the next dispatch prompt (the same
         ``_ci_feedback`` lever the in-loop review gate uses), and **requeues onto the
         SAME open PR** (``pr_url`` preserved via external_ref). Works from
-        ``in_review``.
+        ``in_review``, or a review-gate block when ``escalate=false``.
 
         Body: ``{findings: str, head_sha: str, escalate: bool=false}``. ``head_sha`` must
         be the PR's live head, and one bounce applies per head (#767); otherwise the
@@ -1406,7 +1426,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         ``{findings: str, escalate: bool=false}``. Records the findings as a DISTINCT
         review-bounce comment, leads the next dispatch prompt with them, and requeues onto
         the SAME open PR; ``escalate: true`` climbs the model ladder (Blocked at its top).
-        400 unless the card is ``in_review``, and while the loop is still working it (a
+        400 unless the card is ``in_review`` or a review-gate block with ``escalate=false``,
+        and while the loop is still working it (a
         live drive or review gate, #398)."""
         body = body or {}
         findings = str(body.get("findings", ""))
