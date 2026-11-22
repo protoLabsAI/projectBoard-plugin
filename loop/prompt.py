@@ -560,6 +560,8 @@ def integration_prompt(context: dict) -> str:
         "This replaces earlier conflict-path reports. The board owns the merge and Git metadata. "
         "Edit files only, resolve conflict markers, and preserve both feature and sibling behavior. "
         "Do not commit, stage, abort, merge, or rebase. The board will complete and verify ancestry.\n"
+        "Changes already staged in this tree are that board-prepared merge of the base (other cards' "
+        "merged work); leave them staged. The board removed any change that belonged to neither.\n"
     )
 
 

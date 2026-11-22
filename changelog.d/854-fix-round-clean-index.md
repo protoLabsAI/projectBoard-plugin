@@ -1,0 +1,1 @@
+A fix round now starts from a worktree holding only its own card's changes: any staged or unstaged change from another card is saved to a `stranded/…` branch and then cleared before the coder runs, while the card's own recovery work and the board's pending base merge stay untouched (#854).
