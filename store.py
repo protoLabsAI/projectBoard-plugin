@@ -150,6 +150,25 @@ def _br_lock() -> threading.Lock:
 _CARD_LOCK_SLOT = "project_board.card_locks::" + (__name__.rsplit(".", 1)[0] if "." in __name__ else __name__)
 
 
+def idempotency_label(key) -> str:
+    """The `idem:<hash>` label for a caller's idempotency key (#717), or "" when no key is
+    given. Hashed so any string (spaces, `/`, `#`, any length) fits beads' label rules; the
+    key is stripped first, so a retry that adds whitespace names the same work."""
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    import hashlib
+
+    return LABEL_IDEM_PREFIX + hashlib.sha256(k.encode("utf-8")).hexdigest()[:24]
+
+
+def dup_of_label(fid: str) -> str:
+    """The `dup-of:<id>` label a guarded duplicate cancel stamps (#717). Beads labels allow
+    only alphanumerics, `-`, `_` and `:`, so any other character of the id (the `.` of a
+    child id like `bd-0ia51.33`) is written as `_`; the audit reason keeps the exact id."""
+    return LABEL_DUP_OF_PREFIX + re.sub(r"[^A-Za-z0-9_:-]", "_", str(fid))
+
+
 def _card_lock_for(key: tuple[str, str]) -> threading.RLock:
     """The process-wide lock for one card (``key`` = (board store, fid)), created on first
     use. Installed like ``_br_lock`` — `setdefault` on the slot and on the map settles a
@@ -400,6 +419,11 @@ AGENT_HOLD_CLASS = "agent-hold"
 # projection shows a distinct `cancelled` state and reconcilers/retro never mistake it
 # for shipped work. Preserves the one-Done-edge invariant (only record_merge → `done`).
 LABEL_CANCELLED = "cancelled"
+# #717: a card created with an idempotency key carries `idem:<hash>` (stamped by `br create`
+# itself, so it is durable from the first write), and a duplicate cancel records the card it
+# deferred to as `dup-of:<id>`.
+LABEL_IDEM_PREFIX = "idem:"
+LABEL_DUP_OF_PREFIX = "dup-of:"
 # Archival (#115): a terminal feature (done/cancelled — `_TERMINAL_STATES`, shared
 # with the tool-boundary dedup) whose `closed_at` has aged past the archive window is
 # labeled `archived` by the loop's health sweep. It leaves the DEFAULT list_features
@@ -2370,6 +2394,7 @@ class BeadsBoard:
         priority: int = 2,
         description: str = "",
         external_ref: str = "",
+        labels=(),
     ) -> str:
         priority = validate_priority(priority)
         args = ["create", title, "--type", itype, "-p", str(priority), "--silent"]
@@ -2379,6 +2404,8 @@ class BeadsBoard:
             args += ["--description", description]
         if external_ref:
             args += ["--external-ref", external_ref]
+        if labels:
+            args += ["--labels", ",".join(labels)]
         fid = self._run(*args).strip()
         if not fid:
             raise BoardError(f"`br create` returned no id for {title!r}")
@@ -2413,6 +2440,7 @@ class BeadsBoard:
         execute: bool = False,
         origin_session: str = "",
         coder_timeout_s=None,
+        idempotency_key: str = "",
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -2434,19 +2462,20 @@ class BeadsBoard:
         the host has no resolver; it rides the bead `notes` (see NOTES_ORIGIN_PREFIX).
         `coder_timeout_s` (#753) gives this card its own coder time budget in seconds, used
         in place of the board-wide `coder_timeout_s`; a non-positive or non-numeric value
-        is refused before the bead is minted."""
+        is refused before the bead is minted.
+
+        `idempotency_key` (#717) makes the create a create-or-get: a stable caller-chosen
+        string naming the originating event or work intent. Under the board's idempotency
+        lock, a card already carrying the key (in ANY state, cancelled and done included) is
+        returned instead — the canonical one, see ``idempotency_canonical`` — flagged
+        ``idempotent_existing=True``, and nothing is created. Otherwise the new card is minted
+        with the key's `idem:<hash>` label in the same `br create`, so a retry after a timeout
+        or a restart finds it. No key: exactly the old create."""
         self._require_pullable_type(issue_type)
         card_timeout = validate_coder_timeout(coder_timeout_s)
-        # A card on a hot file is created AND chained under the chain lock (#458). Chaining
-        # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
-        # a racing card could chain while an older one was still invisible (or created but
-        # not yet chained), and both then hung off the same tail, unordered, so the Ready
-        # gate's shared-file check refused one of them. Holding the lock from `br create`
-        # to the last edge makes in-process creation order and chain order the same thing.
-        # Only hot-file cards pay for it; every other create stays parallel.
-        hot = chain_hot_files and issue_type != LABEL_TASK and self._names_hot_file(project, files_to_modify)
-        with self._chain_lock if hot else contextlib.nullcontext():
-            return self._create_feature(
+        idem = idempotency_label(idempotency_key)
+        if not idem:
+            return self._create_feature_chained(
                 title,
                 spec=spec,
                 acceptance_criteria=acceptance_criteria,
@@ -2467,6 +2496,101 @@ class BeadsBoard:
                 origin_session=origin_session,
                 coder_timeout_s=card_timeout,
             )
+        # The look-up and the create are one step under the idempotency lock: two turns
+        # racing the same event both look before either creates otherwise (#717). Taken
+        # BEFORE the chain lock, and nothing takes them in the other order.
+        with self._idem_lock():
+            canonical = self._idempotency_canonical_label(idem)
+            if canonical:
+                f = self.get_feature(canonical) or {"id": canonical, "board_state": "", "title": ""}
+                f["idempotent_existing"] = True
+                return f
+            return self._create_feature_chained(
+                title,
+                spec=spec,
+                acceptance_criteria=acceptance_criteria,
+                design=design,
+                files_to_modify=files_to_modify,
+                parent=parent,
+                priority=priority,
+                difficulty=difficulty,
+                depends_on=depends_on,
+                foundation=foundation,
+                source_issue=source_issue,
+                project=project,
+                issue_type=issue_type,
+                assignee=assignee,
+                waits_for=waits_for,
+                chain_hot_files=chain_hot_files,
+                execute=execute,
+                origin_session=origin_session,
+                coder_timeout_s=card_timeout,
+                labels=(idem,),
+            )
+
+    def _idem_lock(self) -> threading.RLock:
+        """The board's process-wide idempotency lock (#717): held across an idempotent
+        create's look-up + create, and across a duplicate cancel's checks + cancel. Keyed by
+        the board's workspace like ``_card_lock`` (a fresh store over the same DB gets the
+        same lock); the key cannot collide with a card id."""
+        return _card_lock_for((str(self.db or os.path.abspath(self.repo or ".")), "\0idempotency"))
+
+    def idempotency_rows(self, label: str) -> list[dict]:
+        """Every card (any state, archived too) carrying the `idem:` ``label``, oldest first
+        (created_at, then id). One unbounded `br list` read — no per-row `br show`."""
+        if not label:
+            return []
+        type_args: list[str] = []
+        for itype in PULLABLE_ISSUE_TYPES:
+            type_args += ["--type", itype]
+        # br 0.1.x can return no matches when type and label filters are combined.
+        # Keep the established all-state type query and match the durable label locally.
+        rows, has_more = self._run(
+            "list",
+            *type_args,
+            "--status",
+            "open",
+            "--status",
+            "in_progress",
+            "--status",
+            "closed",
+            "--status",
+            "deferred",
+            "--limit",
+            "0",
+            want_json=True,
+            with_has_more=True,
+        )
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or not r.get("id") for r in rows):
+            raise BoardError("`br list` returned an invalid idempotency listing; expected a list of issues")
+        if has_more:
+            raise BoardError("`br list` returned a truncated idempotency listing; cannot safely resolve the key")
+        rows = [r for r in rows if label in (r.get("labels") or [])]
+        return sorted(rows, key=lambda r: (str(r.get("created_at") or ""), str(r["id"])))
+
+    def idempotency_canonical(self, key: str) -> str:
+        """The canonical card id for an idempotency key, or "" when no
+        card carries it (#717). Canonical = the card the key first resolved to: the oldest by
+        created_at, tie broken by id — so every caller, in any turn, gets the same answer."""
+        return self._idempotency_canonical_label(idempotency_label(key))
+
+    def _idempotency_canonical_label(self, label: str) -> str:
+        rows = self.idempotency_rows(label)
+        return str(rows[0]["id"]) if rows else ""
+
+    def _create_feature_chained(self, title: str, *, labels=(), **kw) -> dict:
+        project, files_to_modify = kw["project"], kw["files_to_modify"]
+        issue_type, chain_hot_files = kw["issue_type"], kw["chain_hot_files"]
+        # A card on a hot file is created AND chained under the chain lock (#458). Chaining
+        # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
+        # a racing card could chain while an older one was still invisible (or created but
+        # not yet chained), and both then hung off the same tail, unordered, so the Ready
+        # gate's shared-file check refused one of them. Holding the lock from `br create`
+        # to the last edge makes in-process creation order and chain order the same thing.
+        # Only hot-file cards pay for it; every other create stays parallel.
+        hot = chain_hot_files and issue_type != LABEL_TASK and self._names_hot_file(project, files_to_modify)
+        with self._chain_lock if hot else contextlib.nullcontext():
+            return self._create_feature(title, labels=labels, **kw)
 
     def _names_hot_file(self, project: str, files_to_modify) -> bool:
         """Whether a card for ``project`` naming ``files_to_modify`` touches a `hot_files`
@@ -2511,6 +2635,7 @@ class BeadsBoard:
         execute: bool = False,
         origin_session: str = "",
         coder_timeout_s: int | None = None,
+        labels=(),
     ) -> dict:
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
@@ -2519,7 +2644,10 @@ class BeadsBoard:
         origin = str(origin_session or "").strip()
         _refuse_structured_paths(files_to_modify)
         proj = normalize_project(project or self.default_project)
-        fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec)
+        # `labels` (the #717 idempotency label) is passed only when set, so a `_create` double
+        # without the kwarg keeps working.
+        label_kw = {"labels": tuple(labels)} if labels else {}
+        fid = self._create(title, itype=issue_type, parent=parent, priority=priority, description=spec, **label_kw)
         # Enrichment `br create` can't take (acceptance-criteria/design/notes/labels) — set
         # with a follow-up `br update`. Free-text VALUES ride in `--flag=value` form so a
         # value that STARTS WITH '-' (a markdown bullet in acceptance_criteria, e.g.
@@ -4713,7 +4841,50 @@ class BeadsBoard:
     # ── the second terminal edge: cancel (not merge) ──────────────────────────
     @after_transition
     @after_terminal
-    def cancel_feature(self, fid: str, reason: str = "") -> dict:
+    def cancel_feature(self, fid: str, reason: str = "", *, duplicate_of: str = "") -> dict:
+        """Cancel ``fid`` — see ``_cancel_feature``. ``duplicate_of`` (#717) names the card
+        ``fid`` duplicates. Then the cancel is GUARDED, its checks and the cancel held under
+        the board's idempotency lock so two opposing "cancel the duplicate" calls cannot both
+        land: it is refused when ``fid`` is the canonical card of an idempotency key it
+        shares with ``duplicate_of``, when ``duplicate_of`` is cancelled, or when
+        ``duplicate_of`` is already recorded as a duplicate of ``fid``. A guarded cancel
+        stamps `dup-of:<id>` and names the card in its audit reason. Without it: unchanged."""
+        dup = str(duplicate_of or "").strip()
+        if not dup:
+            return self._cancel_feature(fid, reason)
+        with self._idem_lock():
+            self._refuse_duplicate_cancel(fid, dup)
+            why = f"duplicate of {dup}: {reason}" if reason else f"duplicate of {dup}"
+            return self._cancel_feature(fid, why, extra_labels=(dup_of_label(dup),))
+
+    def _refuse_duplicate_cancel(self, fid: str, dup: str) -> None:
+        """Raise BoardError when cancelling ``fid`` as a duplicate of ``dup`` could leave no
+        live copy of the work (#717). Called under ``_idem_lock``."""
+        if dup == fid:
+            raise BoardError(f"cancel {fid}: duplicate_of names the card itself")
+        target = self._require(fid)
+        other = self.get_feature(dup)
+        if other is None:
+            raise BoardError(f"cancel {fid}: duplicate_of {dup!r} is not a card on this board")
+        if other.get("board_state") == "cancelled":
+            raise BoardError(
+                f"cancel {fid} refused: duplicate_of {dup} is itself cancelled, so cancelling {fid} would "
+                f"leave no live copy of the work"
+            )
+        if dup_of_label(fid) in (other.get("labels") or []):
+            raise BoardError(
+                f"cancel {fid} refused: {dup} is already recorded as a duplicate of {fid}; {fid} is the copy that stays"
+            )
+        mine = {str(l) for l in target.get("labels") or [] if str(l).startswith(LABEL_IDEM_PREFIX)}
+        theirs = {str(l) for l in other.get("labels") or [] if str(l).startswith(LABEL_IDEM_PREFIX)}
+        for label in sorted(mine & theirs):
+            if self._idempotency_canonical_label(label) == fid:
+                raise BoardError(
+                    f"cancel {fid} refused: {fid} is the canonical card for the idempotency key it shares with "
+                    f"{dup} (the card that key first resolved to); cancel {dup} with duplicate_of={fid} instead"
+                )
+
+    def _cancel_feature(self, fid: str, reason: str = "", *, extra_labels=()) -> dict:
         """Cancel a feature created in error (bad decomposition, duplicate, scope cut).
 
         Modeled DELIBERATELY as a second terminal edge so it doesn't break the
@@ -4749,6 +4920,8 @@ class BeadsBoard:
         stale = _terminal_stale_labels(f.get("labels"))
         stale += [s for s in (str(l) for l in f.get("labels") or []) if s.startswith(LABEL_STRANDED_PREFIX)]
         tag = ["update", fid, "--add-label", LABEL_CANCELLED, "--assignee", ""]
+        for label in extra_labels:
+            tag += ["--add-label", label]
         self._run(*tag)
         # Drop open incoming `blocks` edges before closing (#145): `br close` refuses
         # when blockers are unresolved, but a cancel is a scope-cut — prerequisites
@@ -4772,6 +4945,8 @@ class BeadsBoard:
                     blocker_id,
                 )
         undo = ["update", fid, "--remove-label", LABEL_CANCELLED]
+        for label in extra_labels:
+            undo += ["--remove-label", label]
         # Only rewrite the assignee if there was one — a bead that was already
         # unassigned needs no restore (and `--assignee ""` would be a redundant write).
         if prior_assignee:

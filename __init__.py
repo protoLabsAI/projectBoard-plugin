@@ -494,6 +494,42 @@ def _feature_reply(f: dict, ready_check: dict | None = None) -> str:
     return json.dumps(out)
 
 
+def _idempotent_reply(f: dict) -> str:
+    """The reply when an idempotent create found the card its key already names (#717):
+    says plainly that NO card was created and which existing card answers the key."""
+    fid = f.get("id", "?")
+    return json.dumps(
+        {
+            "id": fid,
+            "state": f.get("board_state", ""),
+            "title": f.get("title", ""),
+            "created": False,
+            "existing": True,
+            "message": (
+                f"Existing card {fid} already carries this idempotency_key; it was returned and no new "
+                "card was created."
+            ),
+        }
+    )
+
+
+def _idempotent_existing_reply(store, key: str) -> str | None:
+    """The existing-card reply for ``key`` when a card already carries it, else None. A
+    failed look-up returns None: the store's own create-or-get re-checks under its lock."""
+    from .store import BoardError, BoardTimeout
+
+    try:
+        fid = store.idempotency_canonical(key)
+    except BoardTimeout:
+        raise
+    except BoardError:
+        return None
+    if not fid:
+        return None
+    f = store.get_feature(fid) or {"id": fid}
+    return _idempotent_reply(f)
+
+
 def _ready_dry_run(store, fid: str) -> dict:
     """The Ready gate's dry run for a card just created or updated (#455): every check
     ``board_mark_ready`` would refuse on, ALL of them, each with its fix — so the author
@@ -877,6 +913,7 @@ def _board_tools(cfg: dict, registry=None):
         coder_timeout_s: float | str | None = None,
         state: Annotated[Any, InjectedState] = None,
         allow_shared_source_issue: bool = False,
+        idempotency_key: str = "",
     ) -> str:
         """Create a coding feature (starts in backlog). Ready needs a self-sufficient `spec`,
         testable `acceptance_criteria` and `files_to_modify`: comma-separated paths that exist in
@@ -897,7 +934,9 @@ def _board_tools(cfg: dict, registry=None):
         an in_review card with an open PR (that is a fix round: board_requeue_feature(fid,
         findings=...)), or a `source_issue` an open PR already closes.
         `allow_shared_source_issue=true` skips only the PR check; `force=true` bypasses all three.
-        Breadth caps, shared files, gate grammar: board-tool-reference skill."""
+        `idempotency_key`: a stable string naming the event or work intent this card answers; a
+        card already carrying it is returned (`created: false`) instead of a new one, even with
+        `force=true`. Breadth caps, shared files, gate grammar: board-tool-reference skill."""
         try:
             # Resolve the store against THIS feature's project (#90): its repo/base_branch
             # for the get_store call, so the dedup read + the create land against the right
@@ -929,14 +968,24 @@ def _board_tools(cfg: dict, registry=None):
             card_timeout = validate_coder_timeout(
                 _strip_wrapping_quotes(coder_timeout_s) if isinstance(coder_timeout_s, str) else coder_timeout_s
             )
+            idem_key = _strip_wrapping_quotes(idempotency_key).strip()
+            # #717: the key check comes first and `force` never skips it — a card already
+            # carrying the key IS this work, whatever the heuristic dedup would say.
+            if idem_key and (existing := _idempotent_existing_reply(store, idem_key)) is not None:
+                return existing
             if not force:
                 skip = _dedup_skip_message(
                     store, title, deps, source_issue, allow_shared_source_issue=allow_shared_source_issue
                 )
                 if skip is not None:
+                    # A racing turn may have created the keyed card since the look above.
+                    if idem_key and (existing := _idempotent_existing_reply(store, idem_key)) is not None:
+                        return existing
                     return skip
             # Passed only when set, so a store double without the kwarg keeps working.
             timeout_kw = {"coder_timeout_s": card_timeout} if card_timeout is not None else {}
+            if idem_key:
+                timeout_kw["idempotency_key"] = idem_key
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -954,6 +1003,8 @@ def _board_tools(cfg: dict, registry=None):
                 origin_session=_resolve_origin_session(state),
                 **timeout_kw,
             )
+            if f.get("idempotent_existing"):
+                return _idempotent_reply(f)
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
             return f"Error: {exc}"
@@ -973,12 +1024,13 @@ def _board_tools(cfg: dict, registry=None):
         waits_for: str = "",
         execute: bool = False,
         state: Annotated[Any, InjectedState] = None,
+        idempotency_key: str = "",
     ) -> str:
         """Create a TASK (starts in backlog): work that ships a deliverable (doc, decision, artifact
         ref) instead of a PR. Same lifecycle as a feature, but board_deliver moves it to in_review
         and board_verify closes it. Ready needs `spec` + `acceptance_criteria`, no
         `files_to_modify`. `assignee` pre-assigns; `priority` 0 = highest. The other args, the
-        dedup refusals and `force` behave as on board_create_feature.
+        dedup refusals, `force` and `idempotency_key` behave as on board_create_feature.
         Execution tasks (evals, live checks, release verification: anything that runs commands)
         go to a coder: pass `execute=true` and leave `assignee` empty; never assign one to yourself.
         Writing-only tasks (a doc, a decision) may be self-assigned."""
@@ -996,10 +1048,16 @@ def _board_tools(cfg: dict, registry=None):
             if (refused := _waits_for_refusal(waits_for)) is not None:
                 return refused
             deps = _split_list(depends_on)
+            idem_key = _strip_wrapping_quotes(idempotency_key).strip()
+            if idem_key and (existing := _idempotent_existing_reply(store, idem_key)) is not None:
+                return existing
             if not force:
                 skip = _dedup_skip_message(store, title, deps, source_issue)
                 if skip is not None:
+                    if idem_key and (existing := _idempotent_existing_reply(store, idem_key)) is not None:
+                        return existing
                     return skip
+            idem_kw = {"idempotency_key": idem_key} if idem_key else {}
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -1014,7 +1072,10 @@ def _board_tools(cfg: dict, registry=None):
                 waits_for=waits_for,
                 execute=execute,
                 origin_session=_resolve_origin_session(state),
+                **idem_kw,
             )
+            if f.get("idempotent_existing"):
+                return _idempotent_reply(f)
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
             return f"Error: {exc}"
@@ -1370,18 +1431,22 @@ def _board_tools(cfg: dict, registry=None):
             return f"Error: {exc}"
 
     @tool
-    def board_cancel_feature(feature_id: str, reason: str = "") -> str:
+    def board_cancel_feature(feature_id: str, reason: str = "", duplicate_of: str = "") -> str:
         """Cancel a card created in error (bad decomposition, duplicate, scope cut). Closes it in a
         distinct `cancelled` state (not `done`) with an auditable `reason`; the bead and its
         history remain. Also closes its open PR and stops its in-flight coder, best-effort (see
         `pr_closed` / `drive_cancelled` in the reply). For genuinely shipped work use
-        board_mark_done."""
+        board_mark_done. Cancelling a duplicate: pass `duplicate_of=<the card that stays>`; it is
+        refused if that would leave no live copy (the target is the canonical card for a shared
+        idempotency_key, or the other card is cancelled or already a duplicate of this one)."""
         try:
             reason = _strip_wrapping_quotes(reason)
+            dup = _strip_wrapping_quotes(duplicate_of).strip()
             store = get_store(**store_kw)
             before = store.get_feature(feature_id)
             pr_url = str((before or {}).get("pr_url") or "").strip()
-            f = store.cancel_feature(feature_id, reason)
+            # Passed only when set, so a store double without the kwarg keeps working.
+            f = store.cancel_feature(feature_id, reason, **({"duplicate_of": dup} if dup else {}))
         except BoardError as exc:
             return f"Error: {exc}"
         # Lazy import (the loop imports from here — a top-level import would be circular).

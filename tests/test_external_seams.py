@@ -223,6 +223,7 @@ MAX_UNCOVERED_HOST = 1
 # a version matrix (0.1.23 / 0.2.16 / 0.3.2) with PB_REQUIRE_BR=1 so an absent binary
 # FAILS rather than skips. #353 and #356 were both caught by adding to it.
 STORE_SEAMS: dict[str, str] = {
+    "_cancel_feature": "REAL",  # #717: guarded cancellation and audit reason, real br in test_idempotent_create_717.py.
     "_close_then_strip_stale": "REAL",  # Close with timeout re-read before terminal cleanup.
     "_strip_terminal_stale": "REAL",  # Best-effort terminal label cleanup.
     "_create": "UNCOVERED",
@@ -236,7 +237,6 @@ STORE_SEAMS: dict[str, str] = {
     "attach_pr": "REAL",  # #402: every shape through real `br` in tests/test_attach_pr_402.py
     "block_from_review": "REAL",  # #401 review: real `br` in tests/test_work_snapshot_review_401.py
     "bounce_ci_fail": "UNCOVERED",
-    "cancel_feature": "REAL",
     "claim": "REAL",
     "claim_next_ready": "REAL",
     "claim_task": "REAL",
@@ -251,6 +251,7 @@ STORE_SEAMS: dict[str, str] = {
     "feature_comments": "UNCOVERED",
     "flag_blocked": "REAL",
     "get_feature": "REAL",
+    "idempotency_rows": "REAL",  # #717: durable all-state key lookup, real br in test_idempotent_create_717.py.
     "list_features": "REAL",
     "live_cards": "REAL",  # #401 review: the snapshot's light read, real `br` (test_work_snapshot_review_401.py)
     "mark_designing": "UNCOVERED",
