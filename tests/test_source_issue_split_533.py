@@ -442,3 +442,168 @@ async def test_last_slice_title_keeps_the_close(monkeypatch):
     assert refs_only is False
     assert body.endswith("Fixes #6")
     assert _pr_title(feature, refs_only) == "feat: fix #6 the login bug"
+
+
+# ── #834: the last slice closes its issue even when the store is busy ─────────────
+
+import logging
+
+import pytest
+
+from project_board import pr_description
+from project_board.loop import _common, _title_own_issue
+
+_LOGGER = "protoagent.plugins.project_board"
+
+
+@pytest.fixture
+def _no_backoff(monkeypatch):
+    """Retry immediately — the attempt count, not the wall clock, is under test."""
+    monkeypatch.setattr(_common, "_SIBLING_READ_BACKOFF", (0.0, 0.0))
+
+
+class _FlakyStore(_FakeStore):
+    """A busy store: the first ``fail`` reads raise, later ones return the rows."""
+
+    def __init__(self, features, fail=1):
+        super().__init__(features)
+        self.fail = fail
+        self.reads = 0
+
+    def list_features(self, state=None, include_archived=False):
+        self.reads += 1
+        if self.reads <= self.fail:
+            raise RuntimeError("database is locked")
+        return super().list_features(state, include_archived)
+
+
+def _sole_sourced_board():
+    """bd-lkehm's shape: the only card carrying the source issue, three unsourced
+    sibling slices all done."""
+    return [
+        {"id": "bd-1", "board_state": "in_progress", "source_issue": "acme/widgets#6"},
+        {"id": "bd-2", "board_state": "done", "pr_url": "https://x/1"},
+        {"id": "bd-3", "board_state": "done", "pr_url": "https://x/2"},
+        {"id": "bd-4", "board_state": "done", "pr_url": "https://x/3"},
+    ]
+
+
+async def test_transient_store_error_is_retried_then_fixes(monkeypatch, _no_backoff):
+    """#834 r1: one failed read no longer turns the last slice's Fixes into Refs."""
+    feature = {"id": "bd-1", "title": "fix #6 the login bug", "source_issue": "#6"}
+    store = _FlakyStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-2", "board_state": "done", "source_issue": "#6", "pr_url": "https://x/1"},
+        ],
+        fail=1,
+    )
+    loop = _loop_with_store(monkeypatch, store)
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert store.reads == 2
+    assert refs_only is False
+    assert body == "## Summary\n\nFixes #6"
+    assert pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only) == "feat: fix #6 the login bug"
+
+
+def test_store_error_on_every_attempt_fails_safe_and_warns(caplog, _no_backoff):
+    """#834 r2: every attempt fails ⇒ still Refs (the #533 fail-SAFE direction), but a
+    WARNING names the card and the source issue and says why."""
+    store = _FlakyStore([], fail=99)
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        assert _source_issue_has_open_sibling(store, {"id": "bd-9", "source_issue": "acme/widgets#6"}) is True
+    assert store.reads == 3
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    msg = warnings[0].getMessage()
+    assert "bd-9" in msg and "acme/widgets#6" in msg
+    assert "Refs" in msg and "could not be read" in msg
+
+
+def test_refs_because_of_open_sibling_logs_the_sibling(caplog):
+    """#834 r3: a Refs decision driven by an uncaptured sibling names that sibling."""
+    store = _FakeStore(
+        [
+            {"id": "bd-1", "board_state": "in_progress", "source_issue": "#6"},
+            {"id": "bd-sib", "board_state": "ready", "source_issue": "#6"},
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        assert _source_issue_has_open_sibling(store, {"id": "bd-1", "source_issue": "#6"}) is True
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("bd-1" in m and "bd-sib" in m and "#6" in m for m in msgs)
+
+
+async def test_all_declined_refs_is_logged(monkeypatch, caplog):
+    """#834: the all-declined ledger reason (#715) is logged too."""
+    feature = {
+        "id": "bd-1",
+        "source_issue": "#6",
+        "requirements": [{"id": "r1", "status": "declined", "reason": "not reachable"}],
+    }
+    loop = _loop_with_store(monkeypatch, _FakeStore([]))
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        _body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert refs_only is True
+    assert any("declined" in r.getMessage() and "bd-1" in r.getMessage() for r in caplog.records)
+
+
+def test_title_own_issue_normalises_same_repo_slug():
+    """An `owner/repo#N` source issue in the PR's own repo is the title's bare `#N`."""
+    assert _title_own_issue(("acme/widgets", 6), "Acme/Widgets") == ("", 6)
+    assert _title_own_issue(("other/repo", 6), "acme/widgets") == ("other/repo", 6)
+    assert _title_own_issue(("acme/widgets", 6), "") == ("acme/widgets", 6)  # unknown target → neutralise
+    assert _title_own_issue(("", 6), "acme/widgets") == ("", 6)
+    assert _title_own_issue(None, "acme/widgets") is None
+
+
+async def test_sole_sourced_slice_publishes_fixes_and_keeps_title(monkeypatch):
+    """#834 r4: the only card sourced to acme/widgets#6 (three unsourced done siblings)
+    publishes with `Fixes #6` and keeps `#6` in the title — the protoAgent #5736 case,
+    whose title lost its `#` because an `owner/repo#N` source was never protected."""
+    feature = {"id": "bd-1", "title": "the login bug (Fixes #6, last slice)", "source_issue": "acme/widgets#6"}
+    loop = _loop_with_store(monkeypatch, _FakeStore(_sole_sourced_board()))
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert refs_only is False
+    assert body == "## Summary\n\nFixes #6"
+    assert await loop._card_pr_title(feature, "/wt", refs_only) == "feat: the login bug (Fixes #6, last slice)"
+
+
+async def test_sole_sourced_slice_title_still_neutralised_cross_repo(monkeypatch):
+    """The normalisation is same-repo only: a PR in another repo can't close it via `#6`."""
+    feature = {"id": "bd-1", "title": "the login bug (Fixes #6)", "source_issue": "acme/widgets#6"}
+    loop = _loop_with_store(monkeypatch, _FakeStore(_sole_sourced_board()), slug="other/repo")
+    assert await loop._card_pr_title(feature, "/wt", False) == "feat: the login bug (Fixes 6)"
+
+
+async def test_sole_sourced_slice_title_neutralised_while_sibling_codes(monkeypatch):
+    """#533 unchanged: with a sourced sibling still coding, the same-repo title loses `#6`."""
+    board = _sole_sourced_board() + [{"id": "bd-5", "board_state": "ready", "source_issue": "acme/widgets#6"}]
+    feature = {"id": "bd-1", "title": "the login bug (Fixes #6)", "source_issue": "acme/widgets#6"}
+    loop = _loop_with_store(monkeypatch, _FakeStore(board))
+    body, refs_only = await loop._with_source_issue_ref(feature, "/wt", "## Summary")
+    assert refs_only is True
+    assert body == "## Summary\n\nRefs #6"
+    assert await loop._card_pr_title(feature, "/wt", refs_only) == "feat: the login bug (Fixes 6)"
+
+
+async def test_sole_sourced_slice_fix_round_keeps_fixes(tmp_path, monkeypatch):
+    """#834 r4: a fix round rewrites the PR description from the existing body plus the
+    repair journal; the re-stamp keeps exactly one `Fixes #6` line."""
+    wt = str(tmp_path)
+    await pr_description.record(wt, "bd-1", "CI: fixed the flaky assertion", repair=True, fallback="Feature")
+
+    async def existing(*a):
+        return "## Summary\n\nFeature.\n\nFixes #6\n\n## Operator\nKeep me."
+
+    monkeypatch.setattr(pr_description, "existing_body", existing)
+    feature = {"id": "bd-1", "title": "fix #6 the login bug", "source_issue": "acme/widgets#6", "pr_url": "https://x/9"}
+    loop = _loop_with_store(monkeypatch, _FakeStore(_sole_sourced_board()))
+    body = await pr_description.render(wt, "feat/bd-1", "bd-1", "fallback")
+    body, refs_only = await loop._with_source_issue_ref(feature, wt, body)
+    assert refs_only is False
+    assert body.count("Fixes #6") == 1
+    assert "Refs #6" not in body
+    assert "CI: fixed the flaky assertion" in body
+    assert "## Operator\nKeep me." in body
+    assert await loop._card_pr_title(feature, wt, refs_only) == "feat: fix #6 the login bug"

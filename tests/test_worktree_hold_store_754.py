@@ -15,12 +15,12 @@ class FakeBr:
 
     def __call__(self, *args, want_json=False, actor=""):
         self.calls.append((args, actor))
+        if args[0] == self.fail:
+            raise store.BoardError("write failed" if args[0] != "show" else "read failed")
         if args[0] == "show":
             if args[1] != self.bead["id"]:
                 raise store.BoardNotFound("unknown feature")
             return [deepcopy(self.bead)]
-        if args[0] == self.fail:
-            raise store.BoardError("write failed")
         if args[0] == "comments":
             self.bead["comments"].append(args[3])
         elif args[0] == "update":
@@ -152,3 +152,37 @@ def test_terminal_card_can_be_released(make_board, labels):
     board = make_board(fake)
     assert board.release_worktree_hold("bd-1")["worktree_hold"] is False
     assert fake.bead["comments"] == ["worktree-hold released"]
+
+
+def test_failed_label_add_preserves_reason_without_claiming_hold(make_board):
+    fake = FakeBr(labels=["merge-hold"])
+    board = make_board(fake)
+    fake.fail = "update"
+    with pytest.raises(store.BoardError, match="write failed"):
+        board.set_worktree_hold("bd-1", "manual reset")
+    assert fake.bead["labels"] == ["merge-hold"]
+    assert fake.bead["comments"] == ["worktree-hold set: manual reset"]
+    assert board.get_feature("bd-1")["worktree_hold"] is False
+
+
+def test_failed_release_audit_propagates_after_removing_hold(make_board):
+    fake = FakeBr(labels=["merge-hold", "worktree-hold"])
+    board = make_board(fake)
+    fake.fail = "comments"
+    with pytest.raises(store.BoardError, match="write failed"):
+        board.release_worktree_hold("bd-1")
+    assert fake.bead["labels"] == ["merge-hold"]
+    assert fake.bead["comments"] == []
+    assert board.get_feature("bd-1")["worktree_hold"] is False
+
+
+@pytest.mark.parametrize("method, args", [("set_worktree_hold", ("reason",)), ("release_worktree_hold", ())])
+def test_failed_read_changes_nothing(make_board, method, args):
+    fake = FakeBr(labels=["worktree-hold"])
+    board = make_board(fake)
+    before = deepcopy(fake.bead)
+    fake.fail = "show"
+    with pytest.raises(store.BoardError, match="read failed"):
+        getattr(board, method)("bd-1", *args)
+    assert fake.bead == before
+    assert fake.writes == []

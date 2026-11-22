@@ -1147,8 +1147,10 @@ def _source_issue_has_open_sibling(store, feature: dict) -> bool:
 
     A blocking sibling is another card (not self) whose parsed source issue matches and
     whose work is still uncaptured (``_slice_work_uncaptured``). Returns True when such a
-    sibling exists ⇒ the caller stamps ``Refs``. Fails SAFE: a store read error returns
-    True (⇒ ``Refs``), because closing a shared issue on an uncertain read is the
+    sibling exists ⇒ the caller stamps ``Refs`` (and the blocking sibling's id is logged,
+    #834). Fails SAFE: a store read error is first retried (``_SIBLING_READ_BACKOFF``);
+    only when every attempt fails does it log a WARNING and return True (⇒ ``Refs``),
+    because closing a shared issue on an uncertain read is the
     unrecoverable mistake — the opposite fail direction from the fail-OPEN guards above,
     on purpose. Returns False only when the store was read cleanly and named no still-
     coding sibling (⇒ this is the sole or last-to-publish slice ⇒ ``Fixes``). Source
@@ -1157,19 +1159,74 @@ def _source_issue_has_open_sibling(store, feature: dict) -> bool:
     parsed = _source_issue(feature)
     if parsed is None:
         return False  # no resolvable source issue → nothing a sibling could share
-    try:
-        siblings = store.list_features()
-    except Exception:  # noqa: BLE001 — store read failed → fail SAFE (stamp Refs, never close)
-        return True
     fid = feature.get("id")
+    issue = _format_source_issue(parsed)
+    # #834: a busy store (heavy `br` load) can fail ONE read; that used to flip the
+    # decision to Refs silently, so the last slice of a split issue merged without
+    # closing it. Retry a transient failure before giving up; when every attempt fails,
+    # keep the fail-SAFE answer (Refs) but say so in the log.
+    attempts = len(_SIBLING_READ_BACKOFF) + 1
+    siblings = None
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            siblings = store.list_features()
+            break
+        except Exception as e:  # noqa: BLE001 — retried, then fail SAFE (stamp Refs, never close)
+            last_err = e
+            if attempt < attempts - 1:
+                time.sleep(_SIBLING_READ_BACKOFF[attempt])
+    if siblings is None:
+        log.warning(
+            "[project_board] %s stamps Refs (not Fixes) for source issue %s: the board store could "
+            "not be read to check for open sibling slices (%d attempts, last error: %s)",
+            fid,
+            issue,
+            attempts,
+            last_err,
+        )
+        return True
     for s in siblings:
         # Skip self, and any sibling whose work is already in a PR (terminal, in_review,
         # or pr_url present): only a slice still being coded needs the issue left open.
         if s.get("id") == fid or not _slice_work_uncaptured(s):
             continue
         if _source_issue(s) == parsed:
+            log.info(
+                "[project_board] %s stamps Refs (not Fixes) for source issue %s: sibling slice %s "
+                "(%s) still has work not captured in a PR",
+                fid,
+                issue,
+                s.get("id"),
+                s.get("board_state") or "?",
+            )
             return True
     return False
+
+
+# #834: the pauses between attempts to read the board store for sibling slices (three
+# attempts in all). Short: the read runs on a worker thread just before a PR is stamped.
+_SIBLING_READ_BACKOFF: tuple[float, ...] = (0.25, 0.75)
+
+
+def _format_source_issue(parsed: tuple[str, int]) -> str:
+    """``owner/repo#N`` (or ``#N`` for a bare source issue) — for log lines."""
+    slug, n = parsed
+    return f"{slug}#{n}" if slug else f"#{n}"
+
+
+def _title_own_issue(own: tuple[str, int] | None, target_repo: str) -> tuple[str, int] | None:
+    """The card's source issue as ``pr_title_for``'s ``own`` argument (#834).
+
+    ``_sanitize_pr_title`` protects only a BARE own issue (empty slug), because a ``#N``
+    in a title always names an issue of the PR's target repo. A source issue written as
+    ``owner/repo#N`` (or a URL) for THAT SAME repo is the same issue, so it is normalised
+    to ``("", N)`` and the last slice keeps its closing ``#N`` in the title. A different
+    or unknown target (``repo_slug`` failed open → ``""``) leaves ``own`` as is, so the
+    title's ``#N`` is neutralised — the safe direction."""
+    if own and own[0] and target_repo and own[0].strip().lower() == target_repo.strip().lower():
+        return ("", own[1])
+    return own
 
 
 # ── live concurrency knobs ─────────────────────────────────────────────────────
@@ -2428,6 +2485,8 @@ __all__ = [
     "_issue_closed_by_board_sibling",
     "_slice_work_uncaptured",
     "_source_issue_has_open_sibling",
+    "_title_own_issue",
+    "_format_source_issue",
     "LIVE_KNOBS",
     "LIVE_KNOB_FLOORS",
     "LIVE_BOOL_KNOBS",

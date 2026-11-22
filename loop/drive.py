@@ -2311,7 +2311,7 @@ class DriveMixin(HostDiskMixin):
         # here (no worktree needed) and recomputed at PR-open for the body + final title,
         # since siblings ship during the coding run.
         refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, store, feature)
-        title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
+        title = await self._card_pr_title(feature, repo, refs_only)
         # #227: slugged onto the branch/dir tail — #716: the card's RECORDED branch tail,
         # so a rename after the PR opened still resumes the PR's branch.
         raw_title = await self._branch_title(store, feature, repo)
@@ -3131,7 +3131,7 @@ class DriveMixin(HostDiskMixin):
                     # start value — a sibling may have shipped during the coding run). In
                     # refs_only mode the card's own `#n` is dropped from the subject too, so it
                     # can't close a shared issue while the body only says `Refs #n`.
-                    pr_title = pr_title_for(feature["title"], _source_issue(feature), refs_only=refs_only)
+                    pr_title = await self._card_pr_title(feature, wt, refs_only)
                     # #207: un-draft an adopted PR only on the card's FIRST adoption (no
                     # pr_url yet → the draft is the coder's). A re-dispatch of a card that
                     # already owns its PR (CI-fail bounce) leaves a draft alone: that is
@@ -4421,10 +4421,29 @@ class DriveMixin(HostDiskMixin):
         # REFERENCE, never CLOSE, its source issue — the work was declined, so a merged
         # `Fixes #N` would close the issue with nothing built. OR it into refs_only so the
         # body AND the title (the drive sanitises it with this same flag) both say `Refs #N`.
-        refs_only = await asyncio.to_thread(
-            _source_issue_has_open_sibling, self._store(), feature
-        ) or _all_items_declined(feature.get("requirements") or [])
+        refs_only = await asyncio.to_thread(_source_issue_has_open_sibling, self._store(), feature)
+        if not refs_only and _all_items_declined(feature.get("requirements") or []):
+            # #834: every refs_only decision is logged with its reason (the sibling scan
+            # logs its own: a blocking sibling, or a store it could not read).
+            log.info(
+                "[project_board] %s stamps Refs (not Fixes) for source issue %s: every requirements "
+                "ledger item was declined (#715)",
+                feature.get("id"),
+                _format_source_issue(parsed),
+            )
+            refs_only = True
         return _inject_source_issue_line(body, issue_slug, n, target_repo, refs_only=refs_only), refs_only
+
+    async def _card_pr_title(self, feature: dict, cwd: str, refs_only: bool, title: str | None = None) -> str:
+        """The PR title / squash subject for ``feature`` (#533, #834): ``pr_title_for``
+        with the card's own source issue normalised against the repo the PR targets, so
+        an ``owner/repo#N`` source issue in that same repo keeps its closing ``#N`` (the
+        sanitiser protects only a bare own issue). The target is looked up only when the
+        source issue carries a slug; an unresolvable target fails toward neutralising."""
+        own = _source_issue(feature)
+        if own and own[0] and cwd:
+            own = _title_own_issue(own, await worktree.repo_slug(cwd=cwd))
+        return pr_title_for(title if title is not None else feature["title"], own, refs_only=refs_only)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _use_coder_solve(self, feature: dict) -> bool:
