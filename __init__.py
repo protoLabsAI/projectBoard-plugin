@@ -804,6 +804,7 @@ def _board_tools(cfg: dict, registry=None):
         get_store,
         open_requirement_ids,
         open_requirements_note,
+        validate_coder_timeout,
     )
 
     # Per-project resolution (#90 slice 3): the board's `projects:` map (name →
@@ -871,6 +872,7 @@ def _board_tools(cfg: dict, registry=None):
         source_issue: str = "",
         project: str = "",
         waits_for: str = "",
+        coder_timeout_s: float | str | None = None,
         state: Annotated[Any, InjectedState] = None,
     ) -> str:
         """Create a coding feature (starts in backlog). Ready needs a self-sufficient `spec`,
@@ -883,7 +885,9 @@ def _board_tools(cfg: dict, registry=None):
         `projects:` entry it builds in (default_project if omitted). `waits_for`: comma-separated
         publish gates that must all hold before the card is claimed, for work needing something
         another repo SHIPS (npm:/release:/pr: specs); for a consumer of another card's change use
-        `npm:<pkg>@contains:<owner>/<repo>@<card-id>`, never a version floor.
+        `npm:<pkg>@contains:<owner>/<repo>@<card-id>`, never a version floor. `coder_timeout_s`:
+        this card's own coder time budget in seconds (a positive number), for a long run that
+        needs more than the board-wide one; omit it to use the board's.
 
         The reply's `ready_check` dry-runs the Ready gate; fix what it lists before
         board_mark_ready. Refuses a likely duplicate: a same-title open card, a `depends_on` onto
@@ -917,10 +921,16 @@ def _board_tools(cfg: dict, registry=None):
                 return refused
             deps = _split_list(depends_on)
             files = _split_list(files_to_modify)
+            # #753: refuse a bad per-card timeout before anything is read or written.
+            card_timeout = validate_coder_timeout(
+                _strip_wrapping_quotes(coder_timeout_s) if isinstance(coder_timeout_s, str) else coder_timeout_s
+            )
             if not force:
                 skip = _dedup_skip_message(store, title, deps, source_issue)
                 if skip is not None:
                     return skip
+            # Passed only when set, so a store double without the kwarg keeps working.
+            timeout_kw = {"coder_timeout_s": card_timeout} if card_timeout is not None else {}
             f = store.create_feature(
                 title,
                 spec=spec,
@@ -936,6 +946,7 @@ def _board_tools(cfg: dict, registry=None):
                 project=project,
                 waits_for=waits_for,
                 origin_session=_resolve_origin_session(state),
+                **timeout_kw,
             )
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
@@ -1017,6 +1028,7 @@ def _board_tools(cfg: dict, registry=None):
         priority: int | None = None,
         waits_for: str = "",
         project: str = "",
+        coder_timeout_s: float | str | None = None,
     ) -> str:
         """Partially update a feature: the repair path for a card the Ready gate refused (no need to
         cancel and recreate). Only non-empty args are written. `files_to_modify` REPLACES the list
@@ -1024,8 +1036,9 @@ def _board_tools(cfg: dict, registry=None):
         (board_remove_dependency removes them); `foundation=True` sets the flag, never clears it.
         `source_issue` / `waits_for` replace the value; `none` clears it. `priority` None leaves
         it. `project` re-homes the card, allowed only while backlog/ready with no PR and never
-        dispatched. The reply carries the same `ready_check` dry run as board_create_feature.
-        Details: board-tool-reference skill."""
+        dispatched. `coder_timeout_s` sets the card's own coder time budget in seconds (a
+        positive number); empty leaves it. The reply carries the same `ready_check` dry run as
+        board_create_feature. Details: board-tool-reference skill."""
         try:
             store = get_store(**store_kw)
             title = _strip_wrapping_quotes(title)
@@ -1064,6 +1077,12 @@ def _board_tools(cfg: dict, registry=None):
                 if not clear and (refused := _waits_for_refusal(waits_for)) is not None:
                     return refused
                 update_kw["waits_for"] = [] if clear else waits_for
+            # #753: a bad value is refused before the write; empty leaves the field as it is.
+            card_timeout = validate_coder_timeout(
+                _strip_wrapping_quotes(coder_timeout_s) if isinstance(coder_timeout_s, str) else coder_timeout_s
+            )
+            if card_timeout is not None:
+                update_kw["coder_timeout_s"] = card_timeout
             f = store.update_feature(feature_id, **update_kw)
             return _feature_reply(f, _ready_dry_run(store, f["id"]))
         except BoardError as exc:
@@ -1160,6 +1179,8 @@ def _board_tools(cfg: dict, registry=None):
                 "merge_hold": f.get("merge_hold", False),
                 "worktree_hold": f.get("worktree_hold", False),
                 "difficulty": f["difficulty"],
+                # The card's own coder time budget in seconds (#753); null → the board-wide one.
+                "coder_timeout_s": f.get("coder_timeout_s"),
                 "files_to_modify": f.get("files_to_modify", []),
                 "foundation": f.get("foundation", False),
                 "priority": f.get("priority", 2),

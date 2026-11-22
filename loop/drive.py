@@ -2006,13 +2006,15 @@ class DriveMixin(HostDiskMixin):
             return
         prompt = self._build_task_prompt(feature) + work_location_capture.reporting_instructions()
         try:
-            reply = await coder_seam.dispatch_self(invoke, prompt, session_id, timeout=self.coder_timeout or None)
+            reply = await coder_seam.dispatch_self(invoke, prompt, session_id, timeout=self._coder_timeout_for(feature))
         except asyncio.CancelledError:
             raise  # operator cancel / shutdown owns the edge — never a block
         except (worktree.WorktreeError, worktree.CoderTimeout) as exc:
             if self._shutting_down:
                 log.info("[project_board] %s self task dispatch aborted by shutdown — no block", fid)
                 return
+            if isinstance(exc, worktree.CoderTimeout):
+                await self._raise_coder_timeout_once(store, feature)  # #753: a longer run next time
             await self._task_dispatch_failed(store, fid, "self task", f"{classify(str(exc)).category}: {exc}")
             return
         except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
@@ -2046,7 +2048,7 @@ class DriveMixin(HostDiskMixin):
         cwd, tmp_dir = await self._task_workdir(feature, delegate)
         # Pass ``cwd`` only when a scratch dir was cut, so an A2A task / an unscoped double
         # reaches ``dispatch_task`` with the exact pre-#654 argument list (no ``cwd`` kwarg).
-        kw: dict = {"timeout": self.coder_timeout or None}
+        kw: dict = {"timeout": self._coder_timeout_for(feature)}
         if cwd is not None:
             kw["cwd"] = cwd
             kw["env_passthrough"] = self.env_passthrough
@@ -2060,6 +2062,8 @@ class DriveMixin(HostDiskMixin):
                 if self._shutting_down:
                     log.info("[project_board] %s task dispatch aborted by shutdown — no block", fid)
                     return
+                if isinstance(exc, worktree.CoderTimeout):
+                    await self._raise_coder_timeout_once(store, feature)  # #753: a longer run next time
                 await self._task_dispatch_failed(store, fid, "task", f"{classify(str(exc)).category}: {exc}")
                 return
             except Exception as exc:  # noqa: BLE001 — unexpected; block, don't crash the loop
@@ -2679,7 +2683,7 @@ class DriveMixin(HostDiskMixin):
                                 fid=fid,
                                 gen=1,
                                 tier=tier,
-                                timeout=self.coder_timeout or None,
+                                timeout=self._coder_timeout_for(feature),
                                 new_dispatch=True,
                             )
                         )
@@ -2718,7 +2722,7 @@ class DriveMixin(HostDiskMixin):
                                 base=base,
                                 root=self.root,
                                 fid=fid,
-                                dispatch_timeout=self.coder_timeout or None,
+                                dispatch_timeout=self._coder_timeout_for(feature),
                                 test_cmd=solve["test_cmd"],
                                 test_paths=solve["test_paths"],
                                 test_timeout=solve["test_timeout"],
@@ -2806,7 +2810,7 @@ class DriveMixin(HostDiskMixin):
                             recovery_before = await worktree.recovery_edit_state(wt)
                         result = await self._dispatch_captured(
                             coder_seam.dispatch_coder_tapped(
-                                coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self.coder_timeout or None
+                                coder, wt, prompt, fid=fid, gen=1, tier=tier, timeout=self._coder_timeout_for(feature)
                             )
                         )  # taps live monitor (#84); reaps subprocess; CoderTimeout if it overruns
                     # #258 barrier: any record_gens/record_verified write-backs the
@@ -3893,6 +3897,11 @@ class DriveMixin(HostDiskMixin):
                                 await self._comment(store, fid, reason)
                                 await asyncio.sleep(classify(PROVIDER_STALL_CLASS).base_delay_s)
                                 continue
+                        # #753: the card's first timeout earns its next dispatch (the retry or
+                        # climb below, or the rebuild after a park/block) 1.5x the budget that
+                        # just expired — once per card. Recorded before the park so a card
+                        # parked on this timeout still gets the longer run after an unblock.
+                        await self._raise_coder_timeout_once(store, feature)
                         timeouts = await self._budget_get(store, fid, "timeout") + 1
                         await self._budget_set(store, fid, "timeout", timeouts)
                         threshold = self._too_wide_threshold(feature)  # 0 = never park (block as before)
@@ -3917,6 +3926,10 @@ class DriveMixin(HostDiskMixin):
                             await self._discard_tree(store, fid, repo, wt, branch, base=base)  # save first (#405)
                             self._inflight.pop(fid, None)
                             return
+                    elif isinstance(exc, worktree.CoderTimeout):
+                        # #753: a fix round's timeout (kept worktree / open PR) is no size
+                        # signal, but its next dispatch still gets the once-per-card raise.
+                        await self._raise_coder_timeout_once(store, feature)
                     # 2. Capability failure + a ladder → climb a model tier (fresh budget).
                     if escalation_on and capability:
                         nxt = await asyncio.to_thread(store.escalate, fid, str(exc)[:200])
@@ -4108,6 +4121,61 @@ class DriveMixin(HostDiskMixin):
                 # to take it along (#405).
                 await self._discard_tree(store, fid, repo, wt, branch, base=base)
                 self._inflight.pop(fid, None)
+
+    def _coder_timeout_for(self, feature: dict) -> float | None:
+        """The time budget for one coder dispatch of ``feature`` (#753) — the ONE place every
+        dispatch site resolves it. The card's own ``coder_timeout_s`` when it carries one,
+        else the board-wide ``coder_timeout_s``; then, when the card has earned its
+        once-per-card raise (its first ``CoderTimeout``, see ``_raise_coder_timeout_once``),
+        the larger of that and the raised value. ``None`` = unbounded (a global 0)."""
+        base = self._base_coder_timeout(feature)
+        raised = self._timeout_raise_s(feature)
+        if raised and base:
+            return max(base, raised)
+        return base or None
+
+    def _base_coder_timeout(self, feature: dict) -> float:
+        """The card's own ``coder_timeout_s`` (a positive number), else the global one."""
+        own = (feature or {}).get("coder_timeout_s")
+        if own is None:
+            own = coder_timeout_from_labels((feature or {}).get("labels"))
+        try:
+            own = float(own) if own is not None else 0.0
+        except (TypeError, ValueError):
+            own = 0.0
+        return own if own > 0 and math.isfinite(own) else float(self.coder_timeout or 0)
+
+    def _timeout_raise_s(self, feature: dict) -> float:
+        """The raised timeout (seconds) ``feature`` earned with its first timeout, or 0.
+        The loop's cache wins (a raise granted mid-drive, or a terminal reset), else the
+        bead's durable `budget:timeout-raise-ms:<n>` label — the ``_budget_get`` order."""
+        fid = (feature or {}).get("id")
+        cache = self._budget_cache("timeout-raise-ms")
+        if fid in cache:
+            ms = cache[fid]
+        else:
+            ms = budgets_from_labels((feature or {}).get("labels")).get("timeout-raise-ms", 0)
+        return ms / 1000.0 if ms else 0.0
+
+    async def _raise_coder_timeout_once(self, store, feature: dict) -> None:
+        """Grant ``feature`` its once-per-card raised coder timeout (#753): 1.5x the budget
+        that just expired, for every later dispatch. A card that already holds a raise
+        keeps it — a second timeout never raises again; from there the ordinary timeout
+        policy (tier climb, the too-wide park at its threshold) carries on unchanged."""
+        fid = feature["id"]
+        if await self._budget_get(store, fid, "timeout-raise-ms", feature):
+            return
+        expired = self._base_coder_timeout(feature)
+        if not expired:
+            return  # unbounded: nothing expired that a raise could lengthen
+        raised_ms = max(1, int(math.ceil(expired * 1.5 * 1000)))
+        await self._budget_set(store, fid, "timeout-raise-ms", raised_ms)
+        log.info(
+            "[project_board] %s timed out at %ss — its next dispatch gets %ss (raised once per card)",
+            fid,
+            f"{expired:g}",
+            f"{raised_ms / 1000:g}",
+        )
 
     def _too_wide_threshold(self, feature: dict) -> int:
         difficulty = str(feature.get("difficulty", "")).strip().lower()
@@ -5056,7 +5124,7 @@ class DriveMixin(HostDiskMixin):
         results = await asyncio.gather(
             *(
                 coder_seam.dispatch_coder_tapped(
-                    coder, wt, prompt, fid=fid, gen=i + 1, tier=tier, timeout=self.coder_timeout or None
+                    coder, wt, prompt, fid=fid, gen=i + 1, tier=tier, timeout=self._coder_timeout_for(feature)
                 )
                 for i, (wt, _b) in enumerate(cands)
             ),

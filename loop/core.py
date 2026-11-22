@@ -646,6 +646,8 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         self._review_run_failures: dict[str, int] = {}
         # #378: how many times a coder has timed out on this card, across restarts.
         self._timeout_attempts: dict[str, int] = {}
+        # #753: the once-per-card raised coder timeout (ms) earned by a first timeout.
+        self._timeout_raise_ms: dict[str, int] = {}
         self._provider_stall_attempts: dict[str, int] = {}
         # How many times the blocked sweep has auto-cleared each card (see
         # _recover_blocked); past _UNBLOCK_RETRY_MAX the operator is told instead.

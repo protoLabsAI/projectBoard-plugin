@@ -824,6 +824,12 @@ LABEL_GENS_PREFIX = "gens:"
 # labels on first consult, and the merge / tier-climb edges clear label and cache
 # together (`clear_budgets`).
 LABEL_BUDGET_PREFIX = "budget:"
+# A card's own coder time budget (#753) — `coder-timeout:<seconds>`, ONE label, replaced
+# each write (the `diff:` pattern). Set by board_create_feature/board_update_feature for a
+# card whose run needs longer than the board-wide `coder_timeout_s` (a long measurement
+# task); the loop's dispatches use it in place of the global value. Whole seconds, so the
+# label is a plain digit run the beads label validator always accepts.
+LABEL_CODER_TIMEOUT_PREFIX = "coder-timeout:"
 # Crash-salvage record (#91) — `verified:<sha>`, replaced (never accumulated) each time
 # coder.solve()'s verify boundary promotes a test-PASSING candidate. Written on the bead
 # (not loop memory) so it survives a crash between verify and open_pr; recovery's no-PR
@@ -1708,6 +1714,41 @@ def normalize_project(raw) -> str:
     return s
 
 
+def validate_coder_timeout(raw) -> int | None:
+    """Normalize a card's ``coder_timeout_s`` (#753): a positive number of seconds,
+    rounded UP to whole seconds (the label stores digits only). ``None`` or a blank
+    string means "not given" → ``None`` (an update leaves the field as it is). Zero, a
+    negative, a non-numeric or a non-finite value raises a plain ``BoardError`` before
+    any write, so a refused value never half-applies a create or an update."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        if not raw.strip():
+            return None
+        raw = raw.strip()
+    if isinstance(raw, bool):
+        raise BoardError("coder_timeout_s must be a positive number of seconds")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise BoardError(f"coder_timeout_s must be a positive number of seconds, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise BoardError(f"coder_timeout_s must be a positive number of seconds, got {raw!r}")
+    return int(math.ceil(value))
+
+
+def coder_timeout_from_labels(labels) -> int | None:
+    """The card's own coder timeout in seconds (#753) from its `coder-timeout:<n>` label,
+    or ``None`` when it carries none (or only a malformed/zero one — never guess)."""
+    for label in labels or []:
+        label = str(label)
+        if label.startswith(LABEL_CODER_TIMEOUT_PREFIX):
+            num = label[len(LABEL_CODER_TIMEOUT_PREFIX) :]
+            if num.isdigit() and int(num) > 0:
+                return int(num)
+    return None
+
+
 def validate_priority(raw) -> int:
     """Normalize + validate a bead scheduling priority.
 
@@ -2371,6 +2412,7 @@ class BeadsBoard:
         chain_hot_files: bool = True,
         execute: bool = False,
         origin_session: str = "",
+        coder_timeout_s=None,
     ) -> dict:
         """Create a feature bead (starts in `backlog`). Provide a self-sufficient
         spec + acceptance_criteria + the explicit files to create/modify so it can
@@ -2389,8 +2431,12 @@ class BeadsBoard:
         (gates.py grammar) that must ALL hold before the loop claims the card.
         `execute=True` adds the execution-task routing label. `origin_session` records the
         originating chat the create tool resolved from its turn (ADR 0131 P2b-3) — "" when
-        the host has no resolver; it rides the bead `notes` (see NOTES_ORIGIN_PREFIX)."""
+        the host has no resolver; it rides the bead `notes` (see NOTES_ORIGIN_PREFIX).
+        `coder_timeout_s` (#753) gives this card its own coder time budget in seconds, used
+        in place of the board-wide `coder_timeout_s`; a non-positive or non-numeric value
+        is refused before the bead is minted."""
         self._require_pullable_type(issue_type)
+        card_timeout = validate_coder_timeout(coder_timeout_s)
         # A card on a hot file is created AND chained under the chain lock (#458). Chaining
         # orders cards by `created_at`, but parallel creates commit to `br` out of that order:
         # a racing card could chain while an older one was still invisible (or created but
@@ -2419,6 +2465,7 @@ class BeadsBoard:
                 chain_hot_files=chain_hot_files,
                 execute=execute,
                 origin_session=origin_session,
+                coder_timeout_s=card_timeout,
             )
 
     def _names_hot_file(self, project: str, files_to_modify) -> bool:
@@ -2463,6 +2510,7 @@ class BeadsBoard:
         chain_hot_files: bool,
         execute: bool = False,
         origin_session: str = "",
+        coder_timeout_s: int | None = None,
     ) -> dict:
         # Normalize BEFORE minting the bead: an invalid source_issue/project must reject
         # the whole create with a named error, never leave an orphan bead behind it.
@@ -2512,6 +2560,10 @@ class BeadsBoard:
         if execute:
             upd += ["--add-label", "execute"]
             enriched.append("execute")
+        card_timeout = validate_coder_timeout(coder_timeout_s)
+        if card_timeout is not None:
+            upd += ["--add-label", f"{LABEL_CODER_TIMEOUT_PREFIX}{card_timeout}"]
+            enriched.append("coder_timeout_s")
         if foundation:
             upd += ["--add-label", LABEL_FOUNDATION]
             enriched.append("foundation")
@@ -2926,6 +2978,7 @@ class BeadsBoard:
         priority: int | None = None,
         waits_for=None,
         project: str | None = None,
+        coder_timeout_s=None,
     ) -> dict:
         """Partially update an existing feature's fields (a board-level `br update`).
         Only the arguments you pass (non-``None``) are written; every other field is
@@ -2944,7 +2997,11 @@ class BeadsBoard:
         REPLACES the card's publish gates (a list or comma-separated text; an empty list
         clears them); None leaves them untouched. ``project`` RE-HOMES the card to another
         entry of the board's `projects:` map (#454) — only while nothing is bound to the old
-        repo yet (see ``_rehome_refusal``); None or blank leaves it untouched."""
+        repo yet (see ``_rehome_refusal``); None or blank leaves it untouched.
+        ``coder_timeout_s`` (#753) sets/replaces the card's own coder time budget in
+        seconds; None or blank leaves it untouched, and a non-positive or non-numeric value
+        is refused before anything is written."""
+        card_timeout = validate_coder_timeout(coder_timeout_s)
         f = self._require(fid)
         rehome: tuple[str, str] | None = None
         if project is not None and str(project).strip():
@@ -3023,6 +3080,11 @@ class BeadsBoard:
             diff = difficulty.strip().lower()
             if diff:
                 args += replace_prefixed_label_args(f.get("labels"), "diff:", f"diff:{diff}")
+        if card_timeout is not None:
+            # The single `coder-timeout:` label, replaced (#753) — the `diff:` pattern.
+            args += replace_prefixed_label_args(
+                f.get("labels"), LABEL_CODER_TIMEOUT_PREFIX, f"{LABEL_CODER_TIMEOUT_PREFIX}{card_timeout}"
+            )
         if foundation:
             # Complete the create-repair contract: a foundation flag dropped by a failed
             # create can be restored here (QA panel on #88, round 4 — same undeliverable-
@@ -6118,6 +6180,9 @@ class BeadsBoard:
             "archived": LABEL_ARCHIVED in labels,
             "foundation": LABEL_FOUNDATION in labels,
             "difficulty": diff,
+            # The card's own coder time budget in seconds (#753), or None → the board-wide
+            # `coder_timeout_s` applies.
+            "coder_timeout_s": coder_timeout_from_labels(labels),
             "depends_on": depends_on,
             "open_depends_on": open_depends_on,
             "attempts": attempts,
