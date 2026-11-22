@@ -1343,7 +1343,8 @@ class GapReporter:
     def _action_for(self, key: str, msg: str | None) -> dict | None:
         """The structured action for one gap: the ``plugin_config`` CTA for an ACTIVE
         ``coder`` / ``repo`` configuration blocker, the coder-limit CTA for an ACTIVE
-        ``routing_exclusive`` gap, else ``None`` — a cleared gap (``msg`` None), or a gap
+        ``routing_exclusive`` gap, the first advisory's fix button for an ACTIVE ``preflight``
+        advisory (#728), else ``None`` — a cleared gap (``msg`` None), or a gap
         Project Board's settings can't resolve (``br`` / ``gh`` / advisories, r4). No coder is
         manufactured and no config is touched — the action only opens the config surface."""
         if msg is None:
@@ -1352,6 +1353,12 @@ class GapReporter:
             return plugin_config_action(key)
         if key == ROUTING_EXCLUSIVE_KEY:
             return routing_exclusive_action()
+        if key == PREFLIGHT_KEY:
+            # #728: the slow-gate / slow-preflight / unwinnable-oracle advisory carries the
+            # first active entry's plugin_config fix button (the settings named in its fix).
+            from . import health  # lazy, like setup_status
+
+            return health.advisory_fix_action()
         return None
 
     def _emit(self, key: str, msg: str | None) -> None:
