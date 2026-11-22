@@ -66,6 +66,13 @@ def test_every_board_tool_the_helper_lists_is_one_the_plugin_registers():
     assert listed and listed <= registered, listed - registered
 
 
+def test_the_helper_pins_no_model_so_it_runs_on_any_host():
+    """v0.88.0 pinned the gateway alias `protolabs/reasoning`. A host on anthropic-oauth
+    refused it and all five helpers of the first live batch stopped at startup. The helper
+    must inherit the host's own model resolution; an operator can pin one in config."""
+    assert _writer(_registry()).model == ""
+
+
 def test_the_helper_prompt_carries_the_rules_that_went_wrong_by_hand():
     prompt = _writer(_registry()).system_prompt
     # Reading without carding.

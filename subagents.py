@@ -186,7 +186,12 @@ CARD_WRITER_CONFIG = SubagentConfig(
         "other issues, or writes code. Run one per issue, in the background, via the "
         "`card-github-issues` skill."
     ),
-    model=_MODEL,
+    # No pinned model. `_MODEL` is a gateway alias, and a host on a native subscription
+    # (anthropic-oauth, openai-codex) refuses it: on its first live run every helper stopped
+    # at startup. Unpinned, it follows the turn's model, then `routing.aux_model`, then the
+    # host's main model. An operator who wants a stronger writer sets
+    # `subagents.board_card_writer.model` to a model id their host can run.
+    model="",
     tools=CARD_WRITER_TOOLS,
     max_turns=40,
     system_prompt="""You are the board's **card writer**. You are given ONE GitHub issue and
