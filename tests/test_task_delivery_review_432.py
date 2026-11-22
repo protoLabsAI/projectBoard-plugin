@@ -37,7 +37,13 @@ import project_board as pb
 from project_board import coder_seam, worktree
 from project_board import store as store_mod
 from project_board.loop import BoardLoop, _parse_requirements_reply
-from project_board.store import AlreadyDelivered, BeadsBoard, BoardError, open_requirements_note
+from project_board.store import (
+    AlreadyDelivered,
+    BeadsBoard,
+    BoardError,
+    open_requirements_note,
+    unparsed_requirement_lines,
+)
 
 requires_br = pytest.mark.skipif(
     shutil.which(store_mod.BR) is None,
@@ -264,6 +270,48 @@ def test_a_done_row_may_cite_its_evidence_but_not_hedge():
         "- r7: done —\n"
     )
     assert _parse_requirements_reply(hedged) == []
+
+
+def test_a_done_row_may_explain_itself_after_a_full_stop():
+    """`- r1: done. <explanation>` is done (#861). On bd-xhirv every row took that form;
+    the parser read each as malformed, so the gate saw silence, re-dispatched twice and
+    blocked a finished card as "requirements unresolved". The hedge guard still reads
+    the text after the full stop: `done. but not the e2e` closes nothing."""
+    assert _parse_requirements_reply("## Requirements\n- r1: done. <explanation text>\n") == [
+        {"id": "r1", "status": "done"}
+    ]
+    explained = (
+        "## Requirements\n"
+        "- r1: done. Added the regression test in `tests/test_x.py`\n"
+        "- r2: Done.  Notably, both consumers share it\n"
+        "- r3: done.\n"
+        "- r4: done\n"
+    )
+    assert _parse_requirements_reply(explained) == [{"id": f"r{i}", "status": "done"} for i in range(1, 5)]
+    hedged = (
+        "## Requirements\n"
+        "- r1: done. but not the e2e\n"
+        "- r2: done. partially\n"
+        "- r3: done. not yet\n"
+        "- r4: done. pending\n"
+        "- r5: done.but glued on\n"
+    )
+    assert _parse_requirements_reply(hedged) == []
+
+
+def test_unparsed_requirement_lines_lists_the_rows_the_parser_skipped():
+    """The rows of the last `## Requirements` section that are not a disposition, by the
+    parser's own rules (#861) — so a re-dispatch can name the lines it did not understand."""
+    section = "## Requirements\n- r1: finished it\n\n- r2: done\n\n## Summary\n- r3: whatever\n"
+    assert unparsed_requirement_lines(section) == ["- r1: finished it"]
+    # the LAST section wins, as in the parser
+    assert unparsed_requirement_lines("## Requirements\n- r9: hmm\n" + section) == ["- r1: finished it"]
+    assert unparsed_requirement_lines("## Requirements\n- r1: done. ok\n- r2: declined — n/a\n") == []
+    assert unparsed_requirement_lines("No section here.\n- r1: finished it\n") == []
+    assert unparsed_requirement_lines("") == []
+    assert unparsed_requirement_lines(None) == []
+    fenced = "## Requirements\n- r1: done\n```\n- r2: finished it\n```\n"
+    assert unparsed_requirement_lines(fenced) == []
 
 
 @requires_br
