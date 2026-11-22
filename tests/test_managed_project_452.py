@@ -239,7 +239,33 @@ async def test_the_register_tool_says_what_it_did(monkeypatch, tmp_path):
     assert "read-only managed project 'web'" in reply and "filesystem tools" in reply
     assert "coders can't be dispatched" in reply
     assert "register_local_project with write=true" in reply
-    assert "approval card" in reply and "Settings ▸ Projects" in reply
+    assert "approval card" in reply
+    assert "Tools ▸ Filesystem ▸ Work folders" in reply
+    assert "Settings ▸ Projects" not in reply
+
+
+@pytest.mark.parametrize("write", [False, True])
+async def test_the_register_tool_points_present_read_only_projects_to_the_write_switch(monkeypatch, tmp_path, write):
+    repo = _checkout(tmp_path / "workspace" / "web")
+    onboarded = {"name": "onboarded-web", "path": str(repo), "write": write}
+    host = _host(tmp_path, projects=[dict(onboarded)])
+    wire_host(monkeypatch, host)
+
+    reply = await build_register_tool({}).ainvoke({"name": "web", "repo": str(repo), "repo_conventions": "x"})
+
+    assert "It is already the managed project 'onboarded-web', which was left as it is." in reply
+    for warning in (
+        "It is read-only",
+        "coders can't be dispatched",
+        "onboard_project",
+        "register_local_project with write=true",
+        "approval card",
+        "Tools ▸ Filesystem ▸ Work folders write switch",
+    ):
+        assert (warning in reply) is (not write)
+    assert "Settings ▸ Projects" not in reply
+    assert _registry(host) == [onboarded]
+    assert "projects" not in host.patches[-1]
 
 
 async def test_a_readback_that_misses_the_managed_entry_is_not_reported_as_success(monkeypatch, tmp_path):
