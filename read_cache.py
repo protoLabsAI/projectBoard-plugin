@@ -13,8 +13,9 @@ Now the routes read a :class:`BoardReadCache`:
   snapshot is current costs a few ``stat`` calls and no ``br`` at all.
 - **Current means the change token still matches.** The token is the board's in-process
   write revision (``work_snapshot.board_revision``, bumped by every projection write in
-  this process: loop, tools, routes), the store's file stamp (``api.store_rev``, which
-  moves for a writer outside this process such as a hand-run ``br``), the live project
+  this process: loop, tools, routes), the store's content stamp (:func:`listing_rev`,
+  which moves for a writer outside this process such as a hand-run ``br``, and does not
+  move when a ``br`` read rewrites the database's header counters), the live project
   routing, and this cache's own API-write epoch (:meth:`BoardReadCache.note_write`).
 - **Refreshes are single-flight.** However many readers find the snapshot out of date,
   one listing runs, on its own thread; the others join it. A refresh requested while one
@@ -242,6 +243,88 @@ def store_rev(db: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+_WAL_HEADER = 32
+# The listing stamp last computed per database file: (file stamp it was computed at, stamp).
+_listing_revs: dict[str, tuple[str, str]] = {}
+_listing_revs_lock = threading.Lock()
+
+
+def _store_content(db: str) -> str | None:
+    """A digest of what the store at ``db`` HOLDS, or None when the database cannot be read.
+
+    The database's bytes minus the two SQLite header counters that count transactions
+    (the file change counter at offset 24 and version-valid-for at 92), plus any frames
+    in the WAL past its header. A `br` that opens a write transaction to read (0.1.x)
+    moves those counters, the WAL header's salts and both files' mtimes, and nothing
+    else; a real write changes page content or leaves frames in the WAL."""
+    digest = hashlib.blake2b(digest_size=16)
+    try:
+        with open(db, "rb") as fh:
+            head = bytearray(fh.read(100))
+            if head.startswith(_SQLITE_MAGIC) and len(head) == 100:
+                head[24:28] = head[92:96] = b"\x00\x00\x00\x00"
+            digest.update(head)
+            while chunk := fh.read(1 << 20):
+                digest.update(chunk)
+    except OSError:
+        return None
+    try:
+        with open(db + "-wal", "rb") as fh:
+            fh.seek(_WAL_HEADER)
+            while chunk := fh.read(1 << 20):
+                digest.update(chunk)
+    except OSError:
+        pass  # no WAL: nothing waiting to be checkpointed
+    return digest.hexdigest()
+
+
+def listing_rev(db: str, stamp: str | None = None) -> str:
+    """The change stamp a cached listing is current against: :func:`store_rev`, made
+    proof against a `br` READ (#805).
+
+    `br` 0.1.x rewrites the SQLite header counters on every ``list``/``show``/``ready``,
+    so the file stamp moved after each listing and a cached listing was never current:
+    every read listed the store again. This stamp is taken from the store's content
+    (:func:`_store_content`) and the JSONL exports' file state, so only a write moves it.
+
+    Still cheap: the content is read only when the file stamp (``stamp``, default
+    ``store_rev(db)``) differs from the one this was last computed at. With a `br` whose
+    reads leave the files alone that is once per write. A database that cannot be read,
+    or that changed while it was read, has no content to compare: the file stamp itself
+    is the answer."""
+    if stamp is None:
+        stamp = store_rev(db)
+    with _listing_revs_lock:
+        known = _listing_revs.get(db)
+    if known is not None and known[0] == stamp:
+        return known[1]
+    content = _store_content(db)
+    if content is None:
+        return stamp
+    parts = [content]
+    beads_dir = os.path.dirname(db)
+    try:
+        names = sorted(n for n in os.listdir(beads_dir) if n.endswith(".jsonl"))
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            st = os.stat(os.path.join(beads_dir, name))
+            parts.append(f"{name}:{st.st_size}.{st.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{name}:-")
+    rev = hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+    # Something touched the files while they were read (a write in flight): what was read
+    # may be half of it, so answer with the file stamp, which is out of date the moment
+    # the write ends, and take the content again then.
+    if store_rev(db) != stamp:
+        return stamp
+    with _listing_revs_lock:
+        _listing_revs[db] = (stamp, rev)
+    return rev
+
+
 def db_file(db: str | None, repo: str | None) -> str:
     """The board's database file, as the key the shared cache is published under. `br`
     runs in the repo, so a relative ``db`` is the repo's."""
@@ -285,7 +368,7 @@ def own_cache(board, key: str) -> BoardReadCache:
 
             def _token():
                 routing = repr((getattr(board, "projects", None), getattr(board, "default_project", None)))
-                return (work_snapshot.board_revision(), store_rev(key), routing)
+                return (work_snapshot.board_revision(), listing_rev(key), routing)
 
             cache = _own[board] = BoardReadCache(
                 lambda include_archived: board.list_features(include_archived=include_archived), _token
@@ -307,3 +390,5 @@ def reset_shared() -> None:
     with _shared_lock:
         _published.clear()
         _own.clear()
+    with _listing_revs_lock:
+        _listing_revs.clear()

@@ -705,7 +705,10 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         routing = json.dumps(
             [getattr(board, "projects", None), getattr(board, "default_project", None)], sort_keys=True, default=str
         )
-        return (work_snapshot.board_revision(), store_rev(_db_file()), routing)
+        # The file stamp gates a content stamp: `br` 0.1.x moves the files' mtimes on a
+        # READ, which must not make the listing it just took out of date (#805).
+        db = _db_file()
+        return (work_snapshot.board_revision(), read_cache_mod.listing_rev(db, store_rev(db)), routing)
 
     # The ONE board listing the read routes serve from (/features, /cards…): cached,
     # single-flight, invalidated by writes, never queued behind the drive loop's `br` lock.

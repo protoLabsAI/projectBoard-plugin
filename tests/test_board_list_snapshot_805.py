@@ -420,3 +420,92 @@ def test_a_store_without_a_change_token_is_listed_every_call(monkeypatch):
         dict(id="bd-1", title="New", board_state="backlog", blocked=False, pr_url="", priority=2, difficulty="")
     )
     assert [r["id"] for r in json.loads(board_list.invoke({}))] == ["bd-1"]
+
+
+# ── the change stamp does not move on a `br` read ───────────────────────────────────
+#
+# `br` 0.1.x opens a write transaction to read: every list/show/ready moves the database's
+# two SQLite header counters, the WAL header and both files' mtimes. On the file stamp
+# alone the listing just taken was already out of date, so no call was ever answered from
+# the cache (the 0.1.23 CI leg caught it; a newer `br` leaves the files alone).
+
+
+def _read_like_br_01x(db: str) -> None:
+    """What a `br` 0.1.x read leaves behind: the header counters moved, nothing else."""
+    with open(db, "r+b") as fh:
+        head = bytearray(fh.read(100))
+        assert head.startswith(b"SQLite format 3\x00")
+        for at in (24, 92):
+            head[at : at + 4] = (int.from_bytes(head[at : at + 4], "big") + 1).to_bytes(4, "big")
+        fh.seek(0)
+        fh.write(head)
+    with open(db + "-wal", "wb") as fh:
+        fh.write(bytes(range(32)))  # a header with new salts, no frames
+
+
+def test_a_read_that_touches_the_database_header_leaves_the_stamp_alone(board):
+    db = board["db_path"]
+    before_file, before = read_cache.store_rev(db), read_cache.listing_rev(db)
+    _read_like_br_01x(db)
+    assert read_cache.store_rev(db) != before_file, "the fake read must move the file stamp"
+    assert read_cache.listing_rev(db) == before
+
+    subprocess.run(
+        ["br", "update", "snap-00100", "--title", "A real write", "--db", db],
+        cwd=board["repo"],
+        check=True,
+        capture_output=True,
+    )
+    assert read_cache.listing_rev(db) != before
+
+
+def test_a_real_br_read_leaves_the_stamp_alone(board):
+    db = board["db_path"]
+    before = read_cache.listing_rev(db)
+    for args in (["list", "--json", "--limit", "0"], ["ready", "--json"], ["show", "snap-00100", "--json"]):
+        subprocess.run(["br", *args, "--db", db], cwd=board["repo"], check=True, capture_output=True)
+    assert read_cache.listing_rev(db) == before
+
+
+def test_a_header_touching_read_between_calls_costs_no_listing(board, br_calls):
+    """The whole path: the loop (or the listing itself, on 0.1.x) read the store between
+    two board_list calls. The second is still answered from the snapshot."""
+    board_list = _tools(board)["board_list"]
+    first = board_list.invoke({})
+    _read_like_br_01x(board["db_path"])
+    br_calls.clear()
+    assert board_list.invoke({}) == first
+    assert br_calls == []
+
+
+def test_frames_left_in_the_wal_move_the_stamp(board):
+    db = board["db_path"]
+    before = read_cache.listing_rev(db)
+    with open(db + "-wal", "wb") as fh:
+        fh.write(bytes(32) + b"a frame a writer has not checkpointed yet")
+    assert read_cache.listing_rev(db) != before
+
+
+def test_the_stamp_reads_the_content_once_per_file_change(board, monkeypatch):
+    db = board["db_path"]
+    reads = []
+    real = read_cache._store_content
+    monkeypatch.setattr(read_cache, "_store_content", lambda path: reads.append(path) or real(path))
+    first = read_cache.listing_rev(db)
+    assert read_cache.listing_rev(db) == first and len(reads) == 1
+    _read_like_br_01x(db)
+    assert read_cache.listing_rev(db) == first and len(reads) == 2
+    assert read_cache.listing_rev(db) == first and len(reads) == 2
+
+
+def test_the_stamp_falls_back_to_the_file_stamp(board, tmp_path, monkeypatch):
+    # No database to read: the file stamp is all there is.
+    missing = str(tmp_path / "nowhere" / "beads.db")
+    assert read_cache.listing_rev(missing) == read_cache.store_rev(missing)
+    # The files moved while the content was read (a write in flight): the content may be
+    # half a write, so it is neither returned nor remembered.
+    db = board["db_path"]
+    stamps = iter(["during-1", "during-2"])
+    monkeypatch.setattr(read_cache, "store_rev", lambda _db: next(stamps))
+    assert read_cache.listing_rev(db, "at-start") == "at-start"
+    assert db not in read_cache._listing_revs
