@@ -31,7 +31,8 @@ The 12 seams covered: ``repo_slug``, ``pr_state``, ``pr_head_sha``, ``pr_url_for
 ``pr_merge_info``, ``pr_diff``, ``pr_ci_status``, ``post_review_status``,
 ``read_review_status``, ``_find_marked_comment``, ``post_or_update_pr_comment``, ``merge_pr`` —
 and, since #473, ``pr_review_state`` (the external QA panel's verdict read); since #495,
-``pr_unresolved_threads`` (the PR's unresolved review threads, a ``gh api graphql`` read).
+``pr_unresolved_threads`` (the PR's unresolved review threads, a ``gh api graphql`` read);
+since #716, ``pr_head_branch`` (the durable branch identity for legacy cards).
 Reads use the pinned fixture. The only writes are (1) EXACTLY ONE commit status per run, keyed
 on a STABLE disposable ``(context, sha)`` — GitHub records each POST as a new immutable entry
 (the combined-status rollup, which the review gate reads, reports only the latest per context),
@@ -195,6 +196,16 @@ async def test_pr_head_sha_is_the_immutable_40_hex_head(gh_fixture):
     head = await worktree.pr_head_sha(gh_fixture.url, cwd=gh_fixture.repo_dir)
     assert _HEX40.fullmatch(head), f"not a 40-hex sha: {head!r}"
     assert head == gh_fixture.head_sha
+
+
+@requires_gh
+async def test_pr_head_branch_matches_the_fixture_head(gh_fixture, monkeypatch):
+    """Legacy cards recover their branch from the real PR's headRefName (#716)."""
+    from conftest import REAL_SEAMS
+
+    monkeypatch.setattr(worktree, "pr_head_branch", REAL_SEAMS["worktree.pr_head_branch"])
+    head = await worktree.pr_head_branch(gh_fixture.url, cwd=gh_fixture.repo_dir)
+    assert head == gh_fixture.head_branch
 
 
 # ── pr_url_for_branch ───────────────────────────────────────────────────────────────────
