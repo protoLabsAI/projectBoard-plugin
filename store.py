@@ -44,6 +44,7 @@ import json
 import logging
 import math
 import os
+import posixpath
 import re
 import shutil
 import signal
@@ -1600,6 +1601,30 @@ def _git_ref_has_path(repo: str, ref: str, path: str) -> bool:
     return proc is not None and proc.returncode == 0
 
 
+def _path_on_base(repo: str, base: str, path: str) -> bool:
+    """True iff ``path`` exists on the card's base branch in ``repo`` (#702): in the working
+    tree, in ``origin/<base>``, or in the local ``<base>`` branch.
+
+    WHY THE REFS. A project's ``base_branch`` need not be the branch its checkout has checked
+    out — a team checkout usually sits on ``main`` while an epic project targets
+    ``epic/<name>``. The coder's worktree is cut from the base branch, so a file that exists
+    there is real for the card even when the checkout's working tree lacks it. ``origin/<base>``
+    is read as well as the local branch because the local one may be missing or behind.
+
+    The three answers are OR-ed, so the working tree — a ``stat``, no subprocess — is asked
+    first: a path on disk (the common case, and the only case for a ``repo`` that is not a git
+    checkout) costs no git call. The ref reads are ``git cat-file -e``, LOCAL only: NO
+    ``git fetch`` — the Ready gate must stay fast and offline-safe. ``./`` anchors the path at
+    ``repo`` itself, so a project bound to a subdirectory of a checkout resolves the same path
+    the working-tree check does. Never raises: a ref that can't be read is "not found"."""
+    if os.path.exists(os.path.join(repo, path)):
+        return True
+    rel = posixpath.normpath(str(path).strip().replace(os.sep, "/"))
+    if not base or not rel or rel == "." or rel.startswith(("/", "../")) or rel == "..":
+        return False
+    return any(_git_ref_has_path(repo, ref, f"./{rel}") for ref in (f"origin/{base}", base))
+
+
 def _dep_branch_refs(repo: str, dep_id: str) -> list[str]:
     """The git refs under ``repo`` that hold dependency ``dep_id``'s build branch — the branch
     ``worktree.branch_name`` creates, ``feat/<dep_id>`` or ``feat/<dep_id>-<slug>``, as local
@@ -3082,7 +3107,9 @@ class BeadsBoard:
                 else list(f.get("files_to_modify") or [])
             )
             repo = str((self.projects.get(target) or {}).get("repo") or "").strip() or self.repo
-            phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+            # #702: against the TARGET project's base branch, as the Ready gate does there.
+            base = self._base_branch_for({**f, "project": target})
+            phantom = [p for p in files if "(new)" not in p.lower() and not _path_on_base(repo, base, p)]
             # #537: a path absent from the target checkout may exist on a depends_on card's
             # open-PR branch there, same as the Ready gate — accept those so a stacked card
             # isn't blocked from rehoming. Gated on depends_on so the common no-dep move pays
@@ -3114,6 +3141,26 @@ class BeadsBoard:
         name = str(f.get("project") or "").strip() or self.default_project
         entry = self.projects.get(name) if name else None
         return entry if isinstance(entry, dict) else {}
+
+    def _base_branch_for(self, f: dict) -> str:
+        """The base branch ``f``'s PR targets (#702) — the branch its worktree is cut from, so
+        the one its files_to_modify must exist on. Resolved in the loop's order
+        (``loop/core.py`` ``_base_branch_for``, ``api.py`` ``base_branch_for_feature``): the
+        card's own project entry, else the ``base_branch`` stamped on the card, else the
+        default project's, else the board's, else ``main``."""
+        name = str(f.get("project") or "").strip()
+        if name:
+            base = str((self.projects.get(name) or {}).get("base_branch") or "").strip()
+            if base:
+                return base
+        # A label naming no known project falls back to the default project's entry.
+        entry = self._project_entry({"project": name if name in self.projects else ""})
+        return (
+            str(f.get("base_branch") or "").strip()
+            or str(entry.get("base_branch") or "").strip()
+            or str(self.base_branch or "").strip()
+            or "main"
+        )
 
     def breadth_exclude_for(self, f: dict) -> tuple[str, ...]:
         """The `breadth_exclude` globs for ``f``'s project (#455): the entry's own list,
@@ -3233,8 +3280,13 @@ class BeadsBoard:
         # declares the file doesn't exist yet and bypasses the check. #90: the bound checkout
         # is THIS FEATURE's project repo, so a multi-repo board checks each card against its
         # own repo; a card with no project falls back to the instance repo.
+        # #702: "resolves" means on the card's BASE BRANCH (origin's copy, or the local one) or
+        # in the working tree — the checkout may have another branch checked out (a team
+        # checkout on `main`, a project whose base is an epic branch), and the coder's
+        # worktree is cut from the base, not from whatever is checked out here.
         repo = self._repo_for(f)
-        phantom = [p for p in files if "(new)" not in p.lower() and not os.path.exists(os.path.join(repo, p))]
+        base = self._base_branch_for(f)
+        phantom = [p for p in files if "(new)" not in p.lower() and not _path_on_base(repo, base, p)]
         # STACKED cards (#537): a path missing from the base checkout may already exist on a
         # depends_on card's open-PR branch (bd-8ac depends on bd-0d4, whose open PR creates the
         # files bd-8ac edits). Before refusing, consult each depends_on card that has an open
