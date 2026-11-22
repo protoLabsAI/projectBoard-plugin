@@ -4201,6 +4201,16 @@ class ReconcileMixin(WorktreeCleanup):
         finally:
             self._review_inflight.discard(fid)
             self._review_tasks.pop(fid, None)
+            self._review_model_used.pop(fid, None)
+
+    @staticmethod
+    def _review_model_description(description: str, used: str) -> str:
+        """Fit attribution in the status cap without shortening the verdict."""
+        suffix = " · "
+        available = 140 - len(description) - len(suffix)
+        if available <= 0:
+            return description
+        return description + suffix + used[:available]
 
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
@@ -4215,7 +4225,12 @@ class ReconcileMixin(WorktreeCleanup):
         # (#354) — a fail-closed yellow the merge edge won't cross, resolved to success/failure
         # below. No PR comment for pending (only the terminal blocking verdict carries findings).
         await self._publish_gate_verdict(
-            fid, pr_url, repo, reviewed_head, state="pending", description="Review gate running…"
+            fid,
+            pr_url,
+            repo,
+            reviewed_head,
+            state="pending",
+            description=self._review_model_description("Review gate running…", self.review_model or "host routing"),
         )
         try:
             feature = await asyncio.to_thread(store.get_feature, fid)
@@ -4443,7 +4458,10 @@ class ReconcileMixin(WorktreeCleanup):
                 repo,
                 reviewed_head,
                 state="success",
-                description=f"Review gate clean — {len(findings)} finding(s), none blocking",
+                description=self._review_model_description(
+                    f"Review gate clean — {len(findings)} finding(s), none blocking",
+                    self._review_model_used.get(fid, "host routing"),
+                ),
             )
             log.info("[project_board] %s review gate clean (%d non-blocking finding(s))", fid, len(findings))
             await self._release_board_draft(store, fid, pr_url, repo)
@@ -4523,7 +4541,9 @@ class ReconcileMixin(WorktreeCleanup):
                 repo,
                 reviewed_head,
                 state="failure",
-                description=description,
+                description=self._review_model_description(
+                    description, self._review_model_used.get(fid, "host routing")
+                ),
                 comment=comment,
             )
             log.warning("[project_board] %s blocked (review findings, %d bounce(s) exhausted)", fid, n)
@@ -4552,7 +4572,10 @@ class ReconcileMixin(WorktreeCleanup):
             repo,
             reviewed_head,
             state="failure",
-            description=f"Review gate: {len(blocking)} blocking finding(s) — a fix round is in progress",
+            description=self._review_model_description(
+                f"Review gate: {len(blocking)} blocking finding(s) — a fix round is in progress",
+                self._review_model_used.get(fid, "host routing"),
+            ),
             comment=f"{rendered}\n\nThe coder is re-driving a fix for these findings.\n\n{pr_url}",
         )
         await asyncio.to_thread(store.requeue, fid)
@@ -4582,6 +4605,7 @@ class ReconcileMixin(WorktreeCleanup):
         block reason tell the operator what to fix instead of making them
         correlate a generic three-hypothesis message with the server log (#180:
         the live incident was simply the workflows plugin being disabled)."""
+        self._review_model_used.pop(fid, None)
         number, repo_slug = _parse_pr_url(pr_url)
         runner = None
         try:
@@ -4609,16 +4633,19 @@ class ReconcileMixin(WorktreeCleanup):
                 if card:
                     inputs["card"] = card
                 model_scope = nullcontext()
+                used = "host routing"
                 if self.review_model:
                     try:
                         from graph.subagent_model import turn_model_scope
 
                         model_scope = turn_model_scope(self.review_model)
+                        used = self.review_model
                     except (ImportError, AttributeError):
                         pass  # Older/non-protoAgent hosts still run the review.
                 # Bind before runner creation and _within's task creation: child tasks
                 # inherit this override, above aux_model but below explicit subagent pins.
                 with model_scope:
+                    self._review_model_used[fid] = used
                     result = await _within(
                         runner(self.review_workflow, inputs),
                         self.review_gate_timeout,
@@ -4689,6 +4716,7 @@ class ReconcileMixin(WorktreeCleanup):
                 )
             if output is None:
                 return None, f"reviewer {self.reviewer_name!r} returned no output"
+            self._review_model_used[fid] = f"reviewer {self.reviewer_name}"
             return output, None
         except asyncio.TimeoutError:
             log.warning(

@@ -671,6 +671,7 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # for the review gate, set by `_review_gate_run` for the duration of one review so the
         # panel can weigh a finding against what the card asked for (not on the diff alone).
         self._review_card: dict[str, str] = {}
+        self._review_model_used: dict[str, str] = {}
         # Features whose review gate is RUNNING in this process right now (#205).
         # The gate has two call sites — the drive (PR just opened) and the
         # reconcile's resume edge (an in_review card still review-pending) — and
