@@ -3186,7 +3186,26 @@ class BeadsBoard:
         are consulted. ``_paths_on_dep_branch`` makes at most ONE bounded fetch per dependency
         (never one per path) and a git failure counts as "not found" — the path stays phantom
         and nothing raises — so a stacked card that can't be confirmed gets the normal
-        phantom-path refusal. See ``_paths_on_dep_branch`` for which ref is read and why."""
+        phantom-path refusal. See ``_paths_on_dep_branch`` for which ref is read and why.
+
+        DECLARED OUTPUT (#702). A dependency that has not been built yet has no branch to
+        read, but its own ``files_to_modify`` says what it will create. So a path still
+        phantom after the branch read is accepted when an OPEN, unblocked dependency declares
+        that same path ``(new)`` — the whole chain can be queued at once, and the dependent
+        names the real path instead of mislabelling it ``(new)``. What a dependency's state
+        grants:
+
+        - ``cancelled``: NOTHING — neither its branch (which may outlive the card) nor its
+          declarations. Its work will never land.
+        - ``blocked``: its branch as above, but not its declarations — nothing says the
+          declared file is still coming.
+        - ``done``: its branch as above, but not its declarations — once merged the path must
+          resolve on the base branch (``_path_on_base``).
+        - any other state: its branch, then its ``(new)`` declarations.
+
+        A dependency the listing does not carry (an archived terminal card) is read once by
+        id, so an archived CANCELLED card grants nothing either. No fetch is added: the
+        declaration check reads the board rows only."""
         remaining = list(phantom)
         advisories: list[dict] = []
         for dep in f.get("depends_on") or []:
@@ -3194,23 +3213,55 @@ class BeadsBoard:
                 break
             dep = str(dep)
             row = dep_rows.get(dep)
+            if row is None:
+                # Absent from the listing: an archived terminal card, or an unknown id. Read
+                # it by id so a cancelled dependency can't grant its leftover branch.
+                try:
+                    row = self.get_feature(dep)
+                except BoardError:
+                    row = None
+            state = str((row or {}).get("board_state") or "")
+            if state == "cancelled":
+                continue
             has_pr = bool(row is not None and str(row.get("pr_url") or "").strip())
             on_branch = _paths_on_dep_branch(repo, dep, remaining, has_pr=has_pr)
-            if not on_branch:
+            if on_branch:
+                paths = ", ".join(strip_new_marker(p) for p in on_branch)
+                advisories.append(
+                    {
+                        "gate": "phantom-paths",
+                        "message": (
+                            f"feature {f['id']!r}: {paths} {'is' if len(on_branch) == 1 else 'are'} not "
+                            f"in the base checkout but exist on {dep!r}'s open branch — accepted "
+                            f"(path from {dep}'s branch)."
+                        ),
+                        "fix": "",
+                    }
+                )
+                remaining = [p for p in remaining if p not in on_branch]
+            if not remaining or row is None or state in _TERMINAL_STATES or state == "blocked" or row.get("blocked"):
                 continue
-            paths = ", ".join(strip_new_marker(p) for p in on_branch)
+            declared = {
+                strip_new_marker(p)
+                for p in row.get("files_to_modify") or []
+                if "(new)" in str(p).lower() and strip_new_marker(p)
+            }
+            will_exist = [p for p in remaining if strip_new_marker(p) in declared]
+            if not will_exist:
+                continue
+            paths = ", ".join(strip_new_marker(p) for p in will_exist)
             advisories.append(
                 {
                     "gate": "phantom-paths",
                     "message": (
-                        f"feature {f['id']!r}: {paths} {'is' if len(on_branch) == 1 else 'are'} not "
-                        f"in the base checkout but exist on {dep!r}'s open branch — accepted "
-                        f"(path from {dep}'s branch)."
+                        f"feature {f['id']!r}: {paths} {'is' if len(will_exist) == 1 else 'are'} not "
+                        f"in the base checkout but will be created by {dep!r}'s card "
+                        "(declared (new)) — accepted."
                     ),
                     "fix": "",
                 }
             )
-            remaining = [p for p in remaining if p not in on_branch]
+            remaining = [p for p in remaining if p not in will_exist]
         return remaining, advisories
 
     def graph_summary(self, project: str, *, current: dict | None = None) -> dict | None:
