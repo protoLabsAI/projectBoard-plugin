@@ -204,9 +204,7 @@ async def test_missing_context_fallback_does_not_authorize_worktree_access():
     card = {"id": "bd-1", "labels": []}
     assert not await loop._worktree_hold_current(store, card, fail_closed=False)
     assert await loop._worktree_hold_current(store, card)
-    assert await loop._worktree_hold_current(
-        store, {**card, "labels": [LABEL_WORKTREE_HOLD]}, fail_closed=False
-    )
+    assert await loop._worktree_hold_current(store, {**card, "labels": [LABEL_WORKTREE_HOLD]}, fail_closed=False)
 
 
 def test_location_sweep_does_not_probe_held_card(monkeypatch):
