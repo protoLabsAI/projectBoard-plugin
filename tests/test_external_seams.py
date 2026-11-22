@@ -88,6 +88,12 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 # real, dormant only until the operator sets PB_SANDBOX_REPO. The escape hatch's presence + coverage
 # of each seam is itself asserted below, so the exemption is one env var from closing, not paper.
 WORKTREE_SEAMS: dict[str, str] = {
+    # #854: create_worktree drives these against a real bare origin + clone in
+    # tests/test_fix_round_foreign_index_854.py (staged/unstaged foreign paths,
+    # retained recovery work, and a pending board merge).
+    "_card_paths": "REAL",
+    "_dirty_paths": "REAL",
+    "clear_foreign_changes": "REAL",
     # Board-owned recovery histories: tests/test_conflict_recovery_contract.py.
     "prepare_integration": "REAL",
     "finish_integration": "REAL",
@@ -466,8 +472,8 @@ def test_exempt_worktree_seams_are_a_ratchet_that_only_falls():
     )
 
 
-def test_worktree_coverage_contract_is_61_real_3_exempt_0_uncovered():
-    """The worktree coverage contract after #716: 61 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
+def test_worktree_coverage_contract_is_64_real_3_exempt_0_uncovered():
+    """The worktree coverage contract after #854: 64 REAL, 3 EXEMPT, 0 UNCOVERED — 23 at
     #361; `pr_identity` joined REAL with #402; the 25th to 28th are #405's stranded-work seams
     (``preserve_worktree`` and the helpers ``unpublished_work`` reads through: ``_tree_status``,
     ``_unique_commits``, ``_create_stranded_ref``), exercised against real git in
@@ -509,6 +515,8 @@ def test_worktree_coverage_contract_is_61_real_3_exempt_0_uncovered():
     # The 57th–59th recover stranded work against real git in test_shutdown_resume_stranded.py.
     # The 60th checks live origin branches in test_shared_base_checkout_790.py.
     # The 61st reads the PR head branch against real GitHub in test_worktree_gh.py (#716).
+    # The 62nd–64th classify and clear foreign fix-round paths against real Git in
+    # tests/test_fix_round_foreign_index_854.py.
     real = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "REAL")
     exempt = sorted(k for k, v in WORKTREE_SEAMS.items() if v.startswith("EXEMPT: "))
     uncovered = sorted(k for k, v in WORKTREE_SEAMS.items() if v == "UNCOVERED")
@@ -518,7 +526,7 @@ def test_worktree_coverage_contract_is_61_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 61, f"expected 61 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 64, f"expected 64 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

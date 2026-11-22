@@ -1299,9 +1299,18 @@ async def create_worktree(
         if current != branch:
             raise WorktreeError(f"Interrupted integration belongs to {current}, not {branch}")
         await _git_required(path, "fetch", "origin")
-        if integrate:
-            await prepare_integration(path, branch, base)
-        return path, branch
+        # The kept tree is handed over index and working files included, so another card's
+        # changes left in it would reach the coder — and `prepare_integration`'s "Preserve
+        # retained edits" commit would put them in this card's PR (#854). Move them aside
+        # first; the card's own recovery work and the board's merge stay.
+        await clear_foreign_changes(repo, path, branch, base)
+        if await _operation_present(path, "MERGE_HEAD") or await _unpublished_recovery(path, branch):
+            if integrate:
+                await prepare_integration(path, branch, base)
+            return path, branch
+        # Only foreign changes kept the tree: nothing of the card's own is left in it, so
+        # rebuild from the PR head below like any other fix round.
+        log.info("[project_board] %s: kept tree held only foreign changes — rebuilding from %s", fid, branch)
     # Preventive: drop stale worktree admin entries before touching anything (#225).
     await prune_stale_worktrees(repo)
     # The cleanup below is `remove --force` + `branch -D`. On a tree whose coder died
@@ -1397,6 +1406,10 @@ async def create_worktree(
     # node_modules in (best-effort, no-op for non-node repos) rather than a slow/offline
     # per-worktree install.
     await asyncio.to_thread(link_node_modules, repo, abspath)
+    if resume:
+        # A fresh checkout is clean; this proves it before the coder runs (#854) — any path
+        # the card cannot account for is saved to `stranded/…` and cleared, never shipped.
+        await clear_foreign_changes(repo, abspath, branch, base)
     if integrate:
         await prepare_integration(abspath, branch, base)
     return abspath, branch
@@ -2795,6 +2808,154 @@ async def _unpublished_recovery(path: str, branch: str) -> bool:
     # A journal is evidence, not ownership of the checkout forever. Once its
     # commits are on the remote, a clean checkout must resume the latest PR head.
     return bool(rc or await _git_required(path, "status", "--porcelain"))
+
+
+# ── a fix round's tree holds only its own card's changes (#854) ───────────────────────
+# Card bd-v3y41's fix round opened on a tree that already had ANOTHER card's changes
+# staged in it. The coder refused to commit them; `git add -A && git commit` — or the
+# board's own "Preserve retained edits" commit in `prepare_integration` — would have
+# shipped them inside the wrong PR. So before a fix round starts, every uncommitted path
+# the card cannot account for is moved aside: saved to a `stranded/…` branch, then put
+# back the way HEAD has it.
+
+
+def _diff_paths(diff: str) -> set[str]:
+    """The paths a ``git diff`` (the recovery journal's ``prepared_edit_state`` text)
+    touches. Generous on purpose: a path read too widely is only kept, never cleared."""
+    paths: set[str] = set()
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            pair = line[len("diff --git ") :]
+            size = (len(pair) - 5) // 2  # "a/P b/P": the common case, spaces included
+            if size > 0 and pair[2 : 2 + size] == pair[-size:]:
+                paths.add(pair[2 : 2 + size])
+            else:
+                a, _sep, b = pair.partition(" b/")
+                paths.update({a[2:].strip('"'), b.strip('"')})
+        elif line.startswith(("--- a/", "+++ b/")):
+            paths.add(line[6:])
+        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            paths.add(line.split(" ", 2)[2])
+    return paths
+
+
+async def _dirty_paths(path: str) -> list[str]:
+    """Every path ``status`` reports changed — staged, unstaged or untracked, a rename's
+    source too — minus the board's own droppings (``CODER_SCRATCH``, ``node_modules`` links)."""
+    excludes = [f":(exclude){p}" for p in CODER_SCRATCH]
+    # Raw `_git`, not `_git_required`: its strip would eat the first entry's blank X column.
+    rc, out, err = await _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".", *excludes)
+    if rc:
+        raise WorktreeError(f"git status failed in {path}: {(err or out).strip()[:300]}")
+    found: list[str] = []
+    items = iter(out.split("\0"))
+    for item in items:
+        if len(item) < 4:
+            continue
+        xy, entry = item[:2], item[3:]
+        if xy == "??" and _is_board_link(path, entry):
+            continue
+        found.append(entry.rstrip("/"))
+        if xy[0] in "RC":
+            source = next(items, None)
+            if source:
+                found.append(source)
+    return found
+
+
+async def _card_paths(path: str, branch: str, base: str) -> set[str]:
+    """The paths a fix round's tree may legitimately hold uncommitted: what the card's
+    branch changes against its base (local HEAD and the PR head), what the board's pending
+    base merge brings in, its conflict paths, and what the recovery journal recorded as
+    the tree's own snapshot. Anything else in the index or working tree is another card's."""
+    paths: set[str] = set()
+    base_ref = base
+    for candidate in (f"origin/{base}", base):
+        if (await _git(path, "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"))[0] == 0:
+            base_ref = candidate
+            break
+    heads = ["HEAD"]
+    if (await _git(path, "rev-parse", "--verify", "--quiet", f"origin/{branch}^{{commit}}"))[0] == 0:
+        heads.append(f"origin/{branch}")
+    for head in heads:
+        rc, out, _err = await _git(path, "diff", "--name-only", "--no-renames", f"{base_ref}...{head}")
+        if rc == 0:
+            paths.update(p for p in out.splitlines() if p)
+    if await _operation_present(path, "MERGE_HEAD"):
+        # The board's prepared merge stays exactly as the board left it: the base side's
+        # changes are staged on purpose, and its unmerged paths are the coder's to resolve.
+        for args in (
+            ("diff", "--name-only", "--no-renames", "HEAD...MERGE_HEAD"),
+            ("diff", "--name-only", "--diff-filter=U"),
+        ):
+            rc, out, _err = await _git(path, *args)
+            if rc == 0:
+                paths.update(p for p in out.splitlines() if p)
+    context = await recovery_context(path, branch)
+    paths.update(context.get("conflict_paths") or [])
+    snapshot = context.get("prepared_edit_state") or []
+    if len(snapshot) >= 3:
+        paths |= _diff_paths(snapshot[1] or "")
+        paths.update(entry[0] for entry in snapshot[2] or [] if entry)
+    return paths
+
+
+async def clear_foreign_changes(repo: str, path: str, branch: str, base: str) -> list[str]:
+    """Take every uncommitted path out of the fix-round tree at ``path`` that ``branch``
+    cannot account for (``_card_paths``) — another card's staged or unstaged changes —
+    and return them (#854). The tree's whole state is saved to a ``stranded/…`` branch
+    first (``preserve_worktree``), so nothing is lost even if a path was misjudged; then
+    each foreign path goes back the way HEAD has it, index and working file both. The
+    card's own edits, the board's pending merge and the recovery journal are untouched.
+
+    Raises ``StrandedWorkError`` — the tree left exactly as it was — when the save fails,
+    and ``WorktreeError`` naming the paths if any of them is still there afterwards: a
+    round never starts on a tree holding changes that are not its own."""
+    dirty = await _dirty_paths(path)
+    if not dirty:
+        return []
+    allowed = await _card_paths(path, branch, base)
+    foreign = sorted({p for p in dirty if p not in allowed})
+    if not foreign:
+        return []
+    summary = f"{len(foreign)} file(s) another card changed: {', '.join(foreign[:8])}"
+    try:
+        saved = await preserve_worktree(repo, path, branch, summary=summary)
+    except WorktreeError as exc:
+        raise StrandedWorkError(
+            repo,
+            [StrandedTree(os.path.abspath(path), branch, f"{summary}; saving them before the fix round failed: {exc}")],
+        ) from exc
+    rc, out, _err = await _git(path, "ls-tree", "-r", "-z", "--name-only", "HEAD", "--", *foreign)
+    in_head = {p for p in out.split("\0") if p} if rc == 0 else set()
+    tracked = [p for p in foreign if p in in_head]
+    added = [p for p in foreign if p not in in_head]
+    if tracked:
+        await _git_required(path, *_NO_HOOKS, "restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked)
+    if added:
+        await _git_required(path, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *added)
+        for name in added:
+            target = os.path.join(path, name)
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target, ignore_errors=True)
+            elif os.path.lexists(target):
+                os.remove(target)
+    left = sorted(set(foreign) & set(await _dirty_paths(path)))
+    if left:
+        raise WorktreeError(
+            f"fix round refused: {path} still holds changes that are not {branch}'s after clearing them "
+            f"(saved on {saved.ref}): {', '.join(left)}"
+        )
+    log.warning(
+        "[project_board] %s: cleared %d foreign change(s) from the fix-round tree %s before the coder ran — "
+        "saved first on %s (#854): %s",
+        branch,
+        len(foreign),
+        path,
+        saved.ref,
+        ", ".join(foreign),
+    )
+    return foreign
 
 
 async def preserved_recovery_progress(path: str, branch: str) -> bool:
