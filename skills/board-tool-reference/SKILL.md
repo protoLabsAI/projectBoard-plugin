@@ -266,7 +266,7 @@ explicitly asks (quote their request in `reason`); at capacity, report it and as
 
 | Situation | Verb |
 | --- | --- |
-| Adverse review findings on an `in_review` PR | `board_requeue_feature(fid, findings=…)` — the fix round on the SAME PR; the next dispatch prompt leads with the findings. `escalate=true` climbs the model ladder (at the top the card blocks instead; no ladder = same tier). |
+| Adverse review findings on an `in_review` PR, or your design call on a PR the review gate blocked ("needs a design call … needs human review") | `board_requeue_feature(fid, findings=…)` — the fix round on the SAME PR; the next dispatch prompt leads with the findings. On a review-gate block (`escalate=false` only) it clears the block and resets the review-fix budget without the gate running first. `escalate=true` climbs the model ladder (at the top the card blocks instead; no ladder = same tier). |
 | Transient failure, retry as-is | `board_requeue_feature(fid)` — back to ready, PR kept, assignee cleared, original prompt. |
 | CI bounced the PR (card `in_progress` with an open `pr_url`) | `board_requeue_ci_fix(fid, ci_failure=…)` |
 | Stuck on something external | `board_block_feature(fid, reason, owner=…)` → later `board_unblock_feature`. `owner` is REQUIRED: `agent` when you will do or finish the work yourself, or are waiting on something you will resolve (no operator alert; shown as 'agent hold'); `operator` when the next step is the operator's decision or action (alerts the operator; shown as 'needs you'). Never `operator` for a hold you set on your own work. |

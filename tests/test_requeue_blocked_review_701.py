@@ -183,3 +183,75 @@ def test_stale_gate_reason_does_not_reset_ordinary_review_budget(card):
     assert json.loads(requeue())["state"] == "ready"
     assert "budget:review-fix:3" in board.get_feature(FID)["labels"]
     assert live._budget_cache("review-fix")[FID] == 3
+
+
+def test_in_review_bounce_never_reads_the_card_through_the_api(card):
+    """The ordinary in_review path asks the store for nothing new: a store double with
+    only ``record_review_bounce`` and ``requeue`` (tests/test_external_review_473.py's
+    ``_ApiStore``) still bounces."""
+    from project_board.api import review_bounce
+
+    class MinimalStore:
+        calls: list = []
+
+        def record_review_bounce(self, fid, findings=""):
+            self.calls.append(("record_review_bounce", findings))
+
+        def requeue(self, fid):
+            self.calls.append(("requeue",))
+            return {"id": fid, "board_state": "ready"}
+
+    store = MinimalStore()
+    out = review_bounce(store, FID, "use approach B")
+    assert out == {"requeued": True, "escalated": False, "feature": {"id": FID, "board_state": "ready"}}
+    assert store.calls == [("record_review_bounce", "use approach B"), ("requeue",)]
+
+
+def test_failed_bounce_comment_leaves_block_and_budget_untouched(card, monkeypatch):
+    """Recording comes first: if the comment write fails, nothing was cleared."""
+    from project_board.store import BoardError
+
+    board, _, writes, live, _ = card
+    monkeypatch.setattr(board, "comment", Mock(side_effect=BoardError("comment failed")))
+    assert requeue() == "Error: comment failed"
+    feature = board.get_feature(FID)
+    assert feature["board_state"] == "blocked"
+    assert "budget:review-fix:3" in feature["labels"]
+    assert writes == []
+    assert live._budget_cache("review-fix")[FID] == 3
+    assert FID not in loop._PENDING_FEEDBACK
+
+
+def test_failed_block_clear_keeps_the_findings_and_can_be_repeated(card, monkeypatch):
+    """The block is cleared last: when that fails the card is still blocked, the findings
+    are already recorded and queued, and the same call finishes the job."""
+    from project_board.store import BoardError
+
+    board, bead, _, live, gh = card
+    clear_blocked = board.clear_blocked
+    monkeypatch.setattr(board, "clear_blocked", Mock(side_effect=BoardError("clear failed")))
+    assert requeue() == "Error: clear failed"
+    assert board.get_feature(FID)["board_state"] == "blocked"
+    assert "review requested changes: use approach B" in [c["text"] for c in bead["comments"]]
+    assert "use approach B" in loop._PENDING_FEEDBACK[FID]
+
+    monkeypatch.setattr(board, "clear_blocked", clear_blocked)
+    assert json.loads(requeue())["state"] == "ready"
+    feature = board.get_feature(FID)
+    assert "blocked" not in feature["labels"]
+    assert feature["pr_url"] == PR_URL
+    assert "budget:review-fix:3" not in feature["labels"]
+    assert FID not in live._budget_cache("review-fix")
+    assert "use approach B" in loop._PENDING_FEEDBACK[FID]
+    gh.assert_not_called()
+
+
+def test_store_keyword_alone_does_not_accept_other_states(card):
+    """``review_gate_blocked`` only widens ``blocked`` + in-review label + PR."""
+    from project_board.store import BoardError
+
+    board, bead, writes, _, _ = card
+    bead["labels"].remove("in-review")
+    with pytest.raises(BoardError, match="review bounce expects in_review, got 'blocked'"):
+        board.record_review_bounce(FID, "use approach B", review_gate_blocked=True)
+    assert writes == []

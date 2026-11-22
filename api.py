@@ -196,9 +196,11 @@ def review_bounce(board, fid: str, findings: str, *, escalate: bool = False, esc
     then requeue onto the SAME open PR. ``escalate`` climbs the model ladder when one is
     configured; with the ladder already at its top the card is Blocked instead of looping.
 
-    Without escalation, a review-gate-blocked PR can also take an operator's decision:
-    clear its block and review-fix budget before recording the bounce, without re-arming
-    the gate ahead of the coder (#701).
+    Without escalation, a review-gate-blocked PR can also take an operator's decision
+    (#701): only once ``record_review_bounce`` has refused the card is it checked for the
+    review-gate fingerprint, and then the findings are recorded and queued FIRST and the
+    review-fix budget and the block are cleared LAST, so a step that raises leaves the
+    card blocked and the call safe to repeat. The gate is not re-armed ahead of the coder.
 
     Refused (``BoardError``) while the loop is still working the card (#398): the review
     gate runs inside the drive, so a bounce landing then would requeue the card out from
@@ -210,22 +212,35 @@ def review_bounce(board, fid: str, findings: str, *, escalate: bool = False, esc
     refusal = requeue_refusal(fid)
     if refusal:
         raise BoardError(refusal)
-    if not escalate:
+    gate_blocked = False
+    try:
+        board.record_review_bounce(fid, findings)
+    except BoardError:
+        # The in_review path above is untouched. A refusal is re-raised as it was unless
+        # this is a no-escalate bounce onto a PR the review gate itself blocked.
+        if escalate:
+            raise
         feature = board.get_feature(fid) or {}
-        if (
+        if not (
             _is_review_gate_block(feature)
             and LABEL_IN_REVIEW in (feature.get("labels") or [])
             and str(feature.get("pr_url") or "").strip()
         ):
-            board.clear_blocked(fid)
-            board.clear_budgets(fid, ["review-fix"])
-            # The live cache wins over persisted labels; invalidate both halves, as
-            # unblock_side_effects does, but leave the gate untouched until the fix.
-            loop = live_loop()
-            if loop is not None:
-                loop._budget_cache("review-fix").pop(fid, None)
-    board.record_review_bounce(fid, findings)
+            raise
+        board.record_review_bounce(fid, findings, review_gate_blocked=True)
+        gate_blocked = True
     queue_review_feedback(fid, findings)
+    if gate_blocked:
+        # Budget before block: if the block clear fails the card is still blocked and a
+        # repeat call redoes both; the other order could leave an in_review card whose
+        # spent budget re-blocks it at once. The live cache wins over persisted labels,
+        # so invalidate both halves, as unblock_side_effects does — but leave the gate
+        # itself (review-pending, status) untouched until the fix lands.
+        board.clear_budgets(fid, ["review-fix"])
+        loop = live_loop()
+        if loop is not None:
+            loop._budget_cache("review-fix").pop(fid, None)
+        board.clear_blocked(fid)
     if escalate and escalate_on:
         nxt = board.escalate(fid, f"review-fail: {findings}" if findings else "review-fail")
         if nxt is None:
