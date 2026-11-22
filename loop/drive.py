@@ -1208,6 +1208,10 @@ class DriveMixin(HostDiskMixin):
         skipped: list[dict] = []  # {fid, reason, …} per passed-over candidate, priority order
         parked: list[str] = []  # #217: task beads claimed to in_progress without a slot (human-wait)
         ready = await asyncio.to_thread(store.ready_queue, relaxed=self.relaxed_gate)
+        skipped.extend(
+            {"fid": row["id"], "reason": "unpullable-type", "issue_type": row["issue_type"]}
+            for row in getattr(store, "ready_queue_unpullable", ())
+        )
         disk_probed: dict = {}  # checkout → this scan's free-space reading (#801)
         self._host_disk_scan_start()
         for candidate in ready:  # priority order, dep-unblocked
