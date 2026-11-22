@@ -123,27 +123,133 @@ def preflight_failure(project: str) -> dict | None:
     return preflight_snapshot()["failures"].get(project)
 
 
-def advisory_hint() -> str:
-    """One operator line for the setup advisories: the projects whose preflight can't
-    finish in time (#456) and whose coder.solve() oracle is unwinnable (#459). "" when
-    there are none."""
+# The advisory kinds, in the order an entry list sorts them within one project (#728).
+ADVISORY_KINDS: tuple[str, ...] = ("slow_gate", "slow_preflight", "unwinnable_oracle")
+# The longest a plain advisory summary may run, so a banner never cuts it off (#728).
+SUMMARY_MAX = 120
+
+
+def _duration(seconds) -> str:
+    """``600`` -> ``10 minutes``; ``90`` -> ``90 seconds``; ``0.3`` -> ``0.3 seconds``."""
+    try:
+        s = float(seconds or 0)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s >= 120 and s % 60 == 0:
+        return f"{s / 60:.0f} minutes"
+    return f"{s:g} seconds"
+
+
+def _summary(name: str, template: str) -> str:
+    """``template`` with ``{p}`` filled by the project name, clipped to SUMMARY_MAX by
+    shortening the NAME (never the effect), so a long project name can't push the summary
+    past the banner's width."""
+    text = template.format(p=name)
+    over = len(text) - SUMMARY_MAX
+    if over > 0:
+        keep = max(len(name) - over - 1, 1)
+        text = template.format(p=name[:keep] + "…")
+    return text[:SUMMARY_MAX]
+
+
+def _fix_action(label: str, fields: list[str]) -> dict:
+    """The host's closed setup-gap action shape — the same ``plugin_config`` kind as
+    ``setup_check.plugin_config_action``: it opens Project Board's settings focused on the
+    fields at fault. Built here (not imported) so health stays import-free of setup_check."""
+    return {"kind": "plugin_config", "label": label, "fields": list(fields)}
+
+
+def advisory_entries() -> list[dict]:
+    """The setup advisories as structured entries, one per (project, kind), sorted by
+    project then kind (#728): ``{project, kind, summary, fix, fix_label, fix_action,
+    setting_path, detail}``.
+
+    * ``slow_gate`` — the project's local pre-PR gate timed out (#483);
+    * ``slow_preflight`` — its preflight can't finish inside ``preflight_timeout_s`` (#456);
+    * ``unwinnable_oracle`` — its coder.solve() oracle can't pass, so solve() is off (#459).
+
+    ``summary`` is plain words that lead with the effect, at most SUMMARY_MAX characters,
+    and never carries the command — the command (often hundreds of characters) lives only
+    in ``detail``. ``fix`` is the one-sentence resolution, ``fix_action`` the button that
+    opens the settings named in it, ``setting_path`` the main setting to change."""
     snap = preflight_snapshot()
-    parts = []
-    for name, info in sorted(snap["slow"].items()):
-        parts.append(
-            f"project {name!r}: the preflight (`{info.get('cmd', '')}`) can't finish inside "
-            f"preflight_timeout_s={info.get('timeout_s', 0):.0f}s, so it gives no verdict — set a cheap "
-            "`preflight_cmd` (lint + an import check)"
+    entries: list[dict] = []
+    for name, info in snap["slow"].items():
+        timeout = info.get("timeout_s", 0) or 0
+        entries.append(
+            {
+                "project": name,
+                "kind": "slow_preflight",
+                "summary": _summary(
+                    name, "{p}'s preflight check takes longer than " + _duration(timeout) + ", so it gives no verdict."
+                ),
+                "fix": "Fix: set preflight_cmd to a cheap check (lint + an import check), or raise preflight_timeout_s.",
+                "fix_label": "Set a cheaper preflight",
+                "fix_action": _fix_action("Set a cheaper preflight", ["preflight_cmd", "preflight_timeout_s"]),
+                "setting_path": "preflight_cmd",
+                "detail": (
+                    f"the preflight (`{info.get('cmd', '')}`) can't finish inside "
+                    f"preflight_timeout_s={float(timeout):.0f}s, so it gives no verdict — set a cheap "
+                    "`preflight_cmd` (lint + an import check)"
+                ),
+            }
         )
-    for name, why in sorted(snap["unwinnable_oracle"].items()):
-        parts.append(f"project {name!r}: coder.solve() is off — {why}")
-    for name, info in sorted(slow_gates_snapshot().items()):
-        parts.append(
-            f"project {name!r}: the local gate (`{info.get('cmd', '')}`) timed out at "
-            f"local_gate_timeout_s={info.get('timeout_s', 0):.0f}s, so it verifies nothing and the merged-state "
-            "re-verify is skipped — set a cheaper `local_gate_cmd` (CI is the test gate) or raise the timeout"
+    for name, why in snap["unwinnable_oracle"].items():
+        entries.append(
+            {
+                "project": name,
+                "kind": "unwinnable_oracle",
+                "summary": _summary(name, "{p}'s cards skip coder.solve(), because its test check can't pass in time."),
+                "fix": (
+                    "Fix: raise coder_solve_test_timeout_s, or set coder_solve_test_cmd (or coder_solve_test_paths) "
+                    "to a faster test command."
+                ),
+                "fix_label": "Raise the solve time limit",
+                "fix_action": _fix_action(
+                    "Raise the solve time limit",
+                    ["coder_solve_test_timeout_s", "coder_solve_test_cmd", "coder_solve_test_paths"],
+                ),
+                "setting_path": "coder_solve_test_timeout_s",
+                "detail": f"coder.solve() is off — {why}",
+            }
         )
-    return "; ".join(parts)
+    for name, info in slow_gates_snapshot().items():
+        timeout = info.get("timeout_s", 0) or 0
+        entries.append(
+            {
+                "project": name,
+                "kind": "slow_gate",
+                "summary": _summary(
+                    name, "{p}'s pre-PR check takes longer than " + _duration(timeout) + ", so it is skipped."
+                ),
+                "fix": "Fix: raise local_gate_timeout_s, or set local_gate_cmd to lint only — CI runs the tests.",
+                "fix_label": "Raise the time limit",
+                "fix_action": _fix_action("Raise the time limit", ["local_gate_timeout_s", "local_gate_cmd"]),
+                "setting_path": "local_gate_timeout_s",
+                "detail": (
+                    f"the local gate (`{info.get('cmd', '')}`) timed out at "
+                    f"local_gate_timeout_s={float(timeout):.0f}s, so it verifies nothing and the merged-state "
+                    "re-verify is skipped — set a cheaper `local_gate_cmd` (CI is the test gate) or raise the timeout"
+                ),
+            }
+        )
+    entries.sort(key=lambda e: (str(e["project"]), ADVISORY_KINDS.index(e["kind"])))
+    return entries
+
+
+def advisory_fix_action() -> dict | None:
+    """The first active advisory's fix button (#728), or None when there is none — the
+    action ``GapReporter`` attaches to the preflight setup gap."""
+    entries = advisory_entries()
+    return dict(entries[0]["fix_action"], fields=list(entries[0]["fix_action"]["fields"])) if entries else None
+
+
+def advisory_hint() -> str:
+    """One operator line for the setup advisories (#456/#459/#483), derived from
+    :func:`advisory_entries`: per entry, the plain summary, then the fix, then the detail
+    (which is where the command appears) — so a banner that cuts the line off still shows
+    what is wrong and how to fix it (#728). "" when there are none."""
+    return "; ".join(f"{e['summary']} {e['fix']} Detail: {e['detail']}" for e in advisory_entries())
 
 
 def publish_slow_gates(slow: dict) -> None:
