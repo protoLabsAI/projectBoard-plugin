@@ -396,11 +396,13 @@ class ReconcileMixin(WorktreeCleanup):
             seen.discard(fid)
         return held
 
-    async def _worktree_hold_current(self, store, feature: dict) -> bool:
+    async def _worktree_hold_current(self, store, feature: dict, *, fail_closed: bool = True) -> bool:
         """Re-read at execution boundaries: queued cards and retry snapshots can be stale.
 
         An unreadable card cannot authorize touching its tree. Missing records retain
         the snapshot's hold; normal missing-card handling remains with the caller.
+        Read-only PR review and blocked-card escalation can retain their existing
+        error fallbacks with fail_closed=False, unless a hold is already known.
         """
         read = getattr(store, "get_feature", None)
         if not callable(read):
@@ -410,7 +412,11 @@ class ReconcileMixin(WorktreeCleanup):
         except store_mod.BoardTimeout:
             raise
         except Exception:
-            return True
+            return (
+                fail_closed
+                or feature["id"] in self.__dict__.get("_worktree_hold_logged", set())
+                or self._worktree_held(feature)
+            )
         return self._worktree_held(fresh if isinstance(fresh, dict) else feature)
 
     # ── merged-verify exhaustion sentinel ↔ operator reset (ADR 0326, #326) ───────
@@ -1425,7 +1431,7 @@ class ReconcileMixin(WorktreeCleanup):
             log.warning("[project_board] blocked sweep: could not list blocked features", exc_info=True)
             return
         for f in blocked:
-            if await self._worktree_hold_current(store, f):
+            if await self._worktree_hold_current(store, f, fail_closed=False):
                 continue
             fid = f["id"]
             self._sweep_step_enter(f"blocked recovery {fid}")  # a slow sweep names the card (#794)
@@ -4292,7 +4298,7 @@ class ReconcileMixin(WorktreeCleanup):
 
     async def _review_gate_run(self, store, fid: str, pr_url: str, repo: str) -> None:
         """The gate body — see ``_review_gate`` (the re-entrancy guard) for the contract."""
-        if await self._worktree_hold_current(store, {"id": fid}):
+        if await self._worktree_hold_current(store, {"id": fid}, fail_closed=False):
             return
         await asyncio.to_thread(store.set_review_substate, fid, LABEL_REVIEW_PENDING)
         # The head THIS verdict is for (#328) — read BEFORE the panel so a push that lands

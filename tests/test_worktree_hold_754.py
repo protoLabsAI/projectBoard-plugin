@@ -170,6 +170,45 @@ async def test_stale_snapshots_and_failed_reads(monkeypatch):
     assert await loop._worktree_hold_current(store, {**stale, "worktree_hold": True})
 
 
+@pytest.mark.parametrize("entry", ["blocked", "review"])
+@pytest.mark.parametrize("read_fails", [False, True])
+async def test_review_and_escalation_preserve_known_holds(monkeypatch, entry, read_fails):
+    from tests.test_loop import _BlockedStore, _blocked
+
+    card = {**_blocked("bd-held", "auth", reason=""), "labels": [LABEL_WORKTREE_HOLD]}
+    store = _BlockedStore([card])
+    loop = BoardLoop({"coder": "proto"})
+    if read_fails:
+        # An earlier successful read observed the hold; a transient failure must
+        # not erase that knowledge even on paths that allow missing card context.
+        assert loop._worktree_held(card)
+        store.get_feature = Mock(side_effect=RuntimeError("br hiccup"))
+    else:
+        store.get_feature = Mock(return_value=card)
+    page = Mock()
+    review = AsyncMock()
+    monkeypatch.setattr(loop, "_notify_operator", page)
+    monkeypatch.setattr(loop, "_run_review_workflow", review)
+    if entry == "blocked":
+        await loop._recover_blocked(store)
+    else:
+        await loop._review_gate(store, card["id"], "pr", "/repo")
+    page.assert_not_called()
+    review.assert_not_awaited()
+
+
+async def test_missing_context_fallback_does_not_authorize_worktree_access():
+    loop = BoardLoop({"coder": "proto"})
+    store = Mock()
+    store.get_feature.side_effect = RuntimeError("br hiccup")
+    card = {"id": "bd-1", "labels": []}
+    assert not await loop._worktree_hold_current(store, card, fail_closed=False)
+    assert await loop._worktree_hold_current(store, card)
+    assert await loop._worktree_hold_current(
+        store, {**card, "labels": [LABEL_WORKTREE_HOLD]}, fail_closed=False
+    )
+
+
 def test_location_sweep_does_not_probe_held_card(monkeypatch):
     from project_board import work_location_sweep as sweep
 
