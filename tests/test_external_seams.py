@@ -276,9 +276,11 @@ STORE_SEAMS: dict[str, str] = {
     "record_verified_candidate": "REAL",
     "record_stranded_work": "REAL",  # Real br in tests/test_shutdown_resume_stranded.py.
     "release_merge_hold": "REAL",  # #532: label drop + audit comment, real `br` in tests/test_integration.py
+    "release_worktree_hold": "REAL",  # #754: label drop + audit comment, real `br` in tests/test_integration.py; ordering/no-op rules in tests/test_worktree_hold_store_754.py
     "remove_dependency": "UNCOVERED",
     "requeue": "REAL",
     "set_merge_hold": "REAL",  # #532: label add + audit comment, real `br` in tests/test_integration.py
+    "set_worktree_hold": "REAL",  # #754: audit comment + label add, real `br` in tests/test_integration.py; ordering/no-op rules in tests/test_worktree_hold_store_754.py
     "record_branch_slug": "REAL",  # #716: durable, write-once labels through real br in test_branch_identity_716.py.
     "set_requirements": "UNCOVERED",
     "set_review_substate": "REAL",

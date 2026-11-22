@@ -47,6 +47,7 @@ from project_board.store import (
     LABEL_MERGED_VERIFIED_PREFIX,
     LABEL_READY,
     LABEL_VERIFIED_PREFIX,
+    LABEL_WORKTREE_HOLD,
     BeadsBoard,
     BoardError,
 )
@@ -215,6 +216,29 @@ def test_merge_hold_set_and_release_round_trip_through_real_br(board):
     with pytest.raises(BoardError):
         board.set_merge_hold(fid, "too late")
     assert LABEL_MERGE_HOLD not in (board.get_feature(fid)["labels"] or [])
+
+
+@requires_br
+def test_worktree_hold_set_and_release_round_trip_through_real_br(board):
+    """#754: the `worktree-hold` label and its audit comments land and clear through the
+    REAL `br` label validator and `br comments add`, project back as `worktree_hold`, and a
+    terminal card is refused with nothing written."""
+    f = board.create_feature("Worktree-hold target", spec="s")
+    fid = f["id"]
+    assert len(LABEL_WORKTREE_HOLD) <= BEADS_LABEL_CAP
+
+    held = board.set_worktree_hold(fid, "squashing by hand")
+    assert LABEL_WORKTREE_HOLD in (held["labels"] or []) and held["worktree_hold"] is True
+    reheld = board.set_worktree_hold(fid, "again")
+    assert [label for label in reheld["labels"] if label == LABEL_WORKTREE_HOLD] == [LABEL_WORKTREE_HOLD]
+
+    released = board.release_worktree_hold(fid)
+    assert LABEL_WORKTREE_HOLD not in (released["labels"] or []) and released["worktree_hold"] is False
+
+    board.cancel_feature(fid, "scope cut")
+    with pytest.raises(BoardError):
+        board.set_worktree_hold(fid, "too late")
+    assert LABEL_WORKTREE_HOLD not in (board.get_feature(fid)["labels"] or [])
 
 
 # ── `--json` output shape: one test per want_json=True call site in store.py (#138) ──
