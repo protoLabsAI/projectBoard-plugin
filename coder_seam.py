@@ -951,6 +951,53 @@ def progress_snapshot(fid: str) -> dict:
     return {"gens": [gens[g].snapshot() for g in sorted(gens)]}
 
 
+TIMEOUT_TAIL_CAP = 1000
+
+
+def timed_out_gen(fid: str) -> dict:
+    """The snapshot of the gen this feature's last timeout killed (#753): the latest gen
+    the seam stamped ``TIMED_OUT_REASON``, else the latest gen (an unstamped buffer), else
+    ``{}``. The same choice ``_timeout_escalation_context`` makes in the drive, so a max-mode
+    sibling that failed fast never speaks for the candidate that ran out of time.
+    Best-effort: an unreadable buffer reads as ``{}``."""
+    try:
+        gens = progress_snapshot(fid).get("gens") or []
+    except Exception:  # noqa: BLE001 — a monitor read must never break the caller
+        gens = []
+    timed_out = [g for g in gens if str(g.get("stop_reason") or "").startswith(TIMED_OUT_REASON)]
+    return (timed_out or gens or [{}])[-1]
+
+
+def timeout_output_tail(fid: str, cap: int = TIMEOUT_TAIL_CAP) -> str:
+    """What the timed-out gen was doing when it was killed (#753), for a block reason: its
+    last tool, then the END of its answer/thought text — at most ``cap`` characters in
+    all. Empty when the buffer has nothing for this feature."""
+    gen = timed_out_gen(fid)
+    parts: list[str] = []
+    cur = gen.get("current_tool") or {}
+    if not cur.get("name"):
+        recent = gen.get("recent_tools") or []
+        cur = recent[-1] if recent and isinstance(recent[-1], dict) else {}
+    if cur.get("name"):
+        locs = ", ".join(str(x) for x in (cur.get("locations") or []))
+        status = cur.get("status") or ""
+        parts.append(f"last tool: {cur['name']}" + (f" ({status})" if status else "") + (f" on {locs}" if locs else ""))
+    body = []
+    thought = str(gen.get("thought_tail") or "").strip()
+    answer = str(gen.get("answer_tail") or "").strip()
+    if thought:
+        body.append(f"last reasoning: {thought}")
+    if answer:
+        body.append(f"last output: {answer}")  # last, so a trim keeps the newest text
+    cap = max(0, int(cap))
+    head = "\n".join(parts)[: cap // 4]  # the tool line never crowds out the output
+    room = cap - len(head) - (1 if head and body else 0)
+    text = "\n".join(body)
+    if len(text) > room:
+        text = ("…" + text[-(room - 1) :]) if room > 1 else ""
+    return "\n".join(x for x in (head, text) if x)
+
+
 def _used_tokens(usage) -> bool:
     """A usage record that shows tokens actually spent. ``{used: 0}`` is not one — an
     adapter can report it at turn end when no model ran (#422)."""

@@ -172,6 +172,23 @@ def test_a_fresh_store_over_the_same_db_returns_the_existing_card(tmp_path):
     assert len(fresh.list_features(include_archived=True)) == 1
 
 
+@requires_br
+@pytest.mark.br_shape
+def test_key_lookup_after_restart_includes_closed_duplicates_and_filters_other_work(tmp_path):
+    board = _board(tmp_path)
+    canonical, duplicate = _sharing_pair(board)
+    board.create_feature("Other event", spec="s", idempotency_key="other-event")
+    board.cancel_feature(duplicate, "same event", duplicate_of=canonical)
+    board._run("close", canonical, "-r", "shipped")
+
+    fresh = _board(tmp_path)
+    rows = fresh.idempotency_rows(idempotency_label(_KEY))
+    assert [row["id"] for row in rows] == [canonical, duplicate]
+    assert all(row["status"] == "closed" for row in rows)
+    assert dup_of_label(canonical) in rows[1]["labels"]
+    assert fresh.idempotency_canonical(_KEY) == canonical
+
+
 # ── r4: different work stays separate ───────────────────────────────────────────────
 
 
