@@ -106,6 +106,7 @@ from ..store import (
     parse_requirement_dispositions,
     reconfigure_cached_store,
     resolve_difficulty_tiers,
+    unparsed_requirement_lines,
 )
 
 log = logging.getLogger("protoagent.plugins.project_board")
@@ -510,6 +511,9 @@ _SUMMARY_HEADING_RE = re.compile(r"^##\s*Summary\b", re.MULTILINE)
 # applies the same section (#399) and the store can't reach up into the loop. Kept under
 # its historical name so the coder drive and every existing import read it unchanged.
 _parse_requirements_reply = parse_requirement_dispositions
+# Its companion (#861): the non-blank lines of that same section the parser SKIPPED, so a
+# req-fix re-dispatch can quote them back to the coder instead of repeating the format miss.
+# Re-exported here (and in ``__all__``) exactly as the parser is.
 
 
 # ── grounding a review finding against the diff (#381) ────────────────────────
@@ -826,6 +830,8 @@ def _requirement_gate_diagnostics(result: str, open_items: list[dict]) -> dict:
         "result_len": len(text),
         "has_requirements_heading": bool(headings),
         "after_heading": text[headings[-1].end() :][:200] if headings else "",
+        # #861: the section's lines the parser could not read — a format miss, named.
+        "unparsed_lines": unparsed_requirement_lines(text),
     }
 
 
@@ -837,7 +843,8 @@ def _requirement_gate_diag_line(diag: dict) -> str:
         f"open_ids={diag['open_ids']!r} "
         f"len(result)={diag['result_len']} "
         f"has_requirements_heading={diag['has_requirements_heading']} "
-        f"after_heading={diag['after_heading']!r}"
+        f"after_heading={diag['after_heading']!r} "
+        f"unparsed_lines={diag.get('unparsed_lines', [])!r}"
     )
 
 
@@ -2565,6 +2572,7 @@ __all__ = [
     "_REQ_HEADING_RE",
     "_REQ_LINE_RE",
     "_parse_requirements_reply",
+    "unparsed_requirement_lines",
     "_requirement_gate_diagnostics",
     "_requirement_gate_diag_line",
     "_pr_body",

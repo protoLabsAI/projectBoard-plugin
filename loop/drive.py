@@ -302,6 +302,23 @@ def _held_sentence(held: dict) -> str:
     return "; ".join(parts)
 
 
+def _unparsed_requirement_rows_note(diag: dict) -> str:
+    """The #861 addendum to the req-fix follow-up: when the reply HAD a ``## Requirements``
+    heading but the parser skipped some of its lines, quote those lines back with the
+    accepted forms — so a format miss costs one round, not the whole budget (bd-xhirv
+    re-sent `- rN: done. <note>` twice because the follow-up never said it went unread).
+    "" when nothing was skipped (or there was no heading), leaving the message unchanged."""
+    lines = (diag.get("unparsed_lines") or []) if diag.get("has_requirements_heading") else []
+    if not lines:
+        return ""
+    quoted = "\n".join(f"    {ln}" for ln in lines)
+    return (
+        "\n\nThese lines in your `## Requirements` section were not understood:\n\n"
+        + quoted
+        + "\n\nAccepted forms: `- r1: done`, `- r1: done — <note>`, `- r1: declined — <reason>`."
+    )
+
+
 def _ledger_only_followup(listing: str) -> str:
     """The #382 ledger-only re-prompt: the implementation stays on disk and the coder is
     asked for the disposition ledger ALONE. Module-level so tests pin its text directly.
@@ -3122,7 +3139,9 @@ class DriveMixin(HostDiskMixin):
                                 "requirement items are still OPEN on the ledger — no disposition was "
                                 "recorded for them. Address each one, then END your reply with a "
                                 "`## Requirements` section marking EVERY item `done` or `declined — "
-                                "<concrete reason>` (silence is not a disposition):\n\n" + listing
+                                "<concrete reason>` (silence is not a disposition):\n\n"
+                                + listing
+                                + _unparsed_requirement_rows_note(diag)
                             )
                             # #284: persist the SAME diagnostic payload on the bead so the
                             # NEXT occurrence is diagnosable from the card, not only the log

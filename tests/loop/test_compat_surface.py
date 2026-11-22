@@ -31,6 +31,7 @@ REEXPORTED = [
     "_ci_failure_reason",
     "_parse_pr_url",
     "_parse_requirements_reply",
+    "unparsed_requirement_lines",
     "_requirement_gate_diagnostics",
     "_requirement_gate_diag_line",
     "_REVIEW_FINDINGS_TITLE",
