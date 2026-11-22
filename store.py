@@ -182,6 +182,9 @@ def _task_edge(method):
 # `comments` and `dep` cannot: the working-state line is id + state + title + next-action
 # hint, and none of those read either one.
 _PROJECTION_WRITES = frozenset({"create", "update", "close", "reopen", "delete"})
+# The `br` commands that change nothing. Anything else may change what a listing row shows
+# (a comment carries a blocked reason, a dependency edge sets dag_blocked).
+_BR_READS = frozenset({"list", "show", "ready"})
 
 # `br` plain-mode not-found text (stderr). The --json path is matched on the structured
 # ISSUE_NOT_FOUND code instead, so this only backstops a non-json `show`.
@@ -288,11 +291,15 @@ class BrWait:
     (``asyncio.to_thread`` copies the context, so the workers share this object), hence
     the lock around the sum."""
 
-    __slots__ = ("_lock", "_seconds")
+    __slots__ = ("_lock", "_seconds", "wrote")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._seconds = 0.0
+        # Set once the call ran a `br` command that is not a plain read. The tool wrapper
+        # then tells the shared read cache, so board_list never answers that agent with a
+        # listing from before its own write (#805).
+        self.wrote = False
 
     def add(self, seconds: float) -> None:
         with self._lock:
@@ -325,6 +332,15 @@ def track_br_wait():
         _BR_WAIT.reset(token)
         if outer is not None:
             outer.add(wait.seconds)
+            outer.wrote = outer.wrote or wait.wrote
+
+
+def credit_br_wait(seconds: float) -> None:
+    """Add ``seconds`` of `br`-lock wait to the current call's counter: a wait that was
+    paid on another thread on this call's behalf (the shared read cache's listing)."""
+    wait = _BR_WAIT.get()
+    if wait is not None:
+        wait.add(seconds)
 
 
 def br_wait_notice(seconds: float, *, failed: bool = False) -> str:
@@ -2140,22 +2156,33 @@ class BeadsBoard:
         try:
             return self._shell_br(*args, want_json=want_json, with_has_more=with_has_more, actor=actor)
         except FileNotFoundError as exc:
-            repo = self.repo or "."
-            if not os.path.isdir(repo):
-                names = [name for name, entry in self.projects.items() if entry.get("repo") == repo]
-                if not names:
-                    # The board's own (flat / default) repo: there is no project to remove.
-                    raise BoardError(
-                        f"board repo folder {repo!r} is missing — restore the folder or fix project_board.repo"
-                    ) from exc
-                project = ", ".join(repr(name) for name in names)
-                raise BoardError(
-                    f"project {project}: repo folder {repo!r} is missing — remove the project or restore the folder"
-                ) from exc
+            missing = self.missing_repo_error()
+            if missing is not None:
+                raise missing from exc
             raise BoardError(f"could not run beads CLI {BR!r}: {exc}") from exc
         finally:
             if args and args[0] in _PROJECTION_WRITES:
                 work_snapshot.note_board_write()
+            if args and args[0] not in _BR_READS:
+                wait = _BR_WAIT.get()
+                if wait is not None:
+                    wait.wrote = True
+
+    def missing_repo_error(self) -> BoardError | None:
+        """The error every `br` call on this board fails with when its repo folder is gone
+        (#803), or None while the folder exists. A read answered from the shared read
+        cache runs no `br`, so it asks this first to keep naming the missing folder."""
+        repo = self.repo or "."
+        if os.path.isdir(repo):
+            return None
+        names = [name for name, entry in self.projects.items() if entry.get("repo") == repo]
+        if not names:
+            # The board's own (flat / default) repo: there is no project to remove.
+            return BoardError(f"board repo folder {repo!r} is missing — restore the folder or fix project_board.repo")
+        project = ", ".join(repr(name) for name in names)
+        return BoardError(
+            f"project {project}: repo folder {repo!r} is missing — remove the project or restore the folder"
+        )
 
     def _shell_br(self, *args: str, want_json: bool = False, with_has_more: bool = False, actor: str = ""):
         """``_run``'s body: the ``br`` subprocess, its contention retries, and the

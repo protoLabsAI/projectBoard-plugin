@@ -100,6 +100,9 @@ def _no_real_br_version(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(
         setup_check, "_subprocess_run", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout="br 0.0.0-test\n")
     )
+    from project_board import read_cache
+
+    read_cache.reset_shared()  # #805: no test's board listing answers the next test's board_list
     setup_check._BR_VERSION_CACHE.clear()
     setup_check._REVIEW_STATUS_CACHE.clear()  # #354: the per-process capability probe, per test
     setup_check._ORIGIN_CACHE.clear()  # #454: the legacy-binding advisory's remote reads

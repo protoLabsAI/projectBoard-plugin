@@ -28,8 +28,14 @@ Now the routes read a :class:`BoardReadCache`:
 - **An API write is never answered with pre-write data.** A write route bumps the epoch
   after it returns (the router's route class does this for every non-GET route), and a
   snapshot taken before the newest API write is never served as stale: the next read waits
-  for the refresh the write started. The board loop's and tools' writes are visible
-  within :data:`STALE_WAIT_S` or as a snapshot marked stale.
+  for the refresh the write started. The board loop's writes are visible within
+  :data:`STALE_WAIT_S` or as a snapshot marked stale.
+
+- **The ``board_list`` tool reads the same snapshot** (#805). The router publishes its cache
+  under the board's database file (:func:`publish`); the tool looks it up there
+  (:func:`published`). A board tool call that wrote to the store bumps the epoch when it
+  ends (:func:`note_shared_write`), exactly like an API write, so an agent's own write is
+  never answered with a pre-write listing.
 
 The cache stores the store's projected rows, unannotated. ``next_action`` and the other
 hints read live loop state and config, so the routes annotate a shallow copy per request
@@ -38,9 +44,12 @@ hints read live loop state and config, so the routes annotate a shallow copy per
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import threading
 import time
+import weakref
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -63,6 +72,9 @@ class Snapshot:
     stale: bool
     taken_at: float  # time.monotonic() when the listing that produced it started
     token: Hashable = None
+    # Seconds THIS reader was held up by the listing's queueing for the `br` lock: at most
+    # the time it spent blocked here, 0.0 for a read answered from the cache.
+    waited_s: float = 0.0
 
     def age_s(self, now: float | None = None) -> float:
         return max(0.0, (time.monotonic() if now is None else now) - self.taken_at)
@@ -74,6 +86,7 @@ class _Entry:
     token: Hashable
     epoch: int
     taken_at: float
+    lock_wait_s: float = 0.0  # what the listing itself queued for the `br` lock
 
 
 @dataclass
@@ -116,9 +129,14 @@ class BoardReadCache:
             # A snapshot from before the newest API write is never served: the caller (or
             # whoever it is showing the board to) just changed it.
             fallback = entry if entry is not None and entry.epoch == self._epoch else None
+        blocked = time.monotonic()
+
+        def _fresh(entry: _Entry) -> Snapshot:
+            waited = min(time.monotonic() - blocked, entry.lock_wait_s)
+            return Snapshot(entry.rows, stale=False, taken_at=entry.taken_at, token=entry.token, waited_s=waited)
+
         if fallback is None:
-            entry = run.future.result()  # first read, or read-after-write: wait for it
-            return Snapshot(entry.rows, stale=False, taken_at=entry.taken_at, token=entry.token)
+            return _fresh(run.future.result())  # first read, or read-after-write: wait for it
         try:
             entry = run.future.result(timeout=STALE_WAIT_S)
         except FutureTimeout:
@@ -130,7 +148,7 @@ class BoardReadCache:
                 raise
             log.warning("[project_board] board refresh stalled; serving the previous snapshot: %s", exc)
             return Snapshot(fallback.rows, stale=True, taken_at=fallback.taken_at, token=fallback.token)
-        return Snapshot(entry.rows, stale=False, taken_at=entry.taken_at, token=entry.token)
+        return _fresh(entry)
 
     # ── writes ────────────────────────────────────────────────────────────────
     def note_write(self) -> None:
@@ -174,8 +192,16 @@ class BoardReadCache:
             with self._lock:
                 run.token = token
             started = time.monotonic()
-            rows = self._load(key)
-            entry = _Entry(rows=list(rows or []), token=token, epoch=token[1], taken_at=started)
+            # This thread has its own context, so the reader's `br`-wait counter (#805,
+            # store.track_br_wait) does not see the listing's queueing. Count it here and
+            # hand it back on the snapshot.
+            from .store import track_br_wait
+
+            with track_br_wait() as wait:
+                rows = self._load(key)
+            entry = _Entry(
+                rows=list(rows or []), token=token, epoch=token[1], taken_at=started, lock_wait_s=wait.seconds
+            )
         except BaseException as e:  # noqa: BLE001 — handed to every waiter
             exc = e
         with self._lock:
@@ -190,3 +216,94 @@ class BoardReadCache:
             run.future.set_result(entry)
         else:
             run.future.set_exception(exc)
+
+
+# ── the cache the routes and the board_list tool share (#805) ─────────────────────────
+
+
+def store_rev(db: str) -> str:
+    """A cheap change stamp for the beads store at ``db``: the size + mtime of the
+    database, its WAL and the ``.beads`` JSONL exports. Every ``br`` write lands in one of
+    them, so the stamp moves on any write by any process — and reading it is a few
+    ``stat`` calls. A missing file contributes ``-``; an unreadable directory is skipped."""
+    parts: list[str] = []
+    paths = [db, db + "-wal"]
+    beads_dir = os.path.dirname(db)
+    try:
+        paths += sorted(os.path.join(beads_dir, n) for n in os.listdir(beads_dir) if n.endswith(".jsonl"))
+    except OSError:
+        pass
+    for path in paths:
+        try:
+            st = os.stat(path)
+            parts.append(f"{st.st_size}.{st.st_mtime_ns}")
+        except OSError:
+            parts.append("-")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def db_file(db: str | None, repo: str | None) -> str:
+    """The board's database file, as the key the shared cache is published under. `br`
+    runs in the repo, so a relative ``db`` is the repo's."""
+    from .store import default_db_path
+
+    db = db or default_db_path()
+    if not os.path.isabs(db):
+        db = os.path.join(str(repo or "."), db)
+    return db
+
+
+_shared_lock = threading.Lock()
+# The data router's cache, by database file. One board has one router, so one entry.
+_published: dict[str, BoardReadCache] = {}
+# A board with no published cache (the API did not mount) gets its own, kept as long as
+# the board object is.
+_own: "weakref.WeakKeyDictionary[object, BoardReadCache]" = weakref.WeakKeyDictionary()
+
+
+def publish(key: str, cache: BoardReadCache) -> None:
+    """Make ``cache`` the one every reader of the board at ``key`` (:func:`db_file`) uses.
+    The data router calls this with the cache its routes read; a rebuilt router replaces
+    the previous one's."""
+    with _shared_lock:
+        _published[key] = cache
+
+
+def published(key: str) -> BoardReadCache | None:
+    """The cache the routes read for the board at ``key``, or None when no router is up."""
+    with _shared_lock:
+        return _published.get(key)
+
+
+def own_cache(board, key: str) -> BoardReadCache:
+    """``board``'s own read cache, for a board whose routes published none: its listing,
+    and the routes' change token minus the API's live routing reload."""
+    with _shared_lock:
+        cache = _own.get(board)
+        if cache is None:
+            from . import work_snapshot
+
+            def _token():
+                routing = repr((getattr(board, "projects", None), getattr(board, "default_project", None)))
+                return (work_snapshot.board_revision(), store_rev(key), routing)
+
+            cache = _own[board] = BoardReadCache(
+                lambda include_archived: board.list_features(include_archived=include_archived), _token
+            )
+        return cache
+
+
+def note_shared_write() -> None:
+    """A board tool call that wrote to the store just ended: no reader of any shared cache
+    may be answered with a listing from before it (:meth:`BoardReadCache.note_write`)."""
+    with _shared_lock:
+        caches = list(_published.values()) + list(_own.values())
+    for cache in caches:
+        cache.note_write()
+
+
+def reset_shared() -> None:
+    """Forget every shared cache (tests: one test's board must not answer the next's)."""
+    with _shared_lock:
+        _published.clear()
+        _own.clear()

@@ -27,6 +27,7 @@ from langchain_core.runnables import RunnableConfig
 
 import project_board as pb
 from project_board import store as store_mod
+from project_board import work_snapshot
 
 THRESHOLD = 0.2
 HOLD = 0.6
@@ -88,6 +89,9 @@ def test_tool_reply_says_it_waited_when_the_lock_was_held(real_run_board):
     plain = board_list.invoke({})
     assert "Waited" not in plain
 
+    # board_list answers an UNCHANGED board from the read snapshot with no `br` at all
+    # (#805 last slice), so it only queues when the board changed since: the loop wrote.
+    work_snapshot.note_board_write()
     started = time.monotonic()
     with _HeldLock(HOLD):
         reply = board_list.invoke({})
