@@ -2409,6 +2409,82 @@ async def test_requirement_gate_logs_diagnostics_and_persists_bounce_comment(mon
     assert "mostly done" in text  # the first-200-chars window rode along
 
 
+async def _req_gate_bounce_feedback(monkeypatch, first_reply, feature, caplog):
+    """Drive one requirement-gate bounce and return (the `_ci_feedback` follow-up the
+    retry was dispatched with, the store) — #861's skipped-row feedback seam."""
+    held = []
+    seen = []
+    replies = iter([first_reply, "## Requirements\n- r1: done\n- r2: done\n\n## Summary\nshipped"])
+
+    async def _disp(c, wt, prompt, *, timeout=None, env_passthrough=()):
+        seen.append(held[0]._ci_feedback.get("bd-1"))
+        return next(replies)
+
+    async def _open_pr(wt, branch, *, base, title, body, promote_draft=True):
+        return "https://example/pr/861"
+
+    with caplog.at_level("INFO", logger="protoagent.plugins.project_board"):
+        loop, store = await _drive_with(
+            monkeypatch,
+            open_pr=_open_pr,
+            dispatch=_disp,
+            cfg={"coder": "proto", "goal_fix_max": 2},
+            feature=feature,
+            seed=held.append,
+        )
+    assert ("open_review", "bd-1", "https://example/pr/861") in store.calls
+    assert len(seen) == 2 and seen[1], "the retry must carry the req-fix follow-up"
+    return seen[1], store
+
+
+async def test_requirement_gate_followup_quotes_rows_it_could_not_read(monkeypatch, caplog):
+    """#861 r1/r3: a reply WITH a `## Requirements` heading whose row the parser skips
+    bounces, and the req-fix follow-up quotes that row as not understood and names the
+    accepted forms; the INFO log and the bounce comment both carry the skipped lines."""
+    feature = {**FEATURE, "requirements": [{"id": "r1", "text": "do x", "status": "open"}]}
+    feedback, store = await _req_gate_bounce_feedback(
+        monkeypatch, "## Requirements\n- r1: finished it\n\n## Summary\nwip", feature, caplog
+    )
+    assert "still OPEN on the ledger" in feedback  # the original message is kept
+    assert "were not understood" in feedback
+    assert "- r1: finished it" in feedback
+    assert "`- r1: done`" in feedback and "`- r1: done — <note>`" in feedback
+    assert "`- r1: declined — <reason>`" in feedback
+
+    diag_lines = [m for m in caplog.messages if "requirement gate diagnostics" in m]
+    assert diag_lines and "unparsed_lines=['- r1: finished it']" in diag_lines[0]
+    comments = [c[2] for c in store.calls if c[0] == "comment" and "requirement gate bounce" in c[2]]
+    assert comments and "unparsed_lines=['- r1: finished it']" in comments[0]
+
+
+async def test_requirement_gate_followup_without_skipped_rows_is_unchanged(monkeypatch, caplog):
+    """#861 r2: every row in the section parsed — r2 is open only because its row is
+    missing — so the follow-up says nothing about lines not being understood."""
+    feature = {
+        **FEATURE,
+        "requirements": [
+            {"id": "r1", "text": "do x", "status": "open"},
+            {"id": "r2", "text": "do y", "status": "open"},
+        ],
+    }
+    feedback, _store = await _req_gate_bounce_feedback(
+        monkeypatch, "## Requirements\n- r1: done\n\n## Summary\nwip", feature, caplog
+    )
+    assert "still OPEN on the ledger" in feedback and "- r2: do y" in feedback
+    assert "not understood" not in feedback
+    assert "Accepted forms" not in feedback
+
+
+def test_requirement_gate_diagnostics_reports_unparsed_lines():
+    """#861 r3: the diagnostics payload and its one-line rendering carry the skipped rows;
+    no section → no skipped rows."""
+    body = "## Requirements\n- r1: done\n- r2: finished it\n\n## Summary\nok"
+    diag = _requirement_gate_diagnostics(body, [{"id": "r2", "text": "y", "status": "open"}])
+    assert diag["unparsed_lines"] == ["- r2: finished it"]
+    assert "unparsed_lines=['- r2: finished it']" in _requirement_gate_diag_line(diag)
+    assert _requirement_gate_diagnostics("plain prose", [])["unparsed_lines"] == []
+
+
 async def test_requirement_gate_diagnostic_comment_failure_never_breaks_the_build(monkeypatch, caplog):
     """The bounce comment is bookkeeping: a store.comment failure is logged and swallowed,
     and the build still re-dispatches and opens the PR (#284)."""
