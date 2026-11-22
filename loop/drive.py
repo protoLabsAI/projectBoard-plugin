@@ -698,20 +698,7 @@ class DriveMixin(HostDiskMixin):
         if removed or not os.path.exists(wt):
             # Keep the timeout's evidence, but stop probing a deliberately discarded
             # checkout. A failed save/removal leaves the location live for recovery.
-            try:
-                ledger_store = store or self._store()
-                if hasattr(ledger_store, "list_work_locations"):
-                    ledger = await asyncio.to_thread(ledger_store.list_work_locations, fid)
-                    for entry in ledger["entries"]:
-                        if (
-                            entry.get("id") == TIMEOUT_WORKTREE_LOCATION_ID
-                            and entry.get("path") == str(wt)
-                            and not entry.get("retired")
-                        ):
-                            state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
-                            await asyncio.to_thread(ledger_store.record_work_location, fid, {**state, "retired": True})
-            except Exception:  # noqa: BLE001 — ledger failure must not interrupt tree cleanup
-                log.warning("[project_board] %s could not retire its timed-out worktree %s", fid, wt, exc_info=True)
+            await self._retire_timeout_worktree(store, fid, wt)
         if record is None:
             return (
                 "worktree reaped" if removed or not os.path.exists(wt) else "worktree reap failed (directory remains)"
@@ -2654,9 +2641,15 @@ class DriveMixin(HostDiskMixin):
                                 )
                                 return
                             await worktree.remove_worktree(repo, wt, branch or "")
+                            # #753: a retry, tier climb or provider-stall rebuild removes the
+                            # timed-out tree here; its ledger entry stops being probed.
+                            await self._retire_timeout_worktree(store, fid, wt)
                             self._inflight.pop(fid, None)
                             wt = branch = None
                         saved, unsaved = await worktree.set_aside_stranded_worktrees(repo, self.root, fid, base=base)
+                        for kept in saved:
+                            if kept.removed:  # #753: a timed-out tree a rebuild set aside
+                                await self._retire_timeout_worktree(store, fid, kept.path)
                         if saved:
                             await self._note_preserved(fid, repo, saved, base=base, store=store)
                         if unsaved:
@@ -5376,6 +5369,31 @@ class DriveMixin(HostDiskMixin):
                 wt,
                 exc_info=True,
             )
+
+    async def _retire_timeout_worktree(self, store, fid: str, wt) -> None:
+        """#753: mark the card's live ``timeout-worktree`` work location for ``wt`` retired —
+        the ONE place every removal or rebuild of this drive's tree retires it (the terminal
+        ``_discard_tree``, and the fresh-build removal a retry, tier climb or provider-stall
+        retry goes through), so the health sweep never probes a missing or reused path.
+        The entry keeps its path, branch and sha as evidence. Best-effort: a ledger failure
+        is logged and never interrupts tree cleanup."""
+        if not wt:
+            return
+        try:
+            ledger_store = store or self._store()
+            if not hasattr(ledger_store, "list_work_locations"):
+                return
+            ledger = await asyncio.to_thread(ledger_store.list_work_locations, fid)
+            for entry in ledger.get("entries") or []:
+                if (
+                    entry.get("id") == TIMEOUT_WORKTREE_LOCATION_ID
+                    and entry.get("path") == str(wt)
+                    and not entry.get("retired")
+                ):
+                    state = {k: v for k, v in entry.items() if k in work_locations.FIELDS}
+                    await asyncio.to_thread(ledger_store.record_work_location, fid, {**state, "retired": True})
+        except Exception:  # noqa: BLE001 — ledger failure must not interrupt tree cleanup
+            log.warning("[project_board] %s could not retire its timed-out worktree %s", fid, wt, exc_info=True)
 
     def _timeout_block_detail(self, fid: str, wt) -> str:
         """#753: the lines a timeout's block/park reason gains — the worktree the dispatch ran

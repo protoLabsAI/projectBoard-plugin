@@ -237,3 +237,150 @@ async def test_timeout_location_is_retired_only_when_discarded(monkeypatch, tmp_
         notices = []
         work_location_sweep.Sweep().check(store, lambda *a, **kw: notices.append(a))
         assert notices == []
+
+
+# ── every removal or rebuild of the timed-out tree retires its ledger entry ──────────
+#
+# The one helper `_retire_timeout_worktree` runs on the terminal `_discard_tree`, on the
+# fresh-build removal a tier climb or provider-stall retry goes through, and on the
+# rebuild that sets a kept tree aside (the retry after an unblock). After each, no LIVE
+# `timeout-worktree` entry may still point at the removed (or about-to-be-reused) path,
+# or the health sweep probes it and pages a false recovery alert.
+
+
+def _live(store, wt):
+    return [
+        e
+        for e in store.locations.get("bd-1", [])  # the raw ledger, not the (patchable) read
+        if e["id"] == drive_mod.TIMEOUT_WORKTREE_LOCATION_ID and e["path"] == wt and not e.get("retired")
+    ]
+
+
+def _rebuilds_watched(monkeypatch, store, wt, tmp_path):
+    """Make the tree really leave on removal, and snapshot the live entries each time the
+    drive (re)creates it — i.e. after the previous attempt's tree was removed."""
+    seen: list[list[dict]] = []
+    created = [0]
+
+    async def _remove(repo, path, branch="", **_kw):
+        shutil.rmtree(path, ignore_errors=True)
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        if created[0]:
+            seen.append(_live(store, wt))
+            _git_tree(tmp_path)  # the rebuild reuses the same path
+        created[0] += 1
+        return (wt, "feat/" + fid)
+
+    monkeypatch.setattr(worktree, "remove_worktree", _remove)
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    return seen
+
+
+def _terminal_discard_removes(monkeypatch):
+    async def discard(repo, path, branch, **kwargs):
+        shutil.rmtree(path, ignore_errors=True)
+        return True, None
+
+    monkeypatch.setattr(worktree, "discard_worktree", discard)
+
+
+async def test_a_tier_climb_rebuild_retires_the_timed_out_tree(monkeypatch, tmp_path):
+    wt, _sha = _git_tree(tmp_path)
+    store = _LedgerStore(tiers=["reasoning"])
+    loop, dispatched = _board(monkeypatch, store, {"coders": {"smart": "a", "reasoning": "b"}}, wt)
+    seen = _rebuilds_watched(monkeypatch, store, wt, tmp_path)
+    _terminal_discard_removes(monkeypatch)
+    await loop._drive(_CARD)
+
+    assert store.escalated and dispatched[:2] == ["a", "b"]
+    assert seen and seen[0] == [], "the climb's rebuild left a live entry on the removed tree"
+    assert _live(store, wt) == []
+    assert store.list_work_locations("bd-1")["entries"], "the evidence is kept, retired"
+
+
+async def test_a_provider_stall_retry_retires_the_timed_out_tree(monkeypatch, tmp_path):
+    from test_provider_stall_585 import _Clock
+
+    clock = _Clock()
+    monkeypatch.setattr(coder_seam, "_monotonic", clock)
+    wt, _sha = _git_tree(tmp_path)
+    store = _LedgerStore()
+    loop, dispatched = _board(monkeypatch, store, {"coder": "proto", "decompose_after_timeouts": 1}, wt)
+    notes = []
+    monkeypatch.setattr(store, "comment", lambda fid, text: notes.append(text), raising=False)
+
+    async def _dispatch(coder, wt_, prompt, *, timeout=None, env_passthrough=()):
+        dispatched.append(coder)
+        coder_seam.progress_tool("bd-1", 1, {"phase": "start", "name": "Edit", "id": "t1", "input": {}})
+        clock.advance(600)
+        raise worktree.CoderTimeout(_TIMEOUT)
+
+    monkeypatch.setattr(worktree, "dispatch_coder", _dispatch)
+    seen = _rebuilds_watched(monkeypatch, store, wt, tmp_path)
+    _terminal_discard_removes(monkeypatch)
+    await loop._drive(_CARD)
+
+    assert any(n.startswith("provider_stall:") for n in notes), "the same-tier stall retry ran"
+    assert len(dispatched) >= 2 and seen and all(s == [] for s in seen)
+    assert _live(store, wt) == []
+
+
+async def test_a_retry_rebuild_over_a_kept_tree_retires_it(monkeypatch, tmp_path):
+    """The retry after a block whose tree was KEPT (its removal failed): the next drive's
+    fresh build sets that tree aside, and its live timeout entry is retired then."""
+    wt, _sha = _git_tree(tmp_path)
+    store = _LedgerStore()
+    loop, _ = _board(monkeypatch, store, {"coder": "proto"}, wt)
+
+    async def keep(repo, path, branch, **kwargs):
+        return False, None  # the terminal discard could not remove it
+
+    monkeypatch.setattr(worktree, "discard_worktree", keep)
+    await loop._drive(_CARD)
+    assert len(_live(store, wt)) == 1, "a tree kept for recovery stays live"
+
+    async def set_aside(repo, root, fid, *, base=""):
+        shutil.rmtree(wt, ignore_errors=True)
+        rec = worktree.PreservedTree(wt, "feat/bd-1", "stranded/x", "abc1234", "1 commit", "", removed=True)
+        return [rec], []
+
+    async def note_preserved(*a, **kw):
+        return None
+
+    monkeypatch.setattr(worktree, "set_aside_stranded_worktrees", set_aside)
+    monkeypatch.setattr(loop, "_note_preserved", note_preserved)
+    seen = []
+
+    async def _create(repo, base, fid, root, title="", **_kw):
+        seen.append(_live(store, wt))
+        raise worktree.WorktreeError("stop after the rebuild's set-aside")
+
+    monkeypatch.setattr(worktree, "create_worktree", _create)
+    await loop._drive(_CARD)
+    assert seen == [[]], "the retry's rebuild left a live entry on the set-aside tree"
+
+
+async def test_a_terminal_discard_retires_the_timed_out_tree(monkeypatch, tmp_path):
+    wt, _sha = _git_tree(tmp_path)
+    store = _LedgerStore()
+    loop, _ = _board(monkeypatch, store, {"coder": "proto"}, wt)
+    _terminal_discard_removes(monkeypatch)
+    await loop._drive(_CARD)
+
+    assert _blocks(store), "the card blocks"
+    assert _live(store, wt) == []
+    (entry,) = store.list_work_locations("bd-1")["entries"]
+    assert entry["retired"] is True and entry["path"] == wt
+
+
+async def test_a_ledger_that_cannot_retire_never_breaks_the_rebuild(monkeypatch, tmp_path, caplog):
+    wt, _sha = _git_tree(tmp_path)
+    store = _LedgerStore(tiers=["reasoning"])
+    loop, dispatched = _board(monkeypatch, store, {"coders": {"smart": "a", "reasoning": "b"}}, wt)
+    _rebuilds_watched(monkeypatch, store, wt, tmp_path)
+    monkeypatch.setattr(store, "list_work_locations", lambda fid: (_ for _ in ()).throw(RuntimeError("down")))
+    with caplog.at_level(logging.WARNING):
+        await loop._drive(_CARD)
+    assert dispatched[:2] == ["a", "b"], "the climb still re-dispatched"
+    assert any("could not retire its timed-out worktree" in r.getMessage() for r in caplog.records)
