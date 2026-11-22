@@ -877,7 +877,7 @@ def managed_note(managed: dict[str, Any]) -> str:
         note += (
             " It is read-only, so the board can plan cards here but coders can't be dispatched into it "
             "until the operator makes it read-write (onboard_project or register_local_project with write=true "
-            "asks them with an approval card, or Settings ▸ Projects)."
+            "asks them with an approval card, or the console's Tools ▸ Filesystem ▸ Work folders write switch)."
         )
     return note
 
