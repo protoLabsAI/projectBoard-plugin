@@ -204,7 +204,14 @@ class PromptMixin:
         """Include queued route feedback without consuming it before prompt construction."""
         return bool(self._ci_feedback.get(fid) or _PENDING_FEEDBACK.get(fid))
 
-    def _build_prompt(self, feature: dict, lessons: str = "", timeout_note: str = "", resume_note: str = "") -> str:
+    def _build_prompt(
+        self,
+        feature: dict,
+        lessons: str = "",
+        timeout_note: str = "",
+        resume_note: str = "",
+        carried_feedback: str = "",
+    ) -> str:
         """An imperative, fully-specified instruction (ProtoMaker discipline). A
         passive 'implement this feature' + a vague spec makes a coder produce
         nothing; naming the files + a direct 'make the edits now' makes it act.
@@ -378,12 +385,18 @@ class PromptMixin:
             if board is not None and callable(getattr(board, "feature_comments", None))
             else []
         )
-        briefs = [self._ci_feedback.get(fid) or "", pending or ""]
+        # #757: ``carried_feedback`` is the fix-round brief an earlier build in THIS drive
+        # already delivered (its receipt is written, so history no longer offers it). A
+        # rebuild — a resumed integration replacing the first prompt, a provider retry —
+        # must keep it, and lead with it. Drive-local, so a later drive never replays it.
+        briefs = [carried_feedback or "", self._ci_feedback.get(fid) or "", pending or ""]
+        fresh = [pending or ""]
         # Keep the richer memory preamble when it already carries this finding.
         for _, text in durable:
             body = text.split(":", 1)[1].strip()
             if not any(body in brief for brief in briefs):
                 briefs.append(text)
+                fresh.append(text)
         ci = "\n\n".join(dict.fromkeys(brief for brief in briefs if brief)) or timeout_note
         prior = self._ci_prior_diff.get(fid)
         prior_block = (
@@ -509,6 +522,10 @@ class PromptMixin:
             board.record_fix_feedback_delivery(
                 fid, _FEEDBACK_DELIVERED_PREFIX + json.dumps([key for key, _ in durable])
             )
+            # Hand the drive what this build delivered, so its rebuilds can carry it (#757).
+            delivered = "\n\n".join(dict.fromkeys(b for b in fresh if b))
+            if delivered:
+                self.__dict__.setdefault("_delivered_fix_briefs", {})[fid] = delivered
         if pending and not durable:
             # Preserve the legacy in-process bridge for callers without a bead record.
             self._ci_feedback[fid] = pending

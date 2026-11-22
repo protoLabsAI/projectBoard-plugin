@@ -573,6 +573,9 @@ class BoardLoop(DriveMixin, ReconcileMixin, PreflightMixin, PromptMixin):
         # The prompt-feedback dicts (_ci_feedback/_ci_prior_diff/_review_prior)
         # stay memory-only: they enrich the next prompt, they never gate anything.
         self._ci_feedback: dict[str, str] = {}
+        # #757: the fix-round brief the last prompt build delivered (receipt written), for
+        # the drive to carry into its own rebuilds. Drained by the drive; never replayed.
+        self._delivered_fix_briefs: dict[str, str] = {}
         # #487: the failed check names a CI rerun was spent on, for the flake log line
         # when the rerun comes back green (in memory only; a restart just names fewer).
         self._ci_rerun_checks: dict[str, str] = {}
