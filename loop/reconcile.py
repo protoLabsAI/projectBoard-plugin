@@ -733,7 +733,7 @@ class ReconcileMixin(WorktreeCleanup):
             # #533: the title is the squash subject — sanitise it with the SAME refs_only
             # the body was stamped with, so a split-card slice can't close a shared issue
             # via the subject while its body only says `Refs #n`.
-            title=pr_title_for(f.get("title") or fid, _source_issue(f), refs_only=refs_only),
+            title=await self._card_pr_title(f, wt, refs_only, title=f.get("title") or fid),
             body=body,
             promote_draft=not f.get("pr_url") and not as_draft,
             **as_draft,
