@@ -318,3 +318,35 @@ def test_unrelated_notes_rewrite_keeps_the_hold_condition(make_board):
 def test_files_entry_with_merge_hold_prefix_is_refused():
     with pytest.raises(store.BoardError):
         store._refuse_structured_paths([f"merge-hold-until: {SPEC}"])
+
+
+# ── re-hold keeps the fresh hold's git-evidence gate (_work_location_hold_reason) ─────
+
+_SHA = "abc1234" + "d" * 33
+
+
+def test_rehold_with_unrecorded_sha_is_refused_before_any_write(make_board):
+    board = _held_board(make_board, reason="after 31")
+    fake = board._run
+    before_comments, before_notes = fake.comments(), fake.notes()
+    n_calls = len(fake.calls)
+    with pytest.raises(store.BoardError, match="board_record_work_location"):
+        board.set_merge_hold("bd-1", f"preserve {_SHA}", until=SPEC)
+    assert fake.comments() == before_comments and fake.notes() == before_notes
+    assert all(c[0] == "show" for c in fake.calls[n_calls:])
+    assert board.get_feature("bd-1")["merge_hold_reason"] == "after 31"
+
+
+def test_rehold_with_recorded_sha_snapshots_work_location_context(make_board):
+    board = _held_board(make_board, reason="after 31")
+    board.record_work_location(
+        "bd-1",
+        {"id": "clone", "path": "/tmp/clone", "purpose": "save work", "sha": _SHA, "branch": "feat/x", "pushed": False},
+    )
+    board.set_merge_hold("bd-1", f"preserve {_SHA}", until=SPEC)
+    note = board._run.comments()[-1]
+    assert note.startswith("merge-hold updated: reason 'after 31' → ")
+    context = json.loads(note.split("work-location context: ")[1])
+    assert context[0]["kind"] == "sha" and context[0]["locations"][0]["path"] == "/tmp/clone"
+    # the STORED reason is the operator's text, not the audit snapshot
+    assert board.get_feature("bd-1")["merge_hold_reason"] == f"preserve {_SHA}"

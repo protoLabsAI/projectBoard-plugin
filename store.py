@@ -5309,6 +5309,8 @@ class BeadsBoard:
         that has (or is given) an ``until`` REPLACES its reason and ``until`` with one
         ``merge-hold updated:`` audit comment recording old → new; identical values stay a
         no-op. A plain re-hold (no ``until`` before or after) is the no-op it always was.
+        The update runs the fresh hold's work-location gate too (``_work_location_hold_reason``):
+        a new reason citing an unrecorded SHA/branch is refused before any write.
 
         The merge edge itself is untouched: ``merge_posture`` / the loop's
         ``_auto_merge_blockers`` already read the label back as ``merge-hold (operator
@@ -5337,13 +5339,18 @@ class BeadsBoard:
                 return f  # a plain re-hold — idempotent, no duplicate comment (#532)
             if specs == stored_specs and reason == old_reason:
                 return f  # identical condition — idempotent, no comment
+            # The same git-evidence gate as a fresh hold: a reason citing a SHA/branch with no
+            # recorded work location is refused BEFORE any write, and the audit snapshots
+            # the resolved work-location context exactly as `merge-hold set:` does.
+            reason_text = self._work_location_hold_reason(fid, reason, f)
             changes = []
             if reason != old_reason:
                 changes.append(f"reason {old_reason or '(not recorded)'!r} → {reason!r}")
             if specs != stored_specs:
                 changes.append(f"until {', '.join(stored_specs) or '(none)'} → {', '.join(specs) or '(none)'}")
             # The audit FIRST (allowed to raise): never a changed condition with no record.
-            self._run("comments", "add", fid, "merge-hold updated: " + "; ".join(changes), actor=who)
+            context = reason_text[len(reason) :] if reason_text.startswith(reason) else ""
+            self._run("comments", "add", fid, "merge-hold updated: " + "; ".join(changes) + context, actor=who)
             self._run("update", fid, f"--notes={self._merge_hold_notes(f, specs, reason)}", actor=who)
             return self.get_feature(fid)
         reason_text = self._work_location_hold_reason(fid, reason, f)

@@ -601,6 +601,11 @@ class DriveMixin(HostDiskMixin):
                 self.cfg[key] = new
                 changed[key] = (cur, new)
         if changed:
+            try:
+                # A project's gate command may have changed: drop its slow-gate entry (#728).
+                self._forget_stale_slow_gates()
+            except Exception:  # noqa: BLE001 — never raises, as above
+                log.warning("[project_board] reload: slow-gate advisory refresh failed", exc_info=True)
             setup_check.publish_loop_snapshot(self.cfg)
             # The working-state hints read these knobs (auto_merge, review_gate, …), so what
             # the snapshot renders changed without a board write: mark it stale (#401).
@@ -994,6 +999,12 @@ class DriveMixin(HostDiskMixin):
         """One tick's phases, in order — True if the claim scan started a drive."""
         self._sample_tick_clocks()
         spawned = False
+        try:
+            # A fixed gate command or a raised timeout clears the slow-gate advisory now,
+            # without waiting for a gate run that may never come (#728).
+            self._forget_stale_slow_gates()
+        except Exception:  # noqa: BLE001 — an advisory refresh must never stop a tick
+            log.warning("[project_board] slow-gate advisory refresh failed", exc_info=True)
         # Each phase runs on its OWN (#404). A phase that FAILS — a `br` call refused, a
         # bug — is logged by name and runs again on its own next turn, and the others go
         # ahead: before, any exception anywhere took the whole tick down with a traceback.

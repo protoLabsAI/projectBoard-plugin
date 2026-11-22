@@ -5063,6 +5063,36 @@ class ReconcileMixin(WorktreeCleanup):
         slow = self._slow_gates.get(self._project_name(feature))
         return bool(slow) and slow["cmd"] == cmd and slow["timeout_s"] == float(self.local_gate_timeout)
 
+    def _forget_stale_slow_gates(self) -> bool:
+        """Drop every slow-gate entry whose recorded command or timeout no longer matches
+        the project's gate as configured NOW, and republish the setup advisory (#728).
+
+        An always-slow gate never finishes, so ``_note_gate_speed`` alone would never clear
+        it: the advisory stayed up after the operator changed ``local_gate_cmd`` or raised
+        ``local_gate_timeout_s``. This runs no gate; it uses the same comparison as
+        ``_gate_known_slow``. Entries published by an earlier loop in this process (the
+        health state outlives a restart, which is how those two knobs change) are checked
+        the same way, so a restart with a fixed gate clears them too. Returns whether the
+        published entries changed."""
+        for project in list(self._slow_gates):
+            feature = {"project": project}
+            if not self._gate_known_slow(feature, self._local_gate_cmd_for(feature)):
+                self._slow_gates.pop(project, None)
+        published = health.slow_gates_snapshot()
+        timeout = float(self.local_gate_timeout)
+        current = {
+            name: info
+            for name, info in published.items()
+            if name not in self._slow_gates
+            and info.get("cmd") == self._local_gate_cmd_for({"project": name})
+            and info.get("timeout_s") == timeout
+        }
+        current.update(self._slow_gates)
+        if current == published:
+            return False
+        health.publish_slow_gates(current)
+        return True
+
     async def _run_local_gate(self, wt: str, feature: dict | None = None) -> str | None:
         """Run the pre-PR local gate (``local_gate_cmd``) in the worktree.
 
