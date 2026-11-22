@@ -47,6 +47,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import asyncio
 import os
 import re
 
@@ -97,6 +98,48 @@ def _different_sha(sha: str) -> str:
     """A valid-format 40-hex sha guaranteed NOT to equal ``sha`` — a head the gate never
     examined, for the fail-safe head-identity checks (r5). Flips the first nibble."""
     return ("0" if sha[:1] != "0" else "1") + sha[1:]
+
+
+# #800: GitHub's combined-status endpoint (``GET /repos/{slug}/commits/{sha}/status``) is read from
+# replicas that lag the status POST for a moment. Measured against real GitHub (20 runs of the
+# round-trip test, each on a commit with no earlier status): 3 read ``absent`` straight after a
+# successful post — and the lag is NOT one-way: a read can be PRESENT and the very next one ABSENT
+# again (10 rapid reads after each of 15 posts: 4 commits flapped, the last ABSENT 2.4 s after the
+# post, none from 2.8 s on). So the wait below needs the status to STAY readable for a few reads
+# in a row, not just to show up once. The budget is fixed: at most ``_STATUS_WAIT_TRIES`` reads,
+# ``_STATUS_WAIT_DELAY_S`` apart (~10 s).
+_STATUS_WAIT_TRIES = 10
+_STATUS_WAIT_DELAY_S = 1.0
+_STATUS_WAIT_SETTLE_READS = 3
+
+
+async def _wait_for_review_status(
+    slug: str,
+    head: str,
+    *,
+    cwd: str,
+    tries: int = _STATUS_WAIT_TRIES,
+    delay: float = _STATUS_WAIT_DELAY_S,
+    settle: int = _STATUS_WAIT_SETTLE_READS,
+) -> tuple[str, dict | None]:
+    """Wait (bounded) for a just-posted ``TEST_STATUS_CONTEXT`` status to be readable on ``head``.
+
+    Polls ``worktree.read_review_status_result`` and returns as soon as ``settle`` reads in a row
+    are ``STATUS_READ_PRESENT`` (``settle=1``: the first PRESENT read). Any other outcome — ABSENT
+    or UNREADABLE — restarts that count and is never treated as the status having arrived. After
+    ``tries`` reads it gives up and returns the last read as it is, so the caller's own assertions
+    still fail on a status that never showed. This only WAITS: it asserts nothing and proves
+    nothing — the round-trip test's assertions run after it, unchanged."""
+    result: tuple[str, dict | None] = (worktree.STATUS_READ_ABSENT, None)
+    in_a_row = 0
+    for attempt in range(tries):
+        if attempt:
+            await asyncio.sleep(delay)
+        result = await worktree.read_review_status_result(slug, head, context=TEST_STATUS_CONTEXT, cwd=cwd)
+        in_a_row = in_a_row + 1 if result[0] == worktree.STATUS_READ_PRESENT else 0
+        if in_a_row >= settle:
+            break
+    return result
 
 
 def test_gh_tier_cannot_silently_skip_in_ci():
@@ -335,6 +378,12 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
     )
     assert ok is True
 
+    # #800: GitHub can serve the commit WITHOUT the new status for a moment after the POST (and
+    # flap back to it once or twice). Wait, bounded, for the status to be readable — the result is
+    # deliberately not asserted here: every assertion below is the same as before the wait, so a
+    # status that never shows (or an unreadable read) still fails them with the same message.
+    await _wait_for_review_status(slug, head, cwd=cwd)
+
     read = await worktree.read_review_status(slug, head, context=TEST_STATUS_CONTEXT, cwd=cwd)
     assert read == {"state": "success", "head_sha": head, "passed": True}
 
@@ -368,6 +417,97 @@ async def test_post_and_read_review_status_round_trip_on_the_pinned_head(gh_fixt
         is False
     )
     assert await worktree.read_review_status(slug, "", context=TEST_STATUS_CONTEXT, cwd=cwd) is None
+
+
+# ── the bounded wait the round-trip uses (#800) — host-free: no `gh`, no real sleep ─────
+
+
+def _scripted_status_reads(monkeypatch, outcomes):
+    """Replace ``worktree.read_review_status_result`` with a script of outcomes (the last one
+    repeats) and ``asyncio.sleep`` with a recorder. Returns ``(reads, sleeps)``: the arguments of
+    every read and the delay of every sleep the helper asked for."""
+    reads: list[tuple] = []
+    sleeps: list[float] = []
+    present = {"state": "success", "head_sha": "a" * 40, "passed": True}
+
+    async def _read(slug, head, *, context, cwd):
+        outcome = outcomes[min(len(reads), len(outcomes) - 1)]
+        reads.append((slug, head, context, cwd))
+        return (outcome, dict(present) if outcome == worktree.STATUS_READ_PRESENT else None)
+
+    async def _sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(worktree, "read_review_status_result", _read)
+    monkeypatch.setattr(asyncio, "sleep", _sleep)
+    return reads, sleeps
+
+
+async def test_status_wait_returns_present_once_an_absent_read_turns_present(monkeypatch):
+    """ABSENT, then PRESENT: the helper returns the PRESENT read. It reads the test's own
+    disposable context on the head it was given, sleeps only BETWEEN reads, and stops the moment
+    the status has been PRESENT for the settle count (3 in a row by default) — 4 reads, 3 sleeps,
+    not the whole budget."""
+    reads, sleeps = _scripted_status_reads(monkeypatch, [worktree.STATUS_READ_ABSENT, worktree.STATUS_READ_PRESENT])
+    head = "a" * 40
+
+    outcome, status = await _wait_for_review_status("owner/repo", head, cwd="/repo")
+
+    assert outcome == worktree.STATUS_READ_PRESENT
+    assert status == {"state": "success", "head_sha": head, "passed": True}
+    assert reads == [("owner/repo", head, TEST_STATUS_CONTEXT, "/repo")] * 4
+    assert sleeps == [_STATUS_WAIT_DELAY_S] * 3
+
+
+async def test_status_wait_with_settle_one_stops_at_the_first_present_read(monkeypatch):
+    """``settle=1`` is the plain poll: it stops as soon as one read is PRESENT, and a status that
+    is PRESENT on the first read costs no sleep at all."""
+    reads, sleeps = _scripted_status_reads(monkeypatch, [worktree.STATUS_READ_ABSENT, worktree.STATUS_READ_PRESENT])
+    assert (await _wait_for_review_status("owner/repo", "a" * 40, cwd="/repo", settle=1))[0] == (
+        worktree.STATUS_READ_PRESENT
+    )
+    assert len(reads) == 2 and sleeps == [_STATUS_WAIT_DELAY_S]
+
+    reads, sleeps = _scripted_status_reads(monkeypatch, [worktree.STATUS_READ_PRESENT])
+    assert (await _wait_for_review_status("owner/repo", "a" * 40, cwd="/repo", settle=1))[0] == (
+        worktree.STATUS_READ_PRESENT
+    )
+    assert len(reads) == 1 and sleeps == []
+
+
+async def test_status_wait_restarts_the_settle_count_when_a_present_read_flaps_back(monkeypatch):
+    """The lag measured on real GitHub is not one-way: PRESENT, then ABSENT again. A flap back
+    restarts the count, so the helper keeps waiting until the status has STAYED readable."""
+    p, a = worktree.STATUS_READ_PRESENT, worktree.STATUS_READ_ABSENT
+    reads, sleeps = _scripted_status_reads(monkeypatch, [p, p, a, p, p, p])
+
+    outcome, _status = await _wait_for_review_status("owner/repo", "a" * 40, cwd="/repo")
+
+    assert outcome == worktree.STATUS_READ_PRESENT
+    assert len(reads) == 6 and len(sleeps) == 5
+
+
+@pytest.mark.parametrize("stuck", [worktree.STATUS_READ_ABSENT, worktree.STATUS_READ_UNREADABLE])
+async def test_status_wait_gives_up_after_its_budget_and_reports_the_last_read(monkeypatch, stuck):
+    """A status that never shows — ABSENT on every read, or UNREADABLE on every read — is NOT
+    waited on forever and is NOT turned into a pass: after the fixed budget the helper returns
+    that last outcome with no status, so the round-trip's own assertions fail on it. No real
+    sleep: the delays are only recorded."""
+    reads, sleeps = _scripted_status_reads(monkeypatch, [stuck])
+
+    assert await _wait_for_review_status("owner/repo", "a" * 40, cwd="/repo") == (stuck, None)
+    assert len(reads) == _STATUS_WAIT_TRIES == 10
+    assert sleeps == [_STATUS_WAIT_DELAY_S] * (_STATUS_WAIT_TRIES - 1)
+
+
+async def test_status_wait_does_not_count_an_unreadable_read_towards_present(monkeypatch):
+    """UNREADABLE is never the status "arriving": PRESENT, UNREADABLE, PRESENT … never reaches
+    three in a row, so the helper runs out its budget instead of returning early."""
+    p, u = worktree.STATUS_READ_PRESENT, worktree.STATUS_READ_UNREADABLE
+    reads, _sleeps = _scripted_status_reads(monkeypatch, [p, u] * 5)
+
+    assert await _wait_for_review_status("owner/repo", "a" * 40, cwd="/repo") == (u, None)
+    assert len(reads) == _STATUS_WAIT_TRIES
 
 
 # ── _find_marked_comment + post_or_update_pr_comment (the marked-comment write) ─────────
