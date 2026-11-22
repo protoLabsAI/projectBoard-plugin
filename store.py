@@ -4206,7 +4206,9 @@ class BeadsBoard:
             self.comment(fid, f"CI failed: {reason}")
         return self.get_feature(fid)
 
-    def record_review_bounce(self, fid: str, findings: str = "", *, head: str = "") -> dict:
+    def record_review_bounce(
+        self, fid: str, findings: str = "", *, head: str = "", review_gate_blocked: bool = False
+    ) -> dict:
         """Record an adverse code-review bounce as a DISTINCT comment on the bead —
         the review sibling of ``bounce_ci_fail``'s ``CI failed:`` note, kept separate
         from the requeue so the review history survives on the bead even though the
@@ -4217,9 +4219,20 @@ class BeadsBoard:
         single ``ext-review-bounced:<sha>`` label BEFORE the comment, so the reconcile
         never bounces the same head twice. The stamp is written first on purpose: a crash
         between the two leaves a stamped head with no comment (the next pass holds it for a
-        human), never a bounce the next pass would repeat."""
+        human), never a bounce the next pass would repeat.
+
+        ``review_gate_blocked`` (#701) lets an operator's decision land on a PR the review
+        gate blocked: a ``blocked`` card is accepted too, but only one still carrying the
+        in-review label and its PR. The caller owns the review-gate fingerprint check and
+        clears the block AFTER this comment is written; every other state is refused."""
         f = self._require(fid)
-        if f["board_state"] != "in_review":
+        gate_blocked_pr = (
+            review_gate_blocked
+            and f["board_state"] == "blocked"
+            and LABEL_IN_REVIEW in (f.get("labels") or [])
+            and bool(str(f.get("pr_url") or "").strip())
+        )
+        if f["board_state"] != "in_review" and not gate_blocked_pr:
             raise BoardError(f"review bounce expects in_review, got {f['board_state']!r}")
         head = str(head or "").strip()[:SHORT_SHA_LEN]
         if head:

@@ -196,16 +196,51 @@ def review_bounce(board, fid: str, findings: str, *, escalate: bool = False, esc
     then requeue onto the SAME open PR. ``escalate`` climbs the model ladder when one is
     configured; with the ladder already at its top the card is Blocked instead of looping.
 
+    Without escalation, a review-gate-blocked PR can also take an operator's decision
+    (#701): only once ``record_review_bounce`` has refused the card is it checked for the
+    review-gate fingerprint, and then the findings are recorded and queued FIRST and the
+    review-fix budget and the block are cleared LAST, so a step that raises leaves the
+    card blocked and the call safe to repeat. The gate is not re-armed ahead of the coder.
+
     Refused (``BoardError``) while the loop is still working the card (#398): the review
     gate runs inside the drive, so a bounce landing then would requeue the card out from
     under it. Blocking: call it off the event loop."""
-    from .loop import queue_review_feedback, requeue_refusal
+    from .loop import live_loop, queue_review_feedback, requeue_refusal
+    from .loop._common import _is_review_gate_block
+    from .store import LABEL_IN_REVIEW
 
     refusal = requeue_refusal(fid)
     if refusal:
         raise BoardError(refusal)
-    board.record_review_bounce(fid, findings)
+    gate_blocked = False
+    try:
+        board.record_review_bounce(fid, findings)
+    except BoardError:
+        # The in_review path above is untouched. A refusal is re-raised as it was unless
+        # this is a no-escalate bounce onto a PR the review gate itself blocked.
+        if escalate:
+            raise
+        feature = board.get_feature(fid) or {}
+        if not (
+            _is_review_gate_block(feature)
+            and LABEL_IN_REVIEW in (feature.get("labels") or [])
+            and str(feature.get("pr_url") or "").strip()
+        ):
+            raise
+        board.record_review_bounce(fid, findings, review_gate_blocked=True)
+        gate_blocked = True
     queue_review_feedback(fid, findings)
+    if gate_blocked:
+        # Budget before block: if the block clear fails the card is still blocked and a
+        # repeat call redoes both; the other order could leave an in_review card whose
+        # spent budget re-blocks it at once. The live cache wins over persisted labels,
+        # so invalidate both halves, as unblock_side_effects does — but leave the gate
+        # itself (review-pending, status) untouched until the fix lands.
+        board.clear_budgets(fid, ["review-fix"])
+        loop = live_loop()
+        if loop is not None:
+            loop._budget_cache("review-fix").pop(fid, None)
+        board.clear_blocked(fid)
     if escalate and escalate_on:
         nxt = board.escalate(fid, f"review-fail: {findings}" if findings else "review-fail")
         if nxt is None:
@@ -505,7 +540,7 @@ def build_router(cfg: dict):
         on the bead (≠ ci-fail), feeds them into the next dispatch prompt (the same
         ``_ci_feedback`` lever the in-loop review gate uses), and **requeues onto the
         SAME open PR** (``pr_url`` preserved via external_ref). Works from
-        ``in_review``.
+        ``in_review``, or a review-gate block when ``escalate=false``.
 
         Body: ``{findings: str, head_sha: str, escalate: bool=false}``. ``head_sha`` must
         be the PR's live head, and one bounce applies per head (#767); otherwise the
@@ -1406,7 +1441,8 @@ def build_data_router(cfg: dict, *, gap_reporter=None):
         ``{findings: str, escalate: bool=false}``. Records the findings as a DISTINCT
         review-bounce comment, leads the next dispatch prompt with them, and requeues onto
         the SAME open PR; ``escalate: true`` climbs the model ladder (Blocked at its top).
-        400 unless the card is ``in_review``, and while the loop is still working it (a
+        400 unless the card is ``in_review`` or a review-gate block with ``escalate=false``,
+        and while the loop is still working it (a
         live drive or review gate, #398)."""
         body = body or {}
         findings = str(body.get("findings", ""))

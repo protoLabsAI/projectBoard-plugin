@@ -1330,7 +1330,8 @@ def _board_tools(cfg: dict, registry=None):
     @tool
     def board_requeue_feature(feature_id: str, findings: str = "", escalate: bool = False) -> str:
         """Put a card back to ready for re-dispatch, keeping its open PR. With `findings` (an adverse
-        review's requested changes; the card must be in_review) this is the fix round on the SAME
+        review's requested changes; the card must be in_review, or blocked by the review gate
+        when escalate=false) this is the fix round on the SAME
         PR: a review bounce is recorded and the next dispatch prompt leads with the findings.
         Without `findings` it is a plain retry against the original prompt. `escalate=true` (with
         findings) climbs the model ladder; already at the top, the card is blocked instead.
