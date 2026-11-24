@@ -152,6 +152,8 @@ WORKTREE_SEAMS: dict[str, str] = {
     "pr_diff": "REAL",
     "pr_head_branch": "REAL",  # #716: pinned PR headRefName in tests/test_worktree_gh.py.
     "pr_head_sha": "REAL",
+    "pr_hold_facts": "REAL",  # Real GitHub hold facts in test_worktree_gh.py.
+    "_gh_write": "REAL",  # Disposable PR-label round trip in test_worktree_gh.py.
     "pr_identity": "REAL",  # #402: the pinned PR, tests/test_attach_pr_gh_402.py (the real-gh CI job)
     "pr_merge_info": "REAL",
     "pr_review_state": "REAL",  # #473: the external QA panel's verdict read, tests/test_worktree_gh.py
@@ -277,6 +279,7 @@ STORE_SEAMS: dict[str, str] = {
     "record_ci_rerun": "REAL",  # #487: the rerun stamp, real `br` in tests/test_ci_rerun_487.py
     "record_external_result": "REAL",  # #767: the signed-result stamp, real `br` in tests/test_external_result_stamp_767.py
     "record_reviewed_head": "UNCOVERED",
+    "record_gh_merge_hold": "REAL",  # Ownership marker round trip in test_integration.py.
     "record_board_draft": "REAL",  # #691: set/clear through real `br` in tests/test_draft_until_review_691.py
     "request_decomposition": "REAL",
     "record_verification": "REAL",
@@ -526,7 +529,7 @@ def test_worktree_coverage_contract_is_64_real_3_exempt_0_uncovered():
         "(open_pr / close_pr / _promote_adopted_draft); every other worktree seam must be REAL. "
         f"Got EXEMPT={exempt}"
     )
-    assert len(real) == 64, f"expected 64 REAL worktree seams, got {len(real)}: {real}"
+    assert len(real) == 66, f"expected 66 REAL worktree seams, got {len(real)}: {real}"
     assert len(exempt) == 3, f"expected 3 EXEMPT worktree seams, got {len(exempt)}: {exempt}"
     assert uncovered == [], (
         f"no worktree seam may remain UNCOVERED after #361 S3 (MAX_UNCOVERED_WORKTREE=0): {uncovered}"

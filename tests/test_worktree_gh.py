@@ -49,6 +49,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import asyncio
+import uuid
 import os
 import re
 
@@ -618,3 +619,42 @@ async def test_merge_pr_refuses_a_head_that_moved_and_never_merges_the_fixture(g
     assert isinstance(detail, str) and detail
     # The fixture was NOT merged by the attempt above.
     assert await worktree.pr_state(gh_fixture.url, cwd=gh_fixture.repo_dir) == "OPEN"
+
+
+# Capture before conftest's unit-tier autouse fixture replaces this read.
+_REAL_HOLD_FACTS = worktree.pr_hold_facts
+
+
+@requires_gh
+async def test_pr_hold_facts_matches_real_github(gh_fixture, monkeypatch):
+    from conftest import _gh_setup_json
+
+    monkeypatch.setattr(worktree, "pr_hold_facts", _REAL_HOLD_FACTS)
+    raw = _gh_setup_json(
+        "pr", "view", gh_fixture.url, "--json", "labels,autoMergeRequest", cwd=gh_fixture.repo_dir
+    )
+    assert await worktree.pr_hold_facts(gh_fixture.url, cwd=gh_fixture.repo_dir) == {
+        "labels": [label["name"] for label in raw["labels"]],
+        "auto_merge": raw["autoMergeRequest"] is not None,
+    }
+
+
+@requires_gh_write
+async def test_gh_write_label_round_trip(gh_fixture, monkeypatch):
+    """Exercise real label writes without changing the PR's actual merge hold."""
+    monkeypatch.setattr(worktree, "pr_hold_facts", _REAL_HOLD_FACTS)
+    label = f"pb-seam-test-{uuid.uuid4().hex}"
+    cwd = gh_fixture.repo_dir
+    try:
+        ok, detail = await worktree.add_pr_label(gh_fixture.url, label, cwd=cwd)
+        assert ok, detail
+        facts = await worktree.pr_hold_facts(gh_fixture.url, cwd=cwd)
+        assert facts is not None and label in facts["labels"]
+        ok, detail = await worktree.remove_pr_label(gh_fixture.url, label, cwd=cwd)
+        assert ok, detail
+        facts = await worktree.pr_hold_facts(gh_fixture.url, cwd=cwd)
+        assert facts is not None and label not in facts["labels"]
+    finally:
+        # Deleting the unique repo label also detaches it if an assertion failed.
+        ok, detail = await worktree._gh_write("label", "delete", label, "--yes", cwd=cwd)
+        assert ok, detail
