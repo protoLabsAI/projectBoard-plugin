@@ -1114,6 +1114,9 @@ def _sanitize_pr_title(title: str, own: tuple[str, int] | None, refs_only: bool 
 # whose summary merely mentions one of those words ("fix the login race") is not treated
 # as pre-typed.
 _CC_PREFIXED_RE = re.compile(rf"^\s*{_CC_PREFIX}(?:\([^)]*\))?!?\s*:", re.I)
+# A release card's title: "Release <name> vX.Y.Z[anything]" → "chore: release vX.Y.Z", the
+# subject release.yml's ``startsWith(…, 'chore: release v')`` guard fires on.
+_RELEASE_CARD_TITLE_RE = re.compile(r"^\s*release\s+\S+\s+v(\d+\.\d+\.\d+)", re.I)
 
 
 def pr_title_for(title: str, own: tuple[str, int] | None, refs_only: bool = False) -> str:
@@ -1131,8 +1134,16 @@ def pr_title_for(title: str, own: tuple[str, int] | None, refs_only: bool = Fals
     subject from the COMMIT, not the PR title.
 
     Sanitisation (#533) runs first and is unchanged, so a ``#n`` the subject could read as
-    a closing reference is still neutralised whichever branch is taken."""
+    a closing reference is still neutralised whichever branch is taken.
+
+    A release card titled ``Release <name> vX.Y.Z…`` (any case, anything after the version
+    ignored) returns exactly ``chore: release vX.Y.Z`` — without it such cards squashed as
+    ``feat: Release <name> vX.Y.Z: bump …`` and ``release.yml`` skipped, the same silent
+    no-release as #566."""
     clean = _sanitize_pr_title(title, own, refs_only=refs_only)
+    release = _RELEASE_CARD_TITLE_RE.match(clean)
+    if release:
+        return f"chore: release v{release.group(1)}"
     return clean if _CC_PREFIXED_RE.match(clean) else f"feat: {clean}"
 
 
