@@ -2051,6 +2051,10 @@ class ReconcileMixin(WorktreeCleanup):
                         await self._budget_reset(store, fid)
                         log.info("[project_board] reconcile → blocked (PR closed): %s (%s)", fid, pr_url)
                     elif state == "OPEN":
+                        # FIRST (bd-t266a): mirror the bead's merge-hold onto the GitHub PR, so a
+                        # merge the board does not make (pr-reviewer's `gh pr merge --auto`) is
+                        # held too. Before every edge below, as several of them `continue`.
+                        await self._mirror_merge_hold(store, fid, pr_url, repo)
                         # A terminal QA-panel verdict (PASS/WARN/FAIL) at this PR's current head,
                         # on a project where the AGENT does the merge/adjudication (``auto_merge``
                         # off), wakes the agent to act on it (#5218 / protoAgent#5218): three PRs
@@ -3414,6 +3418,95 @@ class ReconcileMixin(WorktreeCleanup):
             if _REVIEW_FINDINGS_TITLE in (text or ""):
                 return str(text).strip()
         return ""
+
+    async def _mirror_merge_hold(self, store, fid: str, pr_url: str, repo: str) -> None:
+        """Make the GitHub PR carry the bead's ``merge-hold`` (bd-t266a). The board's own
+        merge edge honours the bead label, but a merge armed on GitHub (pr-reviewer's
+        ``gh pr merge --auto``) never saw it: four held cards merged that way. So:
+
+        * held → the PR gets the ``merge-hold`` label (which pr-reviewer refuses to arm on),
+          marked on the bead as the board's (``gh-merge-hold``), and an auto-merge already
+          armed on GitHub is disabled;
+        * released → the board removes the PR label only if ITS marker says it put it
+          there; a label a human added to a card the board never held is left alone.
+
+        Reads the bead fresh (the pass's snapshot may predate a hold change) and makes no
+        gh call at all for a card that is neither held nor marked; a gh write happens only
+        when the PR differs from the bead. A failed write logs a WARNING and adds ONE bead
+        comment per failing action; it never fails the pass and never touches the bead
+        hold. Best-effort: an unreadable PR is retried on the next poll."""
+        noted = getattr(self, "_merge_hold_mirror_failed", None)
+        if noted is None:
+            noted = self._merge_hold_mirror_failed = {}
+
+        async def _failed(action: str, detail: str) -> None:
+            key = (fid, pr_url, action)
+            if key in noted:
+                log.info("[project_board] %s merge-hold mirror still failing (%s): %s", fid, action, detail)
+                return
+            noted[key] = detail
+            log.warning(
+                "[project_board] %s could not %s on %s (the bead merge-hold stands): %s", fid, action, pr_url, detail
+            )
+            await asyncio.to_thread(
+                store.comment,
+                fid,
+                f"merge-hold mirror: could not {action} on {pr_url} — the board's merge-hold stands, "
+                f"but GitHub may still merge this PR on its own: {detail}",
+            )
+
+        def _ok(action: str) -> None:
+            noted.pop((fid, pr_url, action), None)
+
+        try:
+            fresh = await asyncio.to_thread(store.get_feature, fid)
+            labels = (fresh or {}).get("labels") or []
+            held = store_mod.LABEL_MERGE_HOLD in labels
+            ours = store_mod.LABEL_GH_MERGE_HOLD in labels
+            if not held and not ours:
+                return
+            facts = await worktree.pr_hold_facts(pr_url, cwd=repo)
+            if facts is None:
+                return
+            on_pr = worktree.PR_MERGE_HOLD_LABEL in facts["labels"]
+            if held:
+                if not on_pr:
+                    action = "add the merge-hold label"
+                    ok, detail = await worktree.add_pr_label(
+                        pr_url,
+                        worktree.PR_MERGE_HOLD_LABEL,
+                        cwd=repo,
+                        description="Held by the project board: merge by hand",
+                    )
+                    if ok:
+                        _ok(action)
+                        await asyncio.to_thread(store.record_gh_merge_hold, fid, True)
+                        log.info("[project_board] %s merge-hold mirrored onto %s", fid, pr_url)
+                    else:
+                        await _failed(action, detail)
+                if facts["auto_merge"]:
+                    action = "disable GitHub auto-merge"
+                    ok, detail = await worktree.disable_auto_merge(pr_url, cwd=repo)
+                    if ok:
+                        _ok(action)
+                        log.info("[project_board] %s merge-hold: disabled GitHub auto-merge on %s", fid, pr_url)
+                    else:
+                        await _failed(action, detail)
+                return
+            # Released, and the board's marker says the PR label is the board's.
+            if on_pr:
+                action = "remove the merge-hold label"
+                ok, detail = await worktree.remove_pr_label(pr_url, worktree.PR_MERGE_HOLD_LABEL, cwd=repo)
+                if not ok:
+                    await _failed(action, detail)
+                    return
+                _ok(action)
+                log.info("[project_board] %s merge-hold released: label removed from %s", fid, pr_url)
+            await asyncio.to_thread(store.record_gh_merge_hold, fid, False)
+        except store_mod.BoardTimeout:
+            raise
+        except Exception:  # noqa: BLE001 — the mirror must never fail the pass
+            log.warning("[project_board] %s merge-hold mirror failed for %s", fid, pr_url, exc_info=True)
 
     async def _note_board_draft(self, store, fid: str, pr_url: str, repo: str) -> None:
         """Record that the loop holds this card's PR as a draft for its gate (#691). Reads

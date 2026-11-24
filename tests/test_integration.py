@@ -833,3 +833,22 @@ def test_register_degrades_to_plain_warnings_on_a_legacy_host(monkeypatch):
     assert by_key["coder"] == (setup_check.NO_CODER_HINT, None)  # plain warning, no action/label
     assert "/nowhere" in by_key["repo"][0] and by_key["repo"][1] is None
     assert "/plugins/project_board" in reg.routers and "project-board-loop" in reg.surfaces
+
+
+@requires_br
+@pytest.mark.br_shape
+def test_gh_merge_hold_marker_round_trip_through_real_br(board):
+    """Ownership survives a fresh store and never removes the operator's hold."""
+    fid = board.create_feature("GitHub hold marker", spec="s")["id"]
+    board.set_merge_hold(fid, "manual release")
+    for _ in range(2):
+        marked = board.record_gh_merge_hold(fid, True)
+        assert marked["labels"].count(store_mod.LABEL_GH_MERGE_HOLD) == 1
+        assert marked["merge_hold"] is True
+
+    restarted = BeadsBoard(repo=board.repo, actor="test")
+    assert store_mod.LABEL_GH_MERGE_HOLD in restarted.get_feature(fid)["labels"]
+    for _ in range(2):
+        cleared = restarted.record_gh_merge_hold(fid, False)
+        assert store_mod.LABEL_GH_MERGE_HOLD not in cleared["labels"]
+        assert cleared["merge_hold"] is True
