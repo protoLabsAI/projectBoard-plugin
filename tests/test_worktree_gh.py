@@ -630,9 +630,7 @@ async def test_pr_hold_facts_matches_real_github(gh_fixture, monkeypatch):
     from conftest import _gh_setup_json
 
     monkeypatch.setattr(worktree, "pr_hold_facts", _REAL_HOLD_FACTS)
-    raw = _gh_setup_json(
-        "pr", "view", gh_fixture.url, "--json", "labels,autoMergeRequest", cwd=gh_fixture.repo_dir
-    )
+    raw = _gh_setup_json("pr", "view", gh_fixture.url, "--json", "labels,autoMergeRequest", cwd=gh_fixture.repo_dir)
     assert await worktree.pr_hold_facts(gh_fixture.url, cwd=gh_fixture.repo_dir) == {
         "labels": [label["name"] for label in raw["labels"]],
         "auto_merge": raw["autoMergeRequest"] is not None,
