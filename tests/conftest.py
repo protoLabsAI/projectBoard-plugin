@@ -515,6 +515,21 @@ def _no_external_review_read(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_merge_hold_mirror_read(monkeypatch):
+    """The PR reconcile mirrors a held card's merge-hold onto its GitHub PR (bd-t266a), which
+    reads the PR's labels and auto-merge first. In the unit tier every PR url is made up, so a
+    real read would shell `gh` for every held card a reconcile test walks. Stub it to
+    "unreadable" (the mirror writes nothing — the pass runs as before);
+    tests/test_merge_hold_github_label.py puts the real read back over a fake `gh`."""
+
+    async def _unread(_pr_url, *, cwd="."):
+        return None
+
+    monkeypatch.setattr(_worktree_mod, "pr_hold_facts", _unread)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_review_thread_read(monkeypatch):
     """The PR reconcile reads a PR's UNRESOLVED review threads to bounce on a bot's Major/Critical
     finding (#495). In the unit tier every PR url is made up, so a real read would shell

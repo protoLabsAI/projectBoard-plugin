@@ -917,6 +917,10 @@ LABEL_REVIEWED_HEAD_PREFIX = "reviewed-head:"
 # board's gate on a head the board is about to replace. Only a PR carrying this label is
 # un-drafted by the gate: a draft the operator set by hand (#207's hold) is never touched.
 LABEL_BOARD_DRAFT = "board-draft"
+# The board mirrored this card's `merge-hold` onto its GitHub PR (bd-t266a) — the PR's
+# `merge-hold` label is the board's, so releasing the bead hold removes it. A PR label with
+# no such marker (a human put it on) is never removed by the board.
+LABEL_GH_MERGE_HOLD = "gh-merge-hold"
 # The PR head an EXTERNAL QA-panel FAIL already bounced the card for (#473) —
 # `ext-review-bounced:<sha>`, replaced (never accumulated), SHORT for the 50-char label
 # cap. The reconcile bounces a card into a fix round the first time it sees the panel's
@@ -5744,6 +5748,17 @@ class BeadsBoard:
             self._run("update", fid, "--add-label", LABEL_BOARD_DRAFT)
         elif not on and has:
             self._run("update", fid, "--remove-label", LABEL_BOARD_DRAFT)
+        return self.get_feature(fid)
+
+    def record_gh_merge_hold(self, fid: str, on: bool) -> dict:
+        """Set or clear the `gh-merge-hold` marker (bd-t266a): the board added the GitHub
+        PR's `merge-hold` label, so it may remove it when the bead hold is released."""
+        f = self._require(fid)
+        has = LABEL_GH_MERGE_HOLD in (f.get("labels") or [])
+        if on and not has:
+            self._run("update", fid, "--add-label", LABEL_GH_MERGE_HOLD)
+        elif not on and has:
+            self._run("update", fid, "--remove-label", LABEL_GH_MERGE_HOLD)
         return self.get_feature(fid)
 
     # ── loop fix-budget persistence (#259) ────────────────────────────────────

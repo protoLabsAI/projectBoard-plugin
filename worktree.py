@@ -3652,6 +3652,68 @@ async def pr_merge_info(pr_url: str, *, cwd: str = ".") -> dict:
     }
 
 
+# The GitHub label the board mirrors a bead `merge-hold` onto (#bd-t266a): the pr-reviewer
+# plugin refuses to arm `gh pr merge --auto` on a PR carrying it (pr-reviewer#376).
+PR_MERGE_HOLD_LABEL = "merge-hold"
+
+
+async def pr_hold_facts(pr_url: str, *, cwd: str = ".") -> dict | None:
+    """ONE ``gh pr view`` read of the facts the merge-hold mirror needs:
+    ``{"labels": [names], "auto_merge": bool}`` — ``auto_merge`` is True when GitHub
+    reports an ``autoMergeRequest`` (auto-merge armed). ``None`` on a gh failure or an
+    unparseable answer, so the caller writes nothing on a read it could not make.
+    Never raises into the loop."""
+    try:
+        rc, out, _err = await _gh_read(_gh("pr", "view", pr_url, "--json", "labels,autoMergeRequest", cwd=cwd))
+    except (WorktreeError, OSError):
+        return None
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("labels", []), list):
+        return None
+    names = [
+        str(x.get("name") or "").strip() if isinstance(x, dict) else str(x).strip() for x in data.get("labels") or []
+    ]
+    return {"labels": [n for n in names if n], "auto_merge": data.get("autoMergeRequest") is not None}
+
+
+async def _gh_write(*args: str, cwd: str) -> tuple[bool, str]:
+    """A best-effort gh write: ``(ok, detail)``, never raises (a timeout is a failure)."""
+    try:
+        rc, out, err = await _gh(*args, cwd=cwd)
+    except (WorktreeError, OSError) as exc:
+        return False, str(exc)[:300]
+    return rc == 0, (err.strip() or out.strip())[:300]
+
+
+async def add_pr_label(
+    pr_url: str, label: str, *, cwd: str = ".", color: str = "b60205", description: str = ""
+) -> tuple[bool, str]:
+    """Put ``label`` on the PR, first creating it in the repo if missing (``gh label create
+    --force``, best-effort, as ``open_pr`` does for the reviewer-of-record label). Returns
+    ``(ok, detail)`` for the ``gh pr edit --add-label`` write; never raises."""
+    create = ["label", "create", label, "--force", "--color", color]
+    if description:
+        create += ["--description", description]
+    await _gh_write(*create, cwd=cwd)  # a refusal here only means the edit below may refuse too
+    return await _gh_write("pr", "edit", pr_url, "--add-label", label, cwd=cwd)
+
+
+async def remove_pr_label(pr_url: str, label: str, *, cwd: str = ".") -> tuple[bool, str]:
+    """Take ``label`` off the PR (``gh pr edit --remove-label``). ``(ok, detail)``; never raises."""
+    return await _gh_write("pr", "edit", pr_url, "--remove-label", label, cwd=cwd)
+
+
+async def disable_auto_merge(pr_url: str, *, cwd: str = ".") -> tuple[bool, str]:
+    """Disarm GitHub auto-merge on the PR (``gh pr merge --disable-auto``). ``(ok, detail)``;
+    never raises."""
+    return await _gh_write("pr", "merge", pr_url, "--disable-auto", cwd=cwd)
+
+
 async def pr_merge_state(pr_url: str, *, cwd: str = ".") -> str:
     """The PR's ``mergeStateStatus`` — ``CLEAN`` / ``BEHIND`` / ``DIRTY`` / ``BLOCKED``
     / ``UNSTABLE`` / ``UNKNOWN`` / ``DRAFT`` / ``HAS_HOOKS`` — or ``""`` on a gh
